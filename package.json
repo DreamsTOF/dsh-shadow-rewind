@@ -1,0 +1,51 @@
+{
+  "name": "dsh-shadow-rewind",
+  "version": "0.1.0",
+  "description": "基于隐藏影子 jj 仓库的会话级文件快照与回退：不要求工作区有任何 VCS，每轮自动 checkpoint，恢复时绝不触碰工作区自身的 git/jj。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "rewind",
+    "checkpoint",
+    "jj",
+    "shadow-repo"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test \"tests/*.test.mjs\"",
+    "check": "tsc -p tsconfig.json && node --test \"tests/*.test.mjs\""
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.2"
+  }
+}

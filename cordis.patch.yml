@@ -1,0 +1,4 @@
+# 把影子回退插件挂进 DSH Profile（与其它 Profile Bundle 同机制，不改 dsh 核心）。
+- insert:
+    - id: shadow-rewind
+      name: 'dsh-shadow-rewind'
