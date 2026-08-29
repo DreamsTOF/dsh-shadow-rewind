@@ -13,6 +13,8 @@ export declare const en: {
     'produced.reviewAll': string;
     'produced.undo': string;
     'produced.redo': string;
+    'produced.undoFile': string;
+    'produced.redoFile': string;
     'produced.undoing': string;
     'produced.redoing': string;
     'produced.toggleUnavailable': string;

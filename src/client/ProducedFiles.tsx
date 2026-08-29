@@ -12,7 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {
-  FileReviewAction, FileReviewRequest, FileReviewResult,
+  FileReviewAction, FileReviewFileState, FileReviewRequest, FileReviewResult,
 } from '../file-review/change-types.ts'
 import { basename, type ProducedFileReview } from './turn-deliverables.ts'
 import type { NS } from './chat-locales.ts'
@@ -83,6 +83,22 @@ function CloseIcon() {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true" className={css.closeIcon}>
       <path d="m5.5 5.5 9 9m0-9-9 9" />
+    </svg>
+  )
+}
+
+function FileUndoIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" className={css.buttonIcon}>
+      <path d="M8 5 4 9l4 4M4 9h7a5 5 0 0 1 5 5v1" />
+    </svg>
+  )
+}
+
+function FileRedoIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" className={css.buttonIcon}>
+      <path d="m12 5 4 4-4 4M16 9H9a5 5 0 0 0-5 5v1" />
     </svg>
   )
 }
@@ -200,6 +216,9 @@ export function ProducedFiles({
   const [toggleAction, setToggleAction] = useState<FileReviewAction>('undo')
   const [statusPending, setStatusPending] = useState(true)
   const [togglePending, setTogglePending] = useState(false)
+  // 单文件撤销：路径 → 巡检/操作返回的当前状态；fileBusy = 正在操作的路径。
+  const [fileStates, setFileStates] = useState<ReadonlyMap<string, FileReviewFileState>>(() => new Map())
+  const [fileBusy, setFileBusy] = useState<string | null>(null)
   const [toast, setToast] = useState<ToggleNotice | null>(null)
   const toastSeqRef = useRef(0)
 
@@ -256,6 +275,7 @@ export function ProducedFiles({
     setStatusPending(true)
     void inspectChanges({ action: 'undo', files: toggleFiles }).then((result) => {
       if (!active) return
+      setFileStates(new Map(result.files.map(file => [file.path, file.state])))
       const allUndone = reversiblePaths.size > 0
         && [...reversiblePaths].every(path =>
           result.files.find(file => file.path === path)?.state === 'undone')
@@ -274,6 +294,12 @@ export function ProducedFiles({
     const action = toggleAction
     setTogglePending(true)
     void applyChanges({ action, files: toggleFiles }).then((result) => {
+      // 整轮操作后同步每文件状态，chip 上的单文件按钮随之翻转。
+      setFileStates((current) => {
+        const next = new Map(current)
+        for (const file of result.files) next.set(file.path, file.state)
+        return next
+      })
       setToggleAction(phaseForResult(result, action))
       const targetState = action === 'undo' ? 'undone' : 'applied'
       const byPath = new Map(result.files.map(file => [file.path, file]))
@@ -309,6 +335,52 @@ export function ProducedFiles({
   }, [
     applyChanges, hasReversibleFiles, phaseForResult, showToast, t,
     statusPending, toggleAction, toggleFiles, togglePending,
+  ])
+
+  /** 单文件撤销/重新应用：整文件粒度（提交该文件本轮的全部 hunks；hunk 子集
+   * 选择只在侧边栏 diff 视图里）。状态来自挂载巡检与每次操作结果，零额外请求。 */
+  const runFileToggle = useCallback((review: ProducedFileReview) => {
+    const path = review.path
+    if (statusPending || togglePending || fileBusy !== null || !reversiblePaths.has(path)) return
+    const action: FileReviewAction = fileStates.get(path) === 'undone' ? 'redo' : 'undo'
+    const target: FileReviewFileState = action === 'undo' ? 'undone' : 'applied'
+    setFileBusy(path)
+    void applyChanges({ action, files: [{ path, diffs: review.diffs }] }).then((result) => {
+      const outcome = result.files.find(file => file.path === path)
+      const next = new Map(fileStates)
+      next.set(path, outcome?.state ?? 'unsupported')
+      setFileStates(next)
+      // 整轮开关与 chips 保持同一事实：按最新状态重算整轮是否已全部撤销。
+      const allUndoneNow = reversiblePaths.size > 0
+        && [...reversiblePaths].every(p => next.get(p) === 'undone')
+      setToggleAction(allUndoneNow ? 'redo' : 'undo')
+      if (outcome?.state === target) {
+        showToast({
+          tone: 'success',
+          title: t(action === 'undo' ? 'produced.undoSuccess' : 'produced.redoSuccess'),
+          files: [],
+        })
+        return
+      }
+      showToast({
+        tone: 'error',
+        title: t(action === 'undo' ? 'produced.undoPartial' : 'produced.redoPartial'),
+        description: t(action === 'undo'
+          ? 'produced.undoPartialDescription'
+          : 'produced.redoPartialDescription'),
+        files: [{ path }],
+      })
+    }).catch((error: unknown) => {
+      showToast({
+        tone: 'error',
+        title: t(action === 'undo' ? 'produced.undoError' : 'produced.redoError'),
+        description: error instanceof Error ? error.message : String(error),
+        files: [],
+      })
+    }).finally(() => { setFileBusy(null) })
+  }, [
+    applyChanges, fileBusy, fileStates, reversiblePaths, showToast, t,
+    statusPending, togglePending,
   ])
 
   return (
@@ -358,28 +430,44 @@ export function ProducedFiles({
           </button>
         </header>
         <div className={css.fileList}>
-          {shown.map(({ review, stats }) => (
-            <button
-              key={review.path}
-              type="button"
-              className={css.fileRow}
-              title={review.path}
-              aria-label={t('produced.review', { name: review.path })}
-              onClick={() => { openInSidebarTab?.([review.path], turnNumber) }}
-            >
-              <span className={css.fileName}>{basename(review.path)}</span>
-              {review.deleted === true
-                ? <span className={css.deletedBadge}>{t('produced.deleted')}</span>
-                : (
-                  <Stats
-                    stats={stats}
-                    label={t('review.stats', {
-                      added: String(stats.added), removed: String(stats.removed),
-                    })}
-                  />
+          {shown.map(({ review, stats }) => {
+            const reversible = reversiblePaths.has(review.path)
+            const fileAction: FileReviewAction = fileStates.get(review.path) === 'undone' ? 'redo' : 'undo'
+            return (
+              <div className={css.fileRow} key={review.path} title={review.path}>
+                <button
+                  type="button"
+                  className={css.fileLink}
+                  aria-label={t('produced.review', { name: review.path })}
+                  onClick={() => { openInSidebarTab?.([review.path], turnNumber) }}
+                >
+                  <span className={css.fileName}>{basename(review.path)}</span>
+                  {review.deleted === true
+                    ? <span className={css.deletedBadge}>{t('produced.deleted')}</span>
+                    : (
+                      <Stats
+                        stats={stats}
+                        label={t('review.stats', {
+                          added: String(stats.added), removed: String(stats.removed),
+                        })}
+                      />
+                    )}
+                </button>
+                {review.deleted !== true && reversible && (
+                  <button
+                    type="button"
+                    className={css.fileUndoButton}
+                    disabled={statusPending || togglePending || fileBusy !== null}
+                    aria-label={t(fileAction === 'undo' ? 'produced.undoFile' : 'produced.redoFile')}
+                    title={t(fileAction === 'undo' ? 'produced.undoFile' : 'produced.redoFile')}
+                    onClick={() => { runFileToggle(review) }}
+                  >
+                    {fileAction === 'undo' ? <FileUndoIcon /> : <FileRedoIcon />}
+                  </button>
                 )}
-            </button>
-          ))}
+              </div>
+            )
+          })}
           {hidden > 0 && (
             <div className={css.moreFiles}>
               {hidden === 1
