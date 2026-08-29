@@ -133,3 +133,10 @@ HTTP 端点为同源 `/shadow-rewind`（仅接受回环请求）：`GET ?session
 ## License
 
 MIT
+
+## 本地开发快速应用
+
+频繁迭代时不必走发布链路：`pnpm apply`（= 构建 + 把 lib 与补丁文件直灌
+profile 安装目录，依赖仍从 profile 顶层解析，与正式安装同语义），然后重启
+DSH 生效。目标目录可用 `DSH_PROFILE_DIR` 环境变量覆盖；完整验证仍用
+`pnpm check` + 发布链路。

@@ -62,7 +62,8 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test \"tests/*.test.mjs\"",
     "check": "npm run build && node --test \"tests/*.test.mjs\"",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "apply": "node scripts/apply-local.mjs"
   },
   "publishConfig": {
     "access": "public"
