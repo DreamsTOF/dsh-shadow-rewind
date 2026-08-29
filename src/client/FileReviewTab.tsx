@@ -77,6 +77,20 @@ interface PendingScroll {
   readonly turn: number | null
 }
 
+/** 一个文件在本会话某轮的改动记录（文件级时间线节点；按轮升序累积）。 */
+interface FileTurnEntry {
+  readonly turn: number
+  readonly live: boolean
+  readonly deleted?: true
+  readonly diffs: SessionFileChange['diffs']
+}
+
+/** 恢复窗口内一个路径的累计统计与最近改动轮次（恢复对话框 +/− 跳转用）。 */
+interface PathWindowStats {
+  readonly stats: UnifiedDiffStats
+  readonly latestTurn: number
+}
+
 /** A change group is reversible only with complete contextual hunks. */
 function isReversible(file: SessionFileChange): boolean {
   return file.diffs.length > 0 && file.diffs.every(diff =>
@@ -174,6 +188,11 @@ function LazyDiff({ children }: { children: ReactNode }) {
 interface TurnRewindDialogProps {
   readonly sessionId: string
   readonly turn: number
+  /** 恢复窗口（该轮起）内本会话对每个路径的累计 +/-；其它会话写入的路径没有
+   * 客户端 diff 数据，因此没有条目（对话框里这些行不显示统计）。 */
+  readonly windowStats: ReadonlyMap<string, PathWindowStats>
+  /** 点击某路径的 +/-：跳到该文件最近一轮的差异（父级负责关闭对话框）。 */
+  readonly onJumpToDiff: (turn: number, path: string) => void
   readonly onClose: () => void
   /** 恢复成功后回调（刷新 tab 的状态巡检）。 */
   readonly onRestored: () => void
@@ -282,7 +301,7 @@ function snapshotKindLabel(kind: string): string {
   }
 }
 
-function TurnRewindDialog({ sessionId, turn, onClose, onRestored }: TurnRewindDialogProps) {
+function TurnRewindDialog({ sessionId, turn, windowStats, onJumpToDiff, onClose, onRestored }: TurnRewindDialogProps) {
   const [loading, setLoading] = useState(true)
   const [preview, setPreview] = useState<TurnRewindPreview | null>(null)
   const [applying, setApplying] = useState(false)
@@ -498,6 +517,7 @@ function TurnRewindDialog({ sessionId, turn, onClose, onRestored }: TurnRewindDi
                         : change.owner === 'unknown'
                           ? t('ownerUnknown')
                           : t('ownerSession', { id: change.owner.length > 12 ? `${change.owner.slice(0, 12)}…` : change.owner })
+                    const windowEntry = windowStats.get(change.path)
                     return (
                       <div className="srw-file" key={change.path}>
                         {symmetric && (
@@ -510,6 +530,19 @@ function TurnRewindDialog({ sessionId, turn, onClose, onRestored }: TurnRewindDi
                         <code>{change.path}</code>
                         {badge !== null && <span className="srw-kind">{badge}</span>}
                         <span className="srw-kind">{snapshotKindLabel(change.kind)}</span>
+                        {windowEntry !== undefined && (
+                          <button
+                            type="button"
+                            className={css.statsButton}
+                            title={t('viewDiff', { n: windowEntry.latestTurn })}
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              onJumpToDiff(windowEntry.latestTurn, change.path)
+                            }}
+                          >
+                            <Stats stats={windowEntry.stats} />
+                          </button>
+                        )}
                       </div>
                     )
                   })}
@@ -536,6 +569,69 @@ function TurnRewindDialog({ sessionId, turn, onClose, onRestored }: TurnRewindDi
   )
 }
 
+// ── 文件级时间线：一个文件在本会话被改动的每一轮；点 +/- 跳到该轮差异 ──
+
+interface FileTimelineDialogProps {
+  readonly path: string
+  /** 该文件的逐轮改动（轮次升序）。 */
+  readonly entries: readonly FileTurnEntry[]
+  /** 点击某轮的 +/- 统计：父级关闭对话框并滚动到那一轮的差异。 */
+  readonly onPick: (turn: number) => void
+  readonly onClose: () => void
+}
+
+function FileTimelineDialog({ path, entries, onPick, onClose }: FileTimelineDialogProps) {
+  return (
+    <div className="srw-overlay" role="dialog" aria-modal="true">
+      <div className="srw-dialog">
+        <div className="srw-dialog-head">
+          <strong>{t('timelineTitle')}</strong>
+          <button type="button" className="srw-trigger" onClick={onClose} aria-label={t('close')}>✕</button>
+        </div>
+        <div className="srw-content">
+          <div className="srw-body">
+            <p className={css.timelinePath}>{path}</p>
+            {entries.length === 0
+              ? <p className="srw-status">{t('timelineEmpty')}</p>
+              : [
+                <p className="srw-status" key="hint">{t('timelineHint')}</p>,
+                <ul className={css.timelineList} key="list">
+                  {[...entries].reverse().map((entry) => {
+                    const stats = summarizeDiffs(entry.diffs)
+                    return (
+                      <li className={css.timelineItem} key={entry.turn}>
+                        <span className={css.timelineDot} aria-hidden="true" />
+                        <span className={css.turnTitle}>{t('turn', { n: entry.turn })}</span>
+                        {entry.live && <span className={css.liveBadge}>{t('turnLive')}</span>}
+                        {entry.deleted === true
+                          ? <span className={css.deletedBadge}>{t('deleted')}</span>
+                          : entry.diffs.length === 0
+                            ? <span className={css.turnCount}>{t('timelineNoDiff')}</span>
+                            : (
+                              <button
+                                type="button"
+                                className={css.statsButton}
+                                title={t('viewDiff', { n: entry.turn })}
+                                onClick={() => { onPick(entry.turn) }}
+                              >
+                                <Stats stats={stats} />
+                              </button>
+                            )}
+                      </li>
+                    )
+                  })}
+                </ul>,
+              ]}
+          </div>
+        </div>
+        <div className="srw-foot">
+          <button type="button" onClick={onClose}>{t('close')}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /** The sidebar tab body: per-turn change groups with inline diffs and undo. */
 export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewTabProps) {
   const sessions = (ctx as unknown as { readonly sessions: ISessions }).sessions
@@ -549,6 +645,8 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   const [hunkSelection, setHunkSelection] = useState<ReadonlyMap<string, ReadonlySet<number>>>(() => new Map())
   // 打开「从快照恢复此轮」对话框的回合号；null = 关闭。
   const [rewindTurn, setRewindTurn] = useState<number | null>(null)
+  // 打开文件级时间线对话框的路径；null = 关闭。
+  const [timelinePath, setTimelinePath] = useState<string | null>(null)
   const noticeSeqRef = useRef(0)
   const noticeTimerRef = useRef<number | null>(null)
 
@@ -894,6 +992,53 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     { added: 0, removed: 0 },
   ), [flat])
 
+  // 文件级时间线数据：路径 → 逐轮改动（turns 本身按轮升序，逐条追加即升序）。
+  const timelineForPath = useMemo(() => {
+    const map = new Map<string, FileTurnEntry[]>()
+    for (const turn of turns) {
+      for (const file of turn.files) {
+        const list = map.get(file.path) ?? []
+        list.push({
+          turn: turn.turn, live: turn.live, diffs: file.diffs,
+          ...(file.deleted === true ? { deleted: true as const } : {}),
+        })
+        map.set(file.path, list)
+      }
+    }
+    return map
+  }, [turns])
+  const timelineEntries = timelinePath === null ? [] : timelineForPath.get(timelinePath) ?? []
+
+  // 按轮恢复窗口（第 rewindTurn 轮起）内本会话各路径的累计 +/- 与最近改动轮次。
+  const windowStats = useMemo(() => {
+    const map = new Map<string, PathWindowStats>()
+    if (rewindTurn === null) return map
+    for (const entry of flat) {
+      if (entry.turn < rewindTurn) continue
+      const existing = map.get(entry.path)
+      const stats = summarizeDiffs(entry.diffs)
+      map.set(entry.path, {
+        stats: existing === undefined ? stats : addStats(existing.stats, stats),
+        latestTurn: existing === undefined ? entry.turn : Math.max(existing.latestTurn, entry.turn),
+      })
+    }
+    return map
+  }, [flat, rewindTurn])
+
+  /** 从时间线/恢复对话框跳到某个（轮, 文件）的差异：关掉浮层、展开该行并滚动
+   * 到位（setExpanded 总是产生新 Set，滚动副作用必然重放）。 */
+  const jumpToFile = useCallback((turn: number, path: string) => {
+    setTimelinePath(null)
+    setRewindTurn(null)
+    const key = stateKey(turn, path)
+    setExpanded((current) => {
+      const next = new Set(current)
+      next.add(key)
+      return next
+    })
+    pendingScrollRef.current = { rowKey: key, turn: null }
+  }, [])
+
   /** Render one turn group (latest turn first). */
   const renderTurn = (turn: TurnFileChanges) => {
     const turnStats = turn.files.reduce<UnifiedDiffStats>(
@@ -997,6 +1142,17 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
             ? <span className={css.deletedBadge}>{t('deleted')}</span>
             : <Stats stats={stats} />}
           {file.deleted !== true && <StateBadge state={state} />}
+          <button
+            type="button"
+            className={css.smallButton}
+            title={t('timelineTitle')}
+            onClick={(event) => {
+              event.stopPropagation()
+              setTimelinePath(file.path)
+            }}
+          >
+            {t('timeline')}
+          </button>
           {file.deleted !== true && (
             <button
               type="button"
@@ -1103,11 +1259,21 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         <TurnRewindDialog
           sessionId={sessionId}
           turn={rewindTurn}
+          windowStats={windowStats}
+          onJumpToDiff={jumpToFile}
           onClose={() => { setRewindTurn(null) }}
           onRestored={() => {
             setTick(value => value + 1)
             showNotice('success', t('snapshotDone'))
           }}
+        />
+      )}
+      {timelinePath !== null && (
+        <FileTimelineDialog
+          path={timelinePath}
+          entries={timelineEntries}
+          onPick={(turn) => { jumpToFile(turn, timelinePath) }}
+          onClose={() => { setTimelinePath(null) }}
         />
       )}
     </div>

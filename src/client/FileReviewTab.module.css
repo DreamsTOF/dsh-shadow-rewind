@@ -290,3 +290,76 @@
   background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent);
   white-space: nowrap;
 }
+
+/* 可点击的 +/− 统计（时间线节点、恢复对话框文件行）：点击跳到对应差异。 */
+.statsButton {
+  display: inline-flex;
+  gap: 6px;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  flex: none;
+}
+
+.statsButton:hover {
+  background: var(--dsw-alias-border-l1);
+}
+
+/* 文件级时间线：纵向轴线 + 圆点节点（srw-* 对话框体内）。 */
+.timelinePath {
+  margin: 0 0 8px;
+  color: var(--dsw-alias-label-tertiary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.timelineList {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.timelineItem {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 4px 0 20px;
+}
+
+.timelineItem::before {
+  content: '';
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--dsw-alias-border-l2);
+}
+
+.timelineItem:first-child::before {
+  top: 50%;
+}
+
+.timelineItem:last-child::before {
+  bottom: 50%;
+}
+
+.timelineDot {
+  position: absolute;
+  left: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--dsw-alias-border-l2);
+  box-shadow: 0 0 0 2px var(--dsw-alias-markdown-code-block);
+}

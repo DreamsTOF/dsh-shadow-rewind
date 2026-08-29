@@ -86,6 +86,12 @@ export declare const zh: {
     readonly skipTooLarge: "超过大小上限";
     readonly skipUnsupportedType: "文件类型不支持";
     readonly skipReadFailed: "读取失败";
+    readonly timeline: "时间线";
+    readonly timelineTitle: "修改时间线";
+    readonly timelineHint: "这是本会话中改动过这个文件的每一轮；点击行末的 +/− 统计可跳到那一轮的差异。";
+    readonly timelineEmpty: "本会话没有这个文件的改动记录";
+    readonly timelineNoDiff: "无差异文本";
+    readonly viewDiff: "查看第 {n} 轮的差异";
     readonly close: "关闭";
     readonly cancel: "取消";
 };
