@@ -3,14 +3,26 @@
  * `ctx.shadowRewind`，供其它插件消费。
  */
 import { ShadowRewindEngine } from './engine.js'
+import { installFileReviewHost } from './file-review/host.ts'
 import { installShadowRewindHttp, TurnCheckpointCoordinator } from './rewind-host.js'
 import type { AgentFace, HostContext } from './rewind-host.js'
 import type { RestorePointSummary, ShadowRewindConfig } from './types.js'
+import { installWriteGateHost, WorkspaceWriteGate } from './write-gate.js'
+import type { WriteGateDeps } from './write-gate.js'
+import { canonicalDirectory } from './path-utils.js'
 
 export * from './engine.js'
 export * from './errors.js'
 export * from './rewind-host.js'
 export * from './types.js'
+// 文件审查半边（dsh-file-review-tab 融合）。FileReviewService 必须从主入口
+// 可达：Typert 贡献按 exportName 从宿主包主入口解析服务。
+export { FileReviewService, transformFile } from './file-review/host.ts'
+export type {
+  FileReviewAction, FileReviewChange, FileReviewFileResult, FileReviewRequest,
+  FileReviewResult, ProducedFileDiff, ProducedFileReview, RecordedMutation,
+  RecordedRequest, RecordedResult,
+} from './file-review/change-types.ts'
 
 /** 最小 cordis 上下文面（结构类型）：避免依赖具体的 cordis 包版本。 */
 interface PluginContext {
@@ -37,18 +49,52 @@ interface PluginContext {
 export class ShadowRewindService {
   readonly engine: ShadowRewindEngine
   private readonly coordinator: TurnCheckpointCoordinator
+  /** 写入闸（「以当前为准」）；恒常构造，config.writeGate 只决定初始开关。 */
+  readonly writeGate: WorkspaceWriteGate
 
   constructor(ctx: PluginContext, config: ShadowRewindConfig = {}) {
     ctx.provide('shadowRewind', this)
     this.engine = new ShadowRewindEngine(config)
     this.coordinator = new TurnCheckpointCoordinator(this.engine)
 
+    // 写入闸：恒常构造——所有权登记永远进行（即使拒绝裁决关闭），保证
+    // 运行时中途开启闸时立刻有据可依。依赖（sessions/agents）在构造时可能
+    // 尚未就绪，用惰性 getter 延迟解析——闸在每次裁决时才读取当时的存活面。
+    {
+      const lazy = ctx as unknown as {
+        sessions?: WriteGateDeps['sessions']
+        agents?: WriteGateDeps['agents']
+      }
+      const deps: WriteGateDeps = {
+        canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
+        get sessions() { return lazy.sessions },
+        get agents() { return lazy.agents },
+        logger: ctx.logger,
+      }
+      this.writeGate = new WorkspaceWriteGate(deps, {
+        enabled: config.writeGate ?? true,
+        allow: config.writeGateAllow,
+      })
+    }
+
+    // 文件审查半边（dsh-file-review-tab 融合）：Typert `fileReview` 服务 +
+    // 最终回复文件引用引导 + Code Mode 录制器；录制记录持久化到本插件存储。
+    installFileReviewHost(
+      ctx as unknown as Parameters<typeof installFileReviewHost>[0],
+      { storageDir: this.engine.config.storageDir },
+    )
+
+    // 写入闸的拒绝裁决挂在工具瀑布上（关闭时裁决直接放行，监听器常驻）。
+    installWriteGateHost(ctx as unknown as Parameters<typeof installWriteGateHost>[0], this.writeGate)
+
     ctx.inject(['agents'], (scope) => {
       this.coordinator.install(scope as unknown as HostContext)
+      // 所有权登记与快照共用 agent/pre-step 瀑布（step 1 抢占）。
+      this.writeGate?.install(scope as unknown as HostContext)
     })
     ctx.inject(['webServer', 'sessions', 'sessionQuery', 'apiProxy', 'agents'], (scope) => {
       const s = scope as unknown as Parameters<typeof installShadowRewindHttp>[0]
-      installShadowRewindHttp(s, this.engine, this.coordinator)
+      installShadowRewindHttp(s, this.engine, this.coordinator, this.writeGate)
     })
 
     void this.engine.ready.then((reconciled) => {

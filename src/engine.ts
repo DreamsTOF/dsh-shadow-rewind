@@ -563,11 +563,60 @@ export class ShadowRewindEngine {
   }
 
   /** 生成限时恢复计划（确认串必须逐字回显）。 */
+  /**
+   * 对称模式路径归因的数据源：晚于目标恢复点的全部快照（其它会话的 turn
+   * 检查点、rescue 点等），按时间升序，entries 投影到给定路径集。检查点在
+   * 回合开始时捕获，因此窗口 [S_j, S_{j+1}) 的写者就是 S_j 的会话。
+   * 上限 64 个：归因只是预览里的建议标签（勾选权在用户），更早的时间线
+   * 不再细分。
+   */
+  async listSnapshotsAfter(options: {
+    readonly cwd: string
+    readonly restorePointId: string
+    readonly paths: readonly string[]
+    readonly signal?: AbortSignal
+  }): Promise<{
+    readonly targetSessionId: string | undefined
+    readonly snapshots: readonly {
+      readonly id: string
+      readonly sessionId?: string
+      readonly createdAt: number
+      readonly entries: Readonly<Record<string, SnapshotEntry | null>>
+    }[]
+  }> {
+    await this.assertReady(options.signal)
+    const workspace = await canonicalDirectory(options.cwd)
+    const target = await this.store.readManifest(workspace, options.restorePointId)
+    const all = await this.store.listManifests(workspace)
+    const later = all
+      .filter((manifest) => manifest.id !== target.id && manifest.createdAt >= target.createdAt)
+      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
+      .slice(0, 64)
+    return {
+      targetSessionId: target.sessionId,
+      snapshots: later.map((manifest) => {
+        const entries: Record<string, SnapshotEntry | null> = Object.create(null)
+        for (const path of options.paths) {
+          const entry = manifest.entries[path]
+          entries[path] = entry === undefined ? null : entry
+        }
+        return {
+          id: manifest.id,
+          ...(manifest.sessionId === undefined ? {} : { sessionId: manifest.sessionId }),
+          createdAt: manifest.createdAt,
+          entries,
+        }
+      }),
+    }
+  }
+
   async planRestore(options: {
     readonly cwd: string
     readonly restorePointId: string
     readonly sessionId?: string
     readonly expectedCurrentTreeHash?: string
+    /** 对称模式的勾选式子集：计划只覆盖这些路径（必须都是变更清单成员）。 */
+    readonly paths?: readonly string[]
     readonly signal?: AbortSignal
   }): Promise<RestorePlan> {
     await this.assertReady(options.signal)
@@ -584,8 +633,21 @@ export class ShadowRewindEngine {
       // 此后的任何变化都绝不构成恢复动作——否则「新增的大文件」会在恢复时
       // 被误删，违背「恢复不碰跳过项」的承诺。
       const skippedSet = new Set(manifest.skippedPaths.map((skip) => skip.path))
-      const changes = diffTrees(manifest.entries, current.entries)
+      let changes = diffTrees(manifest.entries, current.entries)
         .filter((change) => !skippedSet.has(change.path))
+      if (options.paths !== undefined) {
+        // 未知路径立即拒绝：防止客户端拿错版本的清单拼出半个计划。
+        const changePaths = new Set(changes.map((change) => change.path))
+        const unknown = options.paths.filter((path) => !changePaths.has(path))
+        if (unknown.length > 0) {
+          throw new ShadowRewindError('INVALID_ARGUMENTS', `以下路径不在恢复点 ${manifest.id} 的变更清单里：${unknown.slice(0, 5).join(', ')}`)
+        }
+        const wanted = new Set(options.paths)
+        changes = changes.filter((change) => wanted.has(change.path))
+        if (changes.length === 0) {
+          throw new ShadowRewindError('NO_CHANGES', '勾选的路径没有可恢复的变更')
+        }
+      }
       if (changes.length === 0) {
         throw new ShadowRewindError('NO_CHANGES', `工作区已经与恢复点 ${manifest.id} 一致`)
       }

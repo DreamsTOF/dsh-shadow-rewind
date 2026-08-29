@@ -1,0 +1,15 @@
+node_modules/
+.pnpm-store/
+
+# 构建中间产物（lib/ 是发布物，有意提交）
+.client-build/
+
+# 测试临时目录
+tests/.tmp/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 日志
+*.log

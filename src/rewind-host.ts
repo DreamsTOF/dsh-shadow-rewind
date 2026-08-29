@@ -10,9 +10,15 @@ import { createDeadline } from './deadline.js'
 import { ShadowRewindError, errorMessage } from './errors.js'
 import { canonicalDirectory } from './path-utils.js'
 import { isCheckpointSkipCode } from './engine.js'
+import { attributePaths, serializeOwner } from './attribution.js'
+import type { PathAttribution } from './attribution.js'
+import type { WorkspaceWriteGate } from './write-gate.js'
 import type { ShadowRewindEngine } from './engine.js'
+import type { RestoreResult } from './types.js'
 
 export const REWIND_HTTP_PATH = '/shadow-rewind'
+/** 写入闸运行时开关的查询/翻转端点（仅回环；不持久化，重启回到配置初值）。 */
+export const REWIND_GATE_PATH = '/shadow-rewind/gate'
 
 const BODY_LIMIT = 64 * 1024
 const INITIAL_CHANGE_PREVIEW_LIMIT = 8
@@ -275,15 +281,49 @@ export interface RewindHttpDeps {
 }
 
 /** 注册同源端点；非回环请求一律 403（与旧插件同一安全边界）。 */
-export function installShadowRewindHttp(ctx: RewindHttpDeps & { webServer?: { register(route: { kind: 'exact'; path: string; handler: (request: Request, response: Response) => Promise<void> }): () => void } }, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator): void {
+export function installShadowRewindHttp(ctx: RewindHttpDeps & { webServer?: { register(route: { kind: 'exact'; path: string; handler: (request: Request, response: Response) => Promise<void> }): () => void } }, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator, writeGate: WorkspaceWriteGate): void {
   ctx.webServer?.register({
     kind: 'exact',
     path: REWIND_HTTP_PATH,
-    handler: (request, response) => handleRewindHttp(ctx, engine, coordinator, request, response),
+    handler: (request, response) => handleRewindHttp(ctx, engine, coordinator, writeGate, request, response),
+  })
+  ctx.webServer?.register({
+    kind: 'exact',
+    path: REWIND_GATE_PATH,
+    handler: (request, response) => handleGateHttp(ctx, writeGate, request, response),
   })
 }
 
-async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator, request: Request, response: Response): Promise<void> {
+async function handleGateHttp(deps: RewindHttpDeps, writeGate: WorkspaceWriteGate, request: Request, response: Response): Promise<void> {
+  try {
+    if (!isLoopback(request.socket.remoteAddress)) {
+      json(response, 403, { error: 'forbidden', code: 'FORBIDDEN' })
+      return
+    }
+    if (request.method === 'GET') {
+      json(response, 200, { enabled: writeGate.isEnabled })
+      return
+    }
+    if (request.method === 'POST') {
+      const body = await readJsonBody(request) as { enabled?: unknown }
+      if (typeof body.enabled !== 'boolean') {
+        throw new ShadowRewindError('INVALID_ARGUMENTS', 'enabled 必须是布尔值')
+      }
+      writeGate.setGate(body.enabled)
+      deps.logger.warn(`[shadow-rewind] 写入闸已${body.enabled ? '开启' : '关闭'}（运行时切换，重启后回到配置初值）`)
+      json(response, 200, { enabled: writeGate.isEnabled })
+      return
+    }
+    json(response, 405, { error: 'method not allowed', code: 'METHOD_NOT_ALLOWED' })
+  } catch (error) {
+    json(response, 409, {
+      error: errorMessage(error),
+      code: error instanceof ShadowRewindError ? error.code : 'GATE_FAILED',
+    })
+  }
+}
+
+async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator, writeGate: WorkspaceWriteGate, request: Request, response: Response): Promise<void> {
   try {
     if (!isLoopback(request.socket.remoteAddress)) {
       response.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
@@ -293,39 +333,92 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
     if (request.method === 'GET') {
       const url = new URL(request.url ?? REWIND_HTTP_PATH, 'http://dsh.local')
       const sessionId = requiredText(url.searchParams.get('sessionId'), 'sessionId')
-      const messageSeq = nonNegativeInteger(url.searchParams.get('messageSeq'), 'messageSeq')
+      // 两种预览定位（二选一）：messageSeq = 消息旁回退按钮；turn = 侧边栏
+      // 文件审查 tab 的「从快照恢复此轮」。
+      const turnParam = url.searchParams.get('turn')
+      const messageSeqParam = url.searchParams.get('messageSeq')
+      if ((turnParam === null) === (messageSeqParam === null)) {
+        throw new ShadowRewindError('INVALID_ARGUMENTS', 'messageSeq 与 turn 必须提供其一（且只能其一）')
+      }
       const detailsOnly = url.searchParams.get('details') === '1'
+      // 对称模式的子集计划：paths 为 JSON 字符串数组（勾选路径）。
+      const pathsParam = url.searchParams.get('paths')
+      let requestedPaths: readonly string[] | undefined
+      if (pathsParam !== null) {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(pathsParam)
+        } catch {
+          throw new ShadowRewindError('INVALID_ARGUMENTS', 'paths 必须是 JSON 字符串数组')
+        }
+        if (!Array.isArray(parsed) || parsed.length === 0
+          || !parsed.every((item): item is string => typeof item === 'string')) {
+          throw new ShadowRewindError('INVALID_ARGUMENTS', 'paths 必须是非空的 JSON 字符串数组')
+        }
+        requestedPaths = parsed
+      }
       const offset = nonNegativeInteger(url.searchParams.get('offset') ?? '0', 'offset')
       const limit = pageSize(url.searchParams.get('limit'), detailsOnly ? MAX_CHANGE_PAGE_SIZE : INITIAL_CHANGE_PREVIEW_LIMIT)
-      const { target, checkpoint } = await resolveMessageCheckpoint(deps, engine, sessionId, messageSeq)
-      if (checkpoint === undefined) {
-        // 没有持久检查点：先查持久跳过，再回落内存状态。
-        const durableSkip = await engine.findTurnCheckpointSkip({
-          cwd: target.cwd,
-          sessionId,
-          turn: target.turn,
-          turnStartSeq: target.turnStartSeq,
-        }).catch(() => undefined)
-        json(response, 200, durableSkip ?? coordinator.state(sessionId, target.turn))
+      const resolved = turnParam !== null
+        ? await resolveTurnRewindTarget(deps, engine, sessionId, nonNegativeInteger(turnParam, 'turn'), coordinator)
+        : await resolveMessageRewindTarget(deps, engine, sessionId, nonNegativeInteger(messageSeqParam as string, 'messageSeq'), coordinator)
+      if (resolved.status === 'unavailable') {
+        json(response, 200, resolved.response)
         return
       }
+      const { checkpoint, messageSeq } = resolved
       const inspection = await engine.inspect({ cwd: checkpoint.cwd, restorePointId: checkpoint.id })
-      const activeSessionIds = await sharedWorkspaceSessions(deps, checkpoint.cwd)
+      const running = await sharedWorkspaceSessions(deps, checkpoint.cwd)
+      const ownerId = await writeGate.ownerOf(checkpoint.cwd)
+      const { blocking, gated } = partitionRunningSessions(running, sessionId, ownerId, writeGate.isEnabled)
+      const symmetric = !writeGate.isEnabled
+      // 对称模式（闸关）的路径归因：按检查点窗口给每条变更标归属
+      // （目标会话 / 其它会话 / 双方 / 未知）。只在「预览」请求里算；
+      // 带 paths 的子集计划请求不再渲染标签，直接跳过。
+      let ownership: Map<string, PathAttribution> | undefined
+      if (symmetric && requestedPaths === undefined && inspection.changes.length > 0) {
+        const attributed = await engine.listSnapshotsAfter({
+          cwd: checkpoint.cwd,
+          restorePointId: checkpoint.id,
+          paths: inspection.changes.map((change) => change.path),
+        })
+        ownership = attributePaths({
+          targetSessionId: attributed.targetSessionId,
+          changes: inspection.changes,
+          snapshots: attributed.snapshots,
+        })
+      }
       const changes = inspection.changes.slice(offset, offset + limit)
-      const restoreBlocked = activeSessionIds.length > 0
+      const restoreBlocked = blocking.length > 0
       const common = {
           status: 'ready',
           sessionId,
-          messageSeq,
+          ...(messageSeq !== undefined ? { messageSeq } : {}),
           turn: checkpoint.turn,
           checkpointId: checkpoint.id,
           turnStartSeq: checkpoint.turnStartSeq,
           totalChanges: inspection.changes.length,
-          changes: changes.map((change) => ({ path: change.path, kind: change.kind })),
+          changes: changes.map((change) => {
+            const attributed = ownership?.get(change.path)
+            return {
+              path: change.path,
+              kind: change.kind,
+              ...(attributed === undefined
+                ? {}
+                : { owner: serializeOwner(attributed.owner), autoSelect: attributed.autoSelect }),
+            }
+          }),
           offset,
           truncated: offset + changes.length < inspection.changes.length,
-          activeSessionIds,
+          activeSessionIds: running,
           restoreBlocked,
+          // 恢复语义模式：闸开=以当前为准（整树），闸关=对称（勾选式子集）。
+          mode: symmetric ? 'symmetric' : 'current-wins',
+          // 写入闸开启时：blocking = 请求者自身或当前所有者（这两个真正可能
+          // 在写）；gated = 其余运行中的会话（写入已被拒绝，不阻塞恢复）。
+          blockingSessionIds: blocking,
+          gatedSessionIds: gated,
+          ownerId,
           // 跳过项逐条透传 {path, reason}——用户必须能看到具体哪些文件
           // 不在快照内、为什么，而不是只给一个数字。
           skippedPaths: inspection.skippedPaths.map((skip) => ({ path: skip.path, reason: skip.reason })),
@@ -339,6 +432,7 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
         restorePointId: checkpoint.id,
         sessionId,
         expectedCurrentTreeHash: inspection.currentTreeHash,
+        ...(requestedPaths === undefined ? {} : { paths: requestedPaths }),
       })
       json(response, 200, { ...common, planId: plan.id, confirmation: plan.confirmation })
       return
@@ -351,19 +445,23 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
       }
       const record = body as Record<string, unknown>
       const sessionId = requiredText(record.sessionId, 'sessionId')
-      const messageSeq = nonNegativeInteger(record.messageSeq, 'messageSeq')
       const checkpointId = requiredText(record.checkpointId, 'checkpointId')
-      const checkpoint = await checkpointForRequest(deps, engine, sessionId, messageSeq, checkpointId)
-      const activeSessionIds = await sharedWorkspaceSessions(deps, checkpoint.cwd)
-      if (activeSessionIds.length > 0) {
-        throw new ShadowRewindError('WORKSPACE_IN_USE', `项目目录同时被其它会话使用：${activeSessionIds.slice(0, 5).join(', ')}`)
-      }
       const planId = optionalText(record.planId, 'planId')
       const confirmation = optionalText(record.confirmation, 'confirmation')
-      if (planId === undefined || confirmation === undefined) {
-        throw new ShadowRewindError('NO_CHANGES', '该回合没有可恢复的项目文件变更')
+      if (record.turn !== undefined) {
+        // 按轮快照恢复（侧边栏文件审查 tab）：只恢复文件，绝不触碰对话。
+        if (mode !== 'code') {
+          throw new ShadowRewindError('INVALID_ARGUMENTS', '按回合快照恢复只支持 mode: "code"')
+        }
+        const turn = nonNegativeInteger(record.turn, 'turn')
+        const checkpoint = await turnCheckpointForRequest(deps, engine, sessionId, turn, checkpointId)
+        const restoreResult = await applyGuarded(deps, engine, sessionId, checkpoint.cwd, writeGate, planId, confirmation)
+        json(response, 200, { status: 'completed', mode, ...restoreResult })
+        return
       }
-      const restoreResult = await engine.applyRestore({ planId, confirmation, sessionId })
+      const messageSeq = nonNegativeInteger(record.messageSeq, 'messageSeq')
+      const checkpoint = await checkpointForRequest(deps, engine, sessionId, messageSeq, checkpointId)
+      const restoreResult = await applyGuarded(deps, engine, sessionId, checkpoint.cwd, writeGate, planId, confirmation)
       if (mode === 'code') {
         json(response, 200, { status: 'completed', mode, ...restoreResult })
         return
@@ -491,6 +589,162 @@ async function checkpointForRequest(deps: RewindHttpDeps, engine: ShadowRewindEn
     throw new ShadowRewindError('PLAN_STALE', '该消息的检查点已变化；请重新打开回退对话框')
   }
   return checkpoint
+}
+
+// ── 预览目标解析（消息 / 回合两种定位统一到同一个预览尾部）────────────────
+
+interface CheckpointRef {
+  readonly id: string
+  readonly cwd: string
+  readonly turn: number
+  readonly turnStartSeq: number
+  readonly previousTurnEndSeq?: number
+  /** 消息模式回显；turn 模式没有。 */
+  readonly messageSeq?: number
+}
+
+type ResolvedPreviewTarget =
+  | { readonly status: 'unavailable'; readonly response: unknown }
+  | { readonly status: 'ready'; readonly checkpoint: CheckpointRef; readonly messageSeq?: number }
+
+async function resolveMessageRewindTarget(deps: RewindHttpDeps, engine: ShadowRewindEngine, sessionId: string, messageSeq: number, coordinator: TurnCheckpointCoordinator): Promise<ResolvedPreviewTarget> {
+  const { target, checkpoint } = await resolveMessageCheckpoint(deps, engine, sessionId, messageSeq)
+  if (checkpoint === undefined) {
+    // 没有持久检查点：先查持久跳过，再回落内存状态。
+    const durableSkip = await engine.findTurnCheckpointSkip({
+      cwd: target.cwd,
+      sessionId,
+      turn: target.turn,
+      turnStartSeq: target.turnStartSeq,
+    }).catch(() => undefined)
+    return { status: 'unavailable', response: durableSkip ?? coordinator.state(sessionId, target.turn) }
+  }
+  return {
+    status: 'ready',
+    messageSeq,
+    checkpoint: {
+      id: checkpoint.id,
+      cwd: checkpoint.cwd,
+      turn: checkpoint.turn,
+      turnStartSeq: checkpoint.turnStartSeq,
+      ...(checkpoint.previousTurnEndSeq === undefined ? {} : { previousTurnEndSeq: checkpoint.previousTurnEndSeq }),
+    },
+  }
+}
+
+async function resolveTurnRewindTarget(deps: RewindHttpDeps, engine: ShadowRewindEngine, sessionId: string, turn: number, coordinator: TurnCheckpointCoordinator): Promise<ResolvedPreviewTarget> {
+  const resolved = await resolveTurnCheckpoint(deps, engine, sessionId, turn)
+  if (resolved.checkpoint === undefined) {
+    const durableSkip = await engine.findTurnCheckpointSkip({
+      cwd: resolved.cwd,
+      sessionId,
+      turn,
+      turnStartSeq: resolved.turnStartSeq,
+    }).catch(() => undefined)
+    return { status: 'unavailable', response: durableSkip ?? coordinator.state(sessionId, turn) }
+  }
+  return {
+    status: 'ready',
+    checkpoint: { id: resolved.checkpoint.id, cwd: resolved.cwd, turn, turnStartSeq: resolved.turnStartSeq },
+  }
+}
+
+/**
+ * 回合 → 检查点解析：优先本会话自身的检查点；fork 产物在本会话没有该回合
+ * 检查点时沿父链继承——只有回合起点落在 seed 范围内（fork 之前发生的回合）
+ * 才允许继承，且继承检查点的 turnStartSeq 必须与本会话的回合起点一致。
+ */
+async function resolveTurnCheckpoint(deps: RewindHttpDeps, engine: ShadowRewindEngine, sessionId: string, turn: number): Promise<{
+  cwd: string
+  turnStartSeq: number
+  checkpoint?: { id: string }
+}> {
+  let current = await readSession(deps, sessionId)
+  const target = turnTarget(current, turn)
+  const direct = await engine.findTurnCheckpoint({ cwd: target.cwd, sessionId, turn })
+  if (direct !== undefined) {
+    if (direct.turnStartSeq !== target.turnStartSeq) {
+      throw new ShadowRewindError('PLAN_STALE', '该回合的检查点与回合起点不再匹配')
+    }
+    return { cwd: target.cwd, turnStartSeq: target.turnStartSeq, checkpoint: { id: direct.id } }
+  }
+  const seen = new Set([sessionId])
+  for (;;) {
+    const parentId = current.header.parentSession
+    const seedLength = current.header.seedLength
+    if (parentId === undefined || seedLength === undefined || target.turnStartSeq >= seedLength) {
+      return { cwd: target.cwd, turnStartSeq: target.turnStartSeq }
+    }
+    if (seen.has(parentId)) {
+      throw new ShadowRewindError('PLAN_STALE', '会话分叉谱系出现环')
+    }
+    seen.add(parentId)
+    try {
+      current = await readSession(deps, parentId)
+    } catch (error) {
+      throw new ShadowRewindError('PLAN_STALE', `父会话 ${parentId} 不可读`, { cause: error })
+    }
+    const inherited = await engine.findTurnCheckpoint({ cwd: target.cwd, sessionId: parentId, turn })
+    if (inherited === undefined) continue
+    if (inherited.turnStartSeq !== target.turnStartSeq) {
+      throw new ShadowRewindError('PLAN_STALE', '继承的检查点与该回合起点不匹配')
+    }
+    return { cwd: target.cwd, turnStartSeq: target.turnStartSeq, checkpoint: { id: inherited.id } }
+  }
+}
+
+function turnTarget(session: { id: string; header: { cwd?: string }; events: readonly SessionEvent[] }, turn: number): { cwd: string; turnStartSeq: number } {
+  const cwd = session.header.cwd
+  if (cwd === undefined) {
+    throw new ShadowRewindError('WORKSPACE_REQUIRED', `会话 ${session.id} 没有工作目录`)
+  }
+  const start = session.events.find((event) => event.type === 'turn/start' && event.data.turn === turn)
+  if (start === undefined) {
+    throw new ShadowRewindError('RESTORE_POINT_NOT_FOUND', `会话 ${session.id} 没有回合 ${String(turn)} 的起点`)
+  }
+  return { cwd, turnStartSeq: start.seq }
+}
+
+async function turnCheckpointForRequest(deps: RewindHttpDeps, engine: ShadowRewindEngine, sessionId: string, turn: number, requestedId: string): Promise<{ id: string; cwd: string }> {
+  const resolved = await resolveTurnCheckpoint(deps, engine, sessionId, turn)
+  if (resolved.checkpoint === undefined) {
+    throw new ShadowRewindError('RESTORE_POINT_NOT_FOUND', `回合 ${String(turn)} 没有可用的快照检查点`)
+  }
+  if (requestedId !== resolved.checkpoint.id) {
+    throw new ShadowRewindError('PLAN_STALE', '该回合的检查点已变化；请重新检查')
+  }
+  return { id: resolved.checkpoint.id, cwd: resolved.cwd }
+}
+
+/**
+ * 运行中的共享工作区会话分诊：哪些真正阻塞恢复，哪些只是被闸住的旁观者。
+ *  - 闸开启：只有「请求者自身」（恢复期间它可能写文件）与「当前所有者」
+ *    （唯一未被闸拒绝的写入者）阻塞；其余运行中的会话写入已被拒绝，只提示。
+ *  - 闸关闭：保持旧行为——任何运行中的会话都阻塞。
+ */
+export function partitionRunningSessions(runningSessionIds: readonly string[], requesterSessionId: string, ownerSessionId: string | undefined, gateEnabled: boolean): { blocking: readonly string[]; gated: readonly string[] } {
+  if (!gateEnabled) return { blocking: [...runningSessionIds], gated: [] }
+  const blocking: string[] = []
+  const gated: string[] = []
+  for (const id of runningSessionIds) {
+    if (id === requesterSessionId || (ownerSessionId !== undefined && id === ownerSessionId)) blocking.push(id)
+    else gated.push(id)
+  }
+  return { blocking, gated }
+}
+
+/** 执行前的公共闸门：工作区占用检查 + 计划与确认串必须齐备。 */
+async function applyGuarded(deps: RewindHttpDeps, engine: ShadowRewindEngine, sessionId: string, cwd: string, writeGate: WorkspaceWriteGate, planId: string | undefined, confirmation: string | undefined): Promise<RestoreResult> {
+  const running = await sharedWorkspaceSessions(deps, cwd)
+  const ownerId = await writeGate.ownerOf(cwd)
+  const { blocking } = partitionRunningSessions(running, sessionId, ownerId, writeGate.isEnabled)
+  if (blocking.length > 0) {
+    throw new ShadowRewindError('WORKSPACE_IN_USE', `项目目录正被这些会话占用（恢复会与它们的写入冲突）：${blocking.slice(0, 5).join(', ')}`)
+  }
+  if (planId === undefined || confirmation === undefined) {
+    throw new ShadowRewindError('NO_CHANGES', '该回合没有可恢复的项目文件变更')
+  }
+  return engine.applyRestore({ planId, confirmation, sessionId })
 }
 
 async function createConversationRestart(deps: RewindHttpDeps, sourceId: string, checkpoint: { cwd: string; messageSeq: number; turn: number; turnStartSeq: number; previousTurnEndSeq?: number }): Promise<{ sessionId: string }> {

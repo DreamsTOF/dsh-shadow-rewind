@@ -9,8 +9,8 @@ import { execFileSync } from 'node:child_process'
 import { mkdtemp, mkdir, rm, writeFile, readFile, chmod, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ShadowRewindEngine } from '../lib/engine.js'
-import { ShadowRewindError } from '../lib/errors.js'
+import { ShadowRewindEngine } from '../lib/index.js'
+import { ShadowRewindError } from '../lib/index.js'
 
 function jjOnPath() {
   try {

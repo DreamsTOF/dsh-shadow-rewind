@@ -1,4 +1,8 @@
-# 把影子回退插件挂进 DSH Profile（与其它 Profile Bundle 同机制，不改 dsh 核心）。
+# 把融合插件挂进 DSH Profile（与其它 Profile Bundle 同机制，不改 dsh 核心）。
+# 禁用内置 ui-deliverables：聊天轮尾的产物卡片由本插件的 turnTail 行接管。
+- id: ui-deliverables
+  disabled: true
+
 - insert:
     - id: shadow-rewind
       name: 'dsh-shadow-rewind'

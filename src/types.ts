@@ -224,6 +224,15 @@ export interface ShadowRewindConfig {
    * 字面路径（如 `node_modules`）视为「任意层级下的同名目录及其内容」。
    */
   readonly excludePatterns?: readonly string[]
+  /**
+   * 写入闸（「以当前为准」，默认开启）：同一工作区任一时刻只允许最近一个
+   * 开始回合的会话写入；其它会话的可变工具（含终端与 run_code）被拒绝，
+   * 只读工具照常。开启后恢复的占用闸放宽为「仅请求者自身与当前所有者
+   * 运行中才阻塞」。关闭时恢复保持旧行为（任何运行中的会话都阻塞）。
+   */
+  readonly writeGate?: boolean
+  /** 写入闸在只读白名单之外额外放行的工具名（白名单语义见 README）。 */
+  readonly writeGateAllow?: readonly string[]
 }
 
 /** 解析完成（全部字段有值）的配置。 */
