@@ -179,3 +179,35 @@ test('运行中途切换：关闭=软放行、登记照常；再开启=硬抢占
   gate.setGate(false)
   assert.deepEqual(await gate.check({ name: 'write', agent: b }), { kind: 'allow' })
 })
+
+// 回归（v0.6.1）：闸依赖必须经注入作用域摘取。插件 ctx 未 inject
+// agents/sessions，直接属性访问会触发 cordis 访问保护——真实宿主上抛
+// "cannot get property "agents" without inject"，闸一开所有工具裁决即报错。
+test('闸依赖从注入作用域摘取后可正常裁决（inject 闭包机制）', async () => {
+  const { Context } = await import('@deepseek-ai/cordis')
+  const ctx = new Context()
+  const list = [agent('owner'), agent('bystander')]
+  ctx.provide('agents', { list: () => list })
+  ctx.provide('sessions', { get: (id) => list.find(a => a.id === id) })
+  const captured = {}
+  ctx.inject(['agents'], (scope) => { captured.agents = scope.agents })
+  ctx.inject(['sessions'], (scope) => { captured.sessions = scope.sessions })
+  await new Promise((resolve) => { setTimeout(resolve, 50) })
+  assert.deepEqual(captured.agents?.list?.().map(a => a.id), ['owner', 'bystander'])
+
+  // 与 index.ts 装配同款闭包 deps：所有者放行、旁观者拒绝、谱系不抛。
+  const gate = new WorkspaceWriteGate({
+    canonicalDirectory: async (path) => path,
+    get sessions() { return captured.sessions },
+    get agents() { return captured.agents },
+    logger: { warn() {} },
+  })
+  const owner = agent('owner')
+  await gate.claim(owner)
+  assert.deepEqual(await gate.check({ name: 'write', agent: owner }), { kind: 'allow' })
+  const decision = await gate.check({ name: 'write', agent: agent('bystander') })
+  assert.equal(decision.kind, 'deny')
+  // 子代理谱系：sessions 依赖经同一闭包解析，不抛错。
+  const child = agent('sub', WORKSPACE, 'owner')
+  assert.deepEqual(await gate.check({ name: 'write', agent: child }), { kind: 'allow' })
+})

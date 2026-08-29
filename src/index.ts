@@ -58,24 +58,23 @@ export class ShadowRewindService {
     this.coordinator = new TurnCheckpointCoordinator(this.engine)
 
     // 写入闸：恒常构造——所有权登记永远进行（即使拒绝裁决关闭），保证
-    // 运行时中途开启闸时立刻有据可依。依赖（sessions/agents）在构造时可能
-    // 尚未就绪，用惰性 getter 延迟解析——闸在每次裁决时才读取当时的存活面。
-    {
-      const lazy = ctx as unknown as {
-        sessions?: WriteGateDeps['sessions']
-        agents?: WriteGateDeps['agents']
-      }
-      const deps: WriteGateDeps = {
-        canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
-        get sessions() { return lazy.sessions },
-        get agents() { return lazy.agents },
-        logger: ctx.logger,
-      }
-      this.writeGate = new WorkspaceWriteGate(deps, {
-        enabled: config.writeGate ?? true,
-        allow: config.writeGateAllow,
-      })
-    }
+    // 运行时中途开启闸时立刻有据可依。插件 ctx 自身没有 inject
+    // agents/sessions，直接属性访问会触发 cordis 的访问保护（抛
+    // "cannot get property ... without inject"，闸一开所有工具裁决即报错），
+    // 因此 deps 经注入作用域惰性读取（与 HTTP 端点同机制）：inject 回调把
+    // scope 上的服务摘进闭包，闸在每次裁决时读取当时的存活面。注入完成前
+    // 两者为 undefined，按 WriteGateDeps 的可选语义降级（agents 缺失 →
+    // 所有者视为存活；sessions 缺失 → 谱系上溯停止）。
+    const gateServices: { sessions?: WriteGateDeps['sessions']; agents?: WriteGateDeps['agents'] } = {}
+    this.writeGate = new WorkspaceWriteGate({
+      canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
+      get sessions() { return gateServices.sessions },
+      get agents() { return gateServices.agents },
+      logger: ctx.logger,
+    }, {
+      enabled: config.writeGate ?? true,
+      allow: config.writeGateAllow,
+    })
 
     // 文件审查半边（dsh-file-review-tab 融合）：Typert `fileReview` 服务 +
     // 最终回复文件引用引导 + Code Mode 录制器；录制记录持久化到本插件存储。
@@ -88,9 +87,14 @@ export class ShadowRewindService {
     installWriteGateHost(ctx as unknown as Parameters<typeof installWriteGateHost>[0], this.writeGate)
 
     ctx.inject(['agents'], (scope) => {
+      gateServices.agents = (scope as unknown as WriteGateDeps).agents
       this.coordinator.install(scope as unknown as HostContext)
       // 所有权登记与快照共用 agent/pre-step 瀑布（step 1 抢占）。
       this.writeGate?.install(scope as unknown as HostContext)
+    })
+    // 闸的谱系查找需要 sessions；独立注入，避免把它耦合进快照安装的可用面。
+    ctx.inject(['sessions'], (scope) => {
+      gateServices.sessions = (scope as unknown as WriteGateDeps).sessions
     })
     ctx.inject(['webServer', 'sessions', 'sessionQuery', 'apiProxy', 'agents'], (scope) => {
       const s = scope as unknown as Parameters<typeof installShadowRewindHttp>[0]
