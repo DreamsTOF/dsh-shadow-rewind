@@ -71,4 +71,3 @@ export declare class ShadowRewindService {
     listRecovery(options: Parameters<ShadowRewindEngine['listRecovery']>[0]): ReturnType<ShadowRewindEngine['listRecovery']>;
 }
 export default ShadowRewindService;
-//# sourceMappingURL=index.d.ts.map

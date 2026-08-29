@@ -35,4 +35,3 @@ export declare class ShadowJj {
      */
     readSnapshot(commitId: string, path: string, signal?: AbortSignal): Promise<Buffer | null>;
 }
-//# sourceMappingURL=jj-backend.d.ts.map

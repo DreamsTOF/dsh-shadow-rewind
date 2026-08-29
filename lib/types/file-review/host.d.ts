@@ -20,4 +20,3 @@ export interface InstallFileReviewHostOptions {
  * @param ctx - 宿主 cordis 上下文（携带 system-prompt 注册表与工具瀑布）。
  */
 export declare function installFileReviewHost(ctx: Context, options?: InstallFileReviewHostOptions): FileReviewService;
-//# sourceMappingURL=host.d.ts.map

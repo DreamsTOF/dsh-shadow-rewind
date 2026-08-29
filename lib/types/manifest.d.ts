@@ -20,4 +20,3 @@ export declare function diffTrees(before: Readonly<Record<string, SnapshotEntry>
 export declare function parseManifest(value: unknown): Manifest;
 /** 解析并校验一份恢复操作日志。 */
 export declare function parseOperation(value: unknown): RestoreOperation;
-//# sourceMappingURL=manifest.d.ts.map

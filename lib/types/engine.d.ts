@@ -173,4 +173,3 @@ export declare class ShadowRewindEngine {
 }
 /** 自动检查点的失败中，哪些属于「可预期跳过」而非故障。 */
 export declare function isCheckpointSkipCode(code: string): boolean;
-//# sourceMappingURL=engine.d.ts.map

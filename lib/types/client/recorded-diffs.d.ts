@@ -5,4 +5,3 @@ import type { ProducedFileDiff } from '../file-review/change-types.ts';
  * card). Returns [] when the mutation did not change the file.
  */
 export declare function diffsFromBeforeAfter(path: string, before: string | null, after: string): readonly ProducedFileDiff[];
-//# sourceMappingURL=recorded-diffs.d.ts.map

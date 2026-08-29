@@ -224,4 +224,3 @@ export interface ResolvedShadowRewindConfig {
     readonly turnCheckpointTrust: 'fast' | 'strict';
     readonly excludePatterns: readonly string[];
 }
-//# sourceMappingURL=types.d.ts.map

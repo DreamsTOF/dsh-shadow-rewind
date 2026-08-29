@@ -11,4 +11,3 @@ export declare class ShadowRewindError extends Error {
 }
 /** 把任意抛出值压成一条有界（2000 字符）的诊断文本。 */
 export declare function errorMessage(error: unknown): string;
-//# sourceMappingURL=errors.d.ts.map

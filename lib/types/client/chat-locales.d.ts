@@ -50,4 +50,3 @@ export declare const en: {
 export type DeliverablesKey = keyof typeof en;
 /** Simplified Chinese dictionary. */
 export declare const zh: Record<DeliverablesKey, string>;
-//# sourceMappingURL=chat-locales.d.ts.map

@@ -40,4 +40,3 @@ export declare class FileReviewService extends TypertRemoteService {
     /** Toggle every independently safe file while the receiving Agent is idle. */
     apply(agent: Agent, request: FileReviewRequest): Promise<FileReviewResult>;
 }
-//# sourceMappingURL=file-review-service.d.ts.map

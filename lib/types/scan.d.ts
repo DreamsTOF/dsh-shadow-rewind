@@ -50,4 +50,3 @@ export declare function scanWorkspace(cwd: string, options: {
     readonly excludes: readonly ExcludeRule[];
     readonly signal?: AbortSignal;
 }): Promise<DirectoryScan>;
-//# sourceMappingURL=scan.d.ts.map

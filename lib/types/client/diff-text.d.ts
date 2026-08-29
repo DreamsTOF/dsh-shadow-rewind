@@ -5,4 +5,3 @@
  * @returns Content lines without the terminating newline.
  */
 export declare function diffContentLines(text: string): string[];
-//# sourceMappingURL=diff-text.d.ts.map

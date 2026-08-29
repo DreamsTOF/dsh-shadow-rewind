@@ -33,4 +33,3 @@ export declare function attributePaths(options: {
 }): Map<string, PathAttribution>;
 /** HTTP 序列化：'target' | 'multi' | 'unknown' | 具体会话 id。 */
 export declare function serializeOwner(owner: PathOwner): string;
-//# sourceMappingURL=attribution.d.ts.map

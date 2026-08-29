@@ -36,4 +36,3 @@ export interface CaptureOptions {
 export declare function captureSnapshot(options: CaptureOptions): Promise<CaptureOutput>;
 /** 全树确定性哈希：路径 + 条目完整签名（与存储后端无关）。 */
 export declare function hashTree(entries: Readonly<Record<string, SnapshotEntry>>): string;
-//# sourceMappingURL=capture.d.ts.map

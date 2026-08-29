@@ -78,7 +78,9 @@ const config: UserConfig[] = [{
   platform: 'browser',
   target: 'es2022',
   dts: false,
-  sourcemap: true,
+  // 不产出 client.js.map：它比 client.js 本身还大，而 lib/ 是发布物，
+  // 会把 map 一并带进包和 git；且 loader 注入的产物无法按 map 回源调试。
+  sourcemap: false,
   clean: false,
   deps: {
     neverBundle: [...CLIENT_EXTERNALS],

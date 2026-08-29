@@ -105,4 +105,3 @@ export declare function installWriteGateHost(ctx: {
     effect(dispose: () => void, label?: string): void;
     on(event: string, listener: (exec: unknown, next: unknown) => unknown): () => void;
 }, gate: WorkspaceWriteGate): void;
-//# sourceMappingURL=write-gate.d.ts.map

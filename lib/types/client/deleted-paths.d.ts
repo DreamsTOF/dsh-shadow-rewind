@@ -31,4 +31,3 @@ export declare function deletedPathsFromCommand(command: string): readonly strin
  * deletions.
  */
 export declare function deletedPaths(view: unknown): readonly string[];
-//# sourceMappingURL=deleted-paths.d.ts.map

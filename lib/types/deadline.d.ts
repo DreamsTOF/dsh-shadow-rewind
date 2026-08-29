@@ -4,4 +4,3 @@ export declare function createDeadline(timeoutMs: number): {
     readonly signal: AbortSignal;
     cancel(): void;
 };
-//# sourceMappingURL=deadline.d.ts.map

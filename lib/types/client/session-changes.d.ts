@@ -63,4 +63,3 @@ export declare function countChangedFiles(turns: readonly TurnFileChanges[]): nu
 export declare function basename(path: string): string;
 /** Resolve a (possibly relative) tool path against the session cwd. */
 export declare function resolveSessionPath(cwd: string | undefined, path: string): string;
-//# sourceMappingURL=session-changes.d.ts.map

@@ -39,4 +39,3 @@ export declare function summarizeDiffs(diffs: readonly DiffHunk[]): UnifiedDiffS
  */
 export declare function UnifiedDiff({ diffs, contextLines, labels, className, showCopyButton, showFileHeaders, selectable, selectedHunks, onSelectedHunksChange, }: UnifiedDiffProps): import("react").JSX.Element | null;
 export {};
-//# sourceMappingURL=UnifiedDiff.d.ts.map

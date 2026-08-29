@@ -72,4 +72,3 @@ export interface RecordedRequest {
 export interface RecordedResult {
     readonly mutations: readonly RecordedMutation[];
 }
-//# sourceMappingURL=change-types.d.ts.map

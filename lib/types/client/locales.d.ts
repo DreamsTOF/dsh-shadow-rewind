@@ -107,4 +107,3 @@ export declare function attachLocale(service: {
 } | undefined): void;
 /** Translate a copy key; `{name}` placeholders interpolate from `params`. */
 export declare function t(key: CopyKey, params?: Record<string, string | number>): string;
-//# sourceMappingURL=locales.d.ts.map

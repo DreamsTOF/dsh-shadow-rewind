@@ -13,3 +13,4 @@ tests/.tmp/
 
 # 日志
 *.log
+.npmrc

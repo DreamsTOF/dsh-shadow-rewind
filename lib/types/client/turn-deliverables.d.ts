@@ -84,4 +84,3 @@ export declare function basename(path: string): string;
  * the same disambiguator the row's chips carry.
  */
 export declare function producedFileMentions(paths: readonly string[], openFile: (path: string) => void, label: (path: string) => string): MarkdownFileMentions;
-//# sourceMappingURL=turn-deliverables.d.ts.map

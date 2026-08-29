@@ -17,4 +17,3 @@ export interface FileReviewTabProps {
 }
 /** The sidebar tab body: per-turn change groups with inline diffs and undo. */
 export declare function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewTabProps): import("react").JSX.Element;
-//# sourceMappingURL=FileReviewTab.d.ts.map

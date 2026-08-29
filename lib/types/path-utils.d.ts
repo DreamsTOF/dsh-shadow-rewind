@@ -46,4 +46,3 @@ export declare function syncDirectory(path: string): Promise<void>;
 export declare function safeFileNames(path: string): Promise<string[]>;
 /** 列出一层目录里的子目录名（不存在 → 空数组）。 */
 export declare function safeDirectoryNames(path: string): Promise<string[]>;
-//# sourceMappingURL=path-utils.d.ts.map

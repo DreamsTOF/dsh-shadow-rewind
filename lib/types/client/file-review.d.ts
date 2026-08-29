@@ -41,4 +41,3 @@ export declare const fileReviewInject: string[];
  * @param ctx - client root context.
  */
 export declare function applyFileReview(ctx: Context): void;
-//# sourceMappingURL=file-review.d.ts.map

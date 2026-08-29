@@ -18,4 +18,3 @@ export declare function fetchSubsetPlan(query: string, paths: readonly string[])
 }>;
 /** URL 长度守卫：勾选过多时拒绝发起（避免请求行超限）。 */
 export declare function pathsTooLong(paths: readonly string[]): boolean;
-//# sourceMappingURL=subset-plan.d.ts.map

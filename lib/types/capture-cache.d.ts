@@ -33,4 +33,3 @@ export declare function clearCaptureCache(path: string): Promise<void>;
 export declare function cacheEntryOf(file: ScannedPath, blob?: string, target?: string): CacheEntry;
 /** stat 指纹比对：缓存记录 vs 扫描事实。 */
 export declare function cacheMatches(cached: CacheEntry, file: ScannedPath): boolean;
-//# sourceMappingURL=capture-cache.d.ts.map

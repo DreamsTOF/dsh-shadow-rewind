@@ -46,4 +46,3 @@ export declare class WorkspaceStore {
     /** 状态根必须不在被管理工作区内（防自吞）。 */
     assertStorageSeparated(workspace: string): Promise<void>;
 }
-//# sourceMappingURL=store.d.ts.map
