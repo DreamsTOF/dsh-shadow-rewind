@@ -16,6 +16,15 @@ export interface SessionFileChange {
     readonly diffs: readonly ProducedFileDiff[];
     /** Terminal commands deleted this path in this turn (display-only). */
     readonly deleted?: true;
+    /** 条目来源：'fs' = 检查点对比派生（终端写盘）；缺省 = 工具结果视图。 */
+    readonly origin?: 'fs';
+    /** 空目录条目（撤销语义是 mkdir/rmdir，不涉内容）。 */
+    readonly dir?: true;
+    /** 服务端预算的行数（fs 条目懒加载全文前的显示用；缺省按 diffs 汇总）。 */
+    readonly counts?: {
+        readonly added: number;
+        readonly removed: number;
+    };
 }
 /** One turn's produced files, in first-seen order. */
 export interface TurnFileChanges {

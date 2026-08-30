@@ -19,4 +19,4 @@ export type ProducedFilesProps = Pick<TurnTailOwnerProps, 'openFile' | 'turn'> &
     openInSidebarTab?: (paths: readonly string[], turn?: number) => void;
 } & PropsLocale<typeof NS>;
 /** Render one turn's produced files as a summary card opening the sidebar tab. */
-export declare function ProducedFiles({ matched: reviews, openFile, turn: turnLocation, inspectChanges, applyChanges, openInSidebarTab, t, }: ProducedFilesProps): import("react").JSX.Element;
+export declare function ProducedFiles({ matched: matchedReviews, openFile, turn: turnLocation, projectRoot, inspectChanges, applyChanges, openInSidebarTab, t, }: ProducedFilesProps): import("react").JSX.Element;

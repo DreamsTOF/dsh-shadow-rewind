@@ -70,7 +70,7 @@ function producedDiffs(view: unknown): readonly ProducedFileDiff[] {
   if (record.card !== 'diff' || !Array.isArray(record.diffs)) return []
   const diffs: ProducedFileDiff[] = []
   for (const value of record.diffs) {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return []
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return rejectDiffs(record.diffs.length)
     const { path, oldText, newText, oldStart, newStart } = value as Record<string, unknown>
     if (typeof path !== 'string'
       || (oldText !== null && typeof oldText !== 'string')
@@ -78,7 +78,9 @@ function producedDiffs(view: unknown): readonly ProducedFileDiff[] {
       || (oldStart !== undefined
         && (typeof oldStart !== 'number' || !Number.isInteger(oldStart) || oldStart < 1))
       || (newStart !== undefined
-        && (typeof newStart !== 'number' || !Number.isInteger(newStart) || newStart < 1))) return []
+        && (typeof newStart !== 'number' || !Number.isInteger(newStart) || newStart < 1))) {
+      return rejectDiffs(record.diffs.length)
+    }
     diffs.push({
       path,
       oldText,
@@ -90,12 +92,23 @@ function producedDiffs(view: unknown): readonly ProducedFileDiff[] {
   return diffs
 }
 
+/** 一条 hunk 形状不完整就整组丢弃是刻意设计（宿主撤销要求全量可逆）；
+ * 但静默丢弃曾让「文件在列、撤销永久禁用」无从排查——至少留痕。 */
+function rejectDiffs(total: number): readonly ProducedFileDiff[] {
+  console.warn(`[dsh-shadow-rewind] diff 视图中存在不可解析的 hunk，整组丢弃（共 ${String(total)} 条）`)
+  return []
+}
+
 /** Applied result hunks, or successful-call intent only when no result view exists. */
 function reviewDiffs(
   callView: ToolResultNode['callView'],
   resultView: ConversationMatch['view'],
 ): readonly ProducedFileDiff[] {
-  if (resultView?.for === 'result') return producedDiffs(resultView.view)
+  // Result view 优先，但拿不到可用 hunks 时必须回退 call view：部分工具
+  // （如 write）的 result 呈现不是 diff 卡，hunks 只在 call view 上——
+  // 只认 result view 会让「文件在列、diffs 为空」，撤销按钮永久禁用。
+  const fromResult = resultView?.for === 'result' ? producedDiffs(resultView.view) : []
+  if (fromResult.length > 0) return fromResult
   return producedDiffs(callView)
 }
 

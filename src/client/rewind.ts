@@ -284,11 +284,13 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
   // 对称模式的勾选集（null = 非对称模式，整树恢复）。
   const [selected, setSelected] = React.useState<ReadonlySet<string> | null>(null)
 
-  const load = React.useCallback(async () => {
-    setLoading(true)
-    setStale(false)
-    setError(null)
-    setCompleted(null)
+  const load = React.useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true)
+      setStale(false)
+      setError(null)
+      setCompleted(null)
+    }
     try {
       const response = await fetch(`${PATH}?sessionId=${encodeURIComponent(sessionId)}&messageSeq=${String(matched.messageSeq)}`, {
         headers: { accept: 'application/json' }, cache: 'no-store',
@@ -321,9 +323,10 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
         ? new Set(first.changes.filter(change => change.autoSelect === true).map(change => change.path))
         : null)
     } catch (caught) {
-      setError(friendlyError(caught))
+      // 静默重查失败不动已有预览（占用未解除是常态，不算错误）。
+      if (!silent) setError(friendlyError(caught))
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }, [sessionId, matched.messageSeq])
 
@@ -334,6 +337,15 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
   // 阻塞判定：优先用服务端的写入闸分诊（restoreBlocked），旧协议回退到计数。
   const sharedBlocked = ready !== null
     && (ready.restoreBlocked ?? ready.activeSessionIds.length > 0)
+
+  // 占用自动重查：blocked 期间每 3s 静默重取预览，占用解除的瞬间按钮就地
+  // 变活——否则 blocked 时的预览不带 planId/confirmation，恢复按钮会一直
+  // 死在禁用态。
+  React.useEffect(() => {
+    if (!sharedBlocked || applying || completed !== null) return
+    const timer = window.setInterval(() => { void load(true) }, 3000)
+    return () => { window.clearInterval(timer) }
+  }, [sharedBlocked, applying, completed, load])
   const gatedRunning = ready?.gatedSessionIds?.length ?? 0
   const symmetric = ready?.mode === 'symmetric'
   const selectedCount = selected?.size ?? 0

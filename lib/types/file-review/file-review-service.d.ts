@@ -25,6 +25,8 @@ export declare class FileReviewService extends TypertRemoteService {
     /** 每 agent 的串行化落盘链（防抖触发可能晚于前一次写入）。 */
     private readonly flushChains;
     private readonly recordsDir;
+    /** 删除类 fs 撤销的安全网目录：<storageDir>/file-review/rescue/。 */
+    private readonly rescueDir;
     constructor(ctx: Context, options?: FileReviewServiceOptions);
     /** Append one nested (Code Mode) file mutation for the receiving agent. */
     recordMutation(agent: Agent, mutation: RecordedMutation): void;

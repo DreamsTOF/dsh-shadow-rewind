@@ -21,6 +21,12 @@ export interface DirectoryScan {
     readonly paths: readonly ScannedPath[];
     /** 可见但被显式跳过的路径，按 path 排序。 */
     readonly skipped: readonly SkippedPath[];
+    /** 子树里没有任何入选路径的目录（空目录）；根目录不含在内，按 path 排序。
+     * 快照据此记录纯目录的增删——非空目录由其子条目隐式表达，不重复记录。 */
+    readonly emptyDirs: readonly {
+        readonly path: string;
+        readonly mode: number;
+    }[];
 }
 /** 一条编译完成的排除规则。 */
 export interface ExcludeRule {

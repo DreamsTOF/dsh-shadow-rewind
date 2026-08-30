@@ -28,8 +28,15 @@ export interface SymlinkEntry {
   readonly mode: number
 }
 
-/** 快照条目：文件或符号链接。目录不入快照（按需在恢复时重建/回收）。 */
-export type SnapshotEntry = FileEntry | SymlinkEntry
+/** 单个空目录的快照条目（子树里没有任何入选文件/链接的目录）。
+ * 非空目录不入快照——它们由子条目在恢复时按需重建。 */
+export interface DirEntry {
+  readonly kind: 'dir'
+  readonly mode: number
+}
+
+/** 快照条目：文件、符号链接或空目录。 */
+export type SnapshotEntry = FileEntry | SymlinkEntry | DirEntry
 
 /** 一个可见路径未能进入快照的原因。 */
 export type SkipReason =

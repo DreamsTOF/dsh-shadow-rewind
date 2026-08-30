@@ -42,6 +42,8 @@ export interface CaptureOptions {
   readonly paths: readonly ScannedPath[]
   /** 扫描阶段已产生的跳过项（too-large / unsupported-type）。 */
   readonly skippedAtScan: readonly SkippedPath[]
+  /** 扫描发现的空目录：直接落 dir 条目（无内容、不进增量缓存）。 */
+  readonly emptyDirs?: readonly { readonly path: string; readonly mode: number }[]
   readonly maxFiles: number
   readonly maxSnapshotBytes: number
   readonly strict: boolean
@@ -115,6 +117,11 @@ export async function captureSnapshot(options: CaptureOptions): Promise<CaptureO
     // 以「打开时的 stat 对」为指纹事实：扫描后文件变化的路径按新事实入缓存，
     // 绝不让旧指纹配上新内容污染增量判定。
     nextPaths[file.path] = cacheEntryOf({ ...file, ...read.stat }, blob)
+  }
+  // 空目录没有内容可比对：每次捕获按扫描事实直落条目，不进增量缓存。
+  for (const dir of options.emptyDirs ?? []) {
+    options.signal?.throwIfAborted()
+    entries[dir.path] = { kind: 'dir', mode: dir.mode }
   }
   return {
     entries,
@@ -209,8 +216,10 @@ export function hashTree(entries: Readonly<Record<string, SnapshotEntry>>): stri
     hash.update('\0')
     if (entry.kind === 'file') {
       hash.update(`file\0${entry.blob}\0${entry.size}\0${entry.mode}\0`)
-    } else {
+    } else if (entry.kind === 'symlink') {
       hash.update(`symlink\0${entry.target}\0${entry.mode}\0`)
+    } else {
+      hash.update(`dir\0${entry.mode}\0`)
     }
   }
   return hash.digest('hex')

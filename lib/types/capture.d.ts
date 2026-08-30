@@ -21,6 +21,11 @@ export interface CaptureOptions {
     readonly paths: readonly ScannedPath[];
     /** 扫描阶段已产生的跳过项（too-large / unsupported-type）。 */
     readonly skippedAtScan: readonly SkippedPath[];
+    /** 扫描发现的空目录：直接落 dir 条目（无内容、不进增量缓存）。 */
+    readonly emptyDirs?: readonly {
+        readonly path: string;
+        readonly mode: number;
+    }[];
     readonly maxFiles: number;
     readonly maxSnapshotBytes: number;
     readonly strict: boolean;

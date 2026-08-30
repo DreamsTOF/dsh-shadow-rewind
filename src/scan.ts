@@ -35,6 +35,9 @@ export interface DirectoryScan {
   readonly paths: readonly ScannedPath[]
   /** 可见但被显式跳过的路径，按 path 排序。 */
   readonly skipped: readonly SkippedPath[]
+  /** 子树里没有任何入选路径的目录（空目录）；根目录不含在内，按 path 排序。
+   * 快照据此记录纯目录的增删——非空目录由其子条目隐式表达，不重复记录。 */
+  readonly emptyDirs: readonly { readonly path: string; readonly mode: number }[]
 }
 
 /** 一条编译完成的排除规则。 */
@@ -117,6 +120,8 @@ export async function scanWorkspace(
   const root = await canonicalDirectory(cwd)
   const paths: ScannedPath[] = []
   const skipped: SkippedPath[] = []
+  // 访问过的全部目录（含权限位）；收尾时减去「有入选内容的」即为空目录集。
+  const visitedDirs: { path: string; mode: number }[] = []
   // 显式栈代替递归，避免超深目录树爆调用栈。
   const stack: { readonly dir: string; readonly rel: string }[] = [{ dir: root, rel: '' }]
   while (stack.length > 0) {
@@ -168,6 +173,7 @@ export async function scanWorkspace(
         if (info.isDirectory()) {
           // 目录规则带尾斜杠参与匹配（`node_modules/` 语义）。
           if (matchesExclude(`${relPath}/`, options.excludes)) continue
+          visitedDirs.push({ path: relPath, mode: modeOf(info.mode) })
           stack.push({ dir: absolute, rel: relPath })
           continue
         }
@@ -197,7 +203,18 @@ export async function scanWorkspace(
   }
   paths.sort(byPath)
   skipped.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
-  return { root, paths, skipped }
+  // 空目录 = 访问过的目录 − 任何入选路径的祖先（根本身不参与）。
+  const nonEmpty = new Set<string>()
+  for (const scanned of paths) {
+    const segments = scanned.path.split('/')
+    for (let depth = 1; depth < segments.length; depth += 1) {
+      nonEmpty.add(segments.slice(0, depth).join('/'))
+    }
+  }
+  const emptyDirs = visitedDirs
+    .filter((dir) => !nonEmpty.has(dir.path))
+    .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
+  return { root, paths, skipped, emptyDirs }
 }
 
 function modeOf(mode: bigint): number {

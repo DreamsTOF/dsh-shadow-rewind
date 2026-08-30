@@ -24,9 +24,9 @@ export interface PathAttribution {
 /** 快照条目的稳定比较键（内容 blob + 类型 + 权限位）；null = 路径不存在。 */
 function entryKey(entry: SnapshotEntry | null): string {
   if (entry === null) return '-'
-  return entry.kind === 'file'
-    ? `f:${entry.blob}:${entry.mode.toString(36)}`
-    : `s:${entry.target}:${entry.mode.toString(36)}`
+  if (entry.kind === 'file') return `f:${entry.blob}:${entry.mode.toString(36)}`
+  if (entry.kind === 'dir') return `d:${entry.mode.toString(36)}`
+  return `s:${entry.target}:${entry.mode.toString(36)}`
 }
 
 export function attributePaths(options: {

@@ -30,6 +30,7 @@ export declare const en: {
     'produced.noticeClose': string;
     'produced.noticeDismiss': string;
     'produced.deleted': string;
+    'produced.dir': string;
     'produced.deletedOne': string;
     'produced.deletedAll': string;
     'review.title': string;
@@ -43,8 +44,13 @@ export declare const en: {
     'review.copied': string;
     'review.showUnchanged': string;
     'review.hideUnchanged': string;
+    'review.hunkN': string;
+    'review.hunkInclude': string;
     'review.stats': string;
     'review.unavailable': string;
+    'live.changes': string;
+    'live.deleted': string;
+    'live.more': string;
 };
 /** Union of this namespace's dictionary keys. */
 export type DeliverablesKey = keyof typeof en;

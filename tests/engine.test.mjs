@@ -6,7 +6,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, mkdir, rm, writeFile, readFile, chmod, symlink } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, rmdir, writeFile, readFile, chmod, symlink, lstat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ShadowRewindEngine } from '../lib/index.js'
@@ -73,7 +73,9 @@ async function assertRoundtrip(mode) {
     assert.equal(kinds['added.txt'], 'added')
 
     const result = await rewindTo(engine, workspace, checkpoint.id)
-    assert.equal(result.restoredPaths.length, 3)
+    // 4 = 三个文件变更 + sub 的隐式目录变更（b.txt 被删后 sub 变成空目录，
+    // 当前树以 dir 条目呈现，随恢复一并收敛）。
+    assert.equal(result.restoredPaths.length, 4)
     assert.equal(await readFile(join(workspace, 'a.txt'), 'utf8'), 'hello v1\n')
     assert.equal(await readFile(join(workspace, 'sub', 'b.txt'), 'utf8'), 'bee v1\n')
     await assert.rejects(() => readFile(join(workspace, 'added.txt')))
@@ -395,3 +397,96 @@ if (jjOnPath()) {
   test('符号链接被恢复（jj 镜像）', posix, () => assertSymlinkMirror('jj'))
 }
 
+test('轮末归属：终端/PowerShell 风格写盘被「轮起 vs 下一轮轮起」对比捕获', async () => {
+  const workspace = await makeWorkspace()
+  const { engine } = await makeEngine({})
+  try {
+    // 轮 1 轮起检查点。
+    const t1 = await captureTurn(engine, workspace, 1)
+
+    // 模拟终端/PowerShell 的三种写盘：改、加、删（全部绕过文件工具）。
+    await writeFile(join(workspace, 'a.txt'), 'hello v2 via terminal\n', 'utf8')
+    await writeFile(join(workspace, 'ps-created.txt'), 'created by powershell\n', 'utf8')
+    await rm(join(workspace, 'sub', 'b.txt'))
+
+    // 轮 2 第一步之前的捕获 = 轮 1 的轮末树状态。
+    const t2 = await captureTurn(engine, workspace, 2)
+
+    // listTurnCheckpoints 按 turn 升序。
+    const list = await engine.listTurnCheckpoints({ cwd: workspace, sessionId: 's1' })
+    assert.deepEqual(list.map((p) => p.turn), [1, 2])
+
+    // 轮 1 的变更 = diff(t1, t2)——不含轮 2 之后的任何写盘。
+    const diff = await engine.diffCheckpoints({
+      cwd: workspace,
+      prevCheckpointId: t1.id,
+      currCheckpointId: t2.id,
+    })
+    const kinds = Object.fromEntries(diff.changes.map((change) => [change.path, change.kind]))
+    assert.equal(kinds['a.txt'], 'modified')
+    assert.equal(kinds['ps-created.txt'], 'added')
+    assert.equal(kinds['sub/b.txt'], 'deleted')
+    // b.txt 被删后 sub 成为空目录：t2 检查点以 dir 条目记录，构成第四条变更。
+    assert.equal(kinds['sub'], 'added')
+    assert.equal(diff.changes.length, 4)
+
+    // 检查点内容可按路径读回（供客户端生成完整 diff）。
+    const content = await engine.getFileContentFromCheckpoint({
+      cwd: workspace,
+      checkpointId: t2.id,
+      path: 'ps-created.txt',
+    })
+    assert.equal(content?.toString('utf8'), 'created by powershell\n')
+    const missing = await engine.getFileContentFromCheckpoint({
+      cwd: workspace,
+      checkpointId: t1.id,
+      path: 'ps-created.txt',
+    })
+    assert.equal(missing, null)
+
+    // 轮 2 开始后又有写盘：不得混入轮 1 的归属窗口。
+    await writeFile(join(workspace, 'turn2-file.txt'), 'turn 2 work\n', 'utf8')
+    const diffAgain = await engine.diffCheckpoints({
+      cwd: workspace,
+      prevCheckpointId: t1.id,
+      currCheckpointId: t2.id,
+    })
+    assert.equal(diffAgain.changes.some((change) => change.path === 'turn2-file.txt'), false)
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+
+test('空目录：检查点记录 dir 条目，轮末归属可见且整轮恢复互逆', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-emptydir-'))
+  const { engine } = await makeEngine({})
+  try {
+    await writeFile(join(workspace, 'a.txt'), 'v1\n', 'utf8')
+    await mkdir(join(workspace, 'empty'))
+    const t1 = await captureTurn(engine, workspace, 1)
+
+    // 轮内：删掉空目录 + 改文件。
+    await rmdir(join(workspace, 'empty'))
+    await writeFile(join(workspace, 'a.txt'), 'v2\n', 'utf8')
+    const t2 = await captureTurn(engine, workspace, 2)
+
+    const diffResult = await engine.diffCheckpoints({
+      cwd: workspace,
+      prevCheckpointId: t1.id,
+      currCheckpointId: t2.id,
+    })
+    const byPath = Object.fromEntries(diffResult.changes.map((change) => [change.path, change]))
+    assert.equal(byPath['empty'].kind, 'deleted', '空目录的删除必须出现在轮末归属')
+    assert.equal(byPath['empty'].before.kind, 'dir')
+    assert.equal(typeof byPath['empty'].before.mode, 'number')
+
+    // 恢复到轮起：空目录被重建，文件回到 v1。
+    await rewindTo(engine, workspace, t1.id)
+    const stat = await lstat(join(workspace, 'empty'))
+    assert.ok(stat.isDirectory(), '恢复必须重建空目录')
+    assert.equal(await readFile(join(workspace, 'a.txt'), 'utf8'), 'v1\n')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})

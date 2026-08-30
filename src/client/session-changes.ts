@@ -21,6 +21,12 @@ export interface SessionFileChange {
   readonly diffs: readonly ProducedFileDiff[]
   /** Terminal commands deleted this path in this turn (display-only). */
   readonly deleted?: true
+  /** 条目来源：'fs' = 检查点对比派生（终端写盘）；缺省 = 工具结果视图。 */
+  readonly origin?: 'fs'
+  /** 空目录条目（撤销语义是 mkdir/rmdir，不涉内容）。 */
+  readonly dir?: true
+  /** 服务端预算的行数（fs 条目懒加载全文前的显示用；缺省按 diffs 汇总）。 */
+  readonly counts?: { readonly added: number; readonly removed: number }
 }
 
 /** One turn's produced files, in first-seen order. */
@@ -67,7 +73,7 @@ export function producedDiffs(view: unknown): readonly ProducedFileDiff[] {
   if (record.card !== 'diff' || !Array.isArray(record.diffs)) return []
   const diffs: ProducedFileDiff[] = []
   for (const value of record.diffs) {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return []
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return rejectDiffs(record.diffs.length)
     const { path, oldText, newText, oldStart, newStart } = value as Record<string, unknown>
     if (typeof path !== 'string'
       || (oldText !== null && typeof oldText !== 'string')
@@ -75,7 +81,9 @@ export function producedDiffs(view: unknown): readonly ProducedFileDiff[] {
       || (oldStart !== undefined
         && (typeof oldStart !== 'number' || !Number.isInteger(oldStart) || oldStart < 1))
       || (newStart !== undefined
-        && (typeof newStart !== 'number' || !Number.isInteger(newStart) || newStart < 1))) return []
+        && (typeof newStart !== 'number' || !Number.isInteger(newStart) || newStart < 1))) {
+      return rejectDiffs(record.diffs.length)
+    }
     diffs.push({
       path,
       oldText,
@@ -87,9 +95,19 @@ export function producedDiffs(view: unknown): readonly ProducedFileDiff[] {
   return diffs
 }
 
+/** 一条 hunk 形状不完整就整组丢弃是刻意设计（宿主撤销要求全量可逆）；
+ * 但静默丢弃曾让「文件在列、撤销永久禁用」无从排查——至少留痕。 */
+function rejectDiffs(total: number): readonly ProducedFileDiff[] {
+  console.warn(`[dsh-shadow-rewind] diff 视图中存在不可解析的 hunk，整组丢弃（共 ${String(total)} 条）`)
+  return []
+}
+
 /** Applied result hunks, or call-intent hunks when no result view exists. */
 function reviewDiffs(node: ToolResultNode): readonly ProducedFileDiff[] {
-  if (node.resultView !== null) return producedDiffs(node.resultView)
+  // 与 turn-deliverables 的 reviewDiffs 同一规则：result view 拿不到可用
+  // hunks 时回退 call view——只认 result view 会让 hunks 静默丢失。
+  const fromResult = node.resultView !== null ? producedDiffs(node.resultView) : []
+  if (fromResult.length > 0) return fromResult
   return producedDiffs(node.callView)
 }
 

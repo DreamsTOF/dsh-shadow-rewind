@@ -32,8 +32,10 @@ export function hashTree(entries: Readonly<Record<string, SnapshotEntry>>): stri
     hash.update('\0')
     if (entry.kind === 'file') {
       hash.update(`file\0${entry.blob}\0${entry.size}\0${entry.mode}\0`)
-    } else {
+    } else if (entry.kind === 'symlink') {
       hash.update(`symlink\0${entry.target}\0${entry.mode}\0`)
+    } else {
+      hash.update(`dir\0${entry.mode}\0`)
     }
   }
   return hash.digest('hex')
@@ -46,6 +48,7 @@ export function entriesEqual(left: SnapshotEntry | undefined, right: SnapshotEnt
   if (left.kind === 'file' && right.kind === 'file') {
     return left.blob === right.blob && left.size === right.size
   }
+  if (left.kind === 'dir') return true
   return left.kind === 'symlink' && right.kind === 'symlink' && left.target === right.target
 }
 
@@ -87,7 +90,7 @@ export function diffTrees(
 function entriesSameBytes(left: SnapshotEntry, right: SnapshotEntry): boolean {
   if (left.kind === 'file' && right.kind === 'file') return left.blob === right.blob
   if (left.kind === 'symlink' && right.kind === 'symlink') return left.target === right.target
-  return false
+  return left.kind === 'dir' && right.kind === 'dir'
 }
 
 // ── 持久化数据校验（fail-closed）───────────────────────────────────────────
@@ -243,6 +246,9 @@ function parseEntry(value: unknown, path: string): SnapshotEntry {
     const target = stringField(record, 'target')
     if (target.includes('\0')) corrupt(`快照符号链接 target 含 NUL：${JSON.stringify(path)}`)
     return { kind, target, mode }
+  }
+  if (kind === 'dir') {
+    return { kind, mode }
   }
   corrupt(`快照条目 kind 非法：${JSON.stringify(path)}`)
 }

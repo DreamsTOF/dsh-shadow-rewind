@@ -129,6 +129,9 @@
 
 .fileList {
   border-top: 1px solid var(--dsw-alias-border-l1);
+  /* 同框最多 8 行，超出滚动查找。 */
+  max-height: 304px;
+  overflow-y: auto;
 }
 
 /* 一行 = 深链（文件名 + 统计）+ 单文件撤销按钮。 */
@@ -196,13 +199,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.moreFiles {
-  min-height: 34px;
-  padding: 0 12px;
-  color: var(--dsw-alias-label-tertiary);
-  line-height: 34px;
 }
 
 .drawer {
@@ -633,4 +629,132 @@
   color: var(--dsw-alias-state-error-primary);
   background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent);
   white-space: nowrap;
+}
+
+/* 悬停 diff 浮层：fixed 定位避开聊天流的 overflow 裁剪。 */
+.diffPopover {
+  position: fixed;
+  z-index: 1300;
+  display: flex;
+  max-height: min(480px, 60vh);
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-container, Canvas);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+}
+
+.diffPopoverHeader {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  font: var(--dsw-font-markdown-code-block);
+}
+
+.diffPopoverPath {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diffPopoverBody {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+/* 轮进行中 live 框（conversation.input.dock）：与轮末卡片同一套交互——
+   列表最多 4 行超出滚动，悬停弹对齐浮层，点击开侧边栏审计。 */
+.liveBar {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-container, Canvas);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+}
+
+.liveBarHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.liveDot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-success-primary);
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.liveTitle {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-primary);
+  white-space: nowrap;
+}
+
+.liveFiles {
+  display: flex;
+  flex-direction: column;
+  max-height: 256px; /* 8 行 × 32px，超出滚动查找 */
+  overflow-y: auto;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+
+.liveFileRow {
+  display: flex;
+  width: 100%;
+  min-height: 32px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.liveFileRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.liveFileRow:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--dsw-alias-border-l3);
+}
+
+.liveFileRow .fileName {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.liveFileRow .stats {
+  margin-left: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .liveDot {
+    animation: none;
+  }
 }

@@ -82,6 +82,33 @@ export declare class ShadowRewindEngine {
     }): Promise<{
         reason: string;
     } | undefined>;
+    /** 列出某会话的所有 turn 检查点（按 turn 升序）。 */
+    listTurnCheckpoints(options: {
+        readonly cwd: string;
+        readonly sessionId: string;
+    }): Promise<readonly RestorePointSummary[]>;
+    /**
+     * 对比两个检查点的 entries，生成文件系统级别的变更列表。
+     * 用于捕获 PowerShell 等终端命令创建/修改/删除的文件（这些没有工具结果节点）。
+     * 返回的 changes 结构与 diffTrees 一致，但来源是快照间对比而非当前树。
+     */
+    diffCheckpoints(options: {
+        readonly cwd: string;
+        readonly prevCheckpointId: string;
+        readonly currCheckpointId: string;
+    }): Promise<{
+        readonly changes: readonly WorkspaceChange[];
+        readonly skippedPaths: readonly SkippedPath[];
+    }>;
+    /**
+     * 从指定检查点读取文件内容。用于为文件系统变更生成完整 diff。
+     * 返回 null 表示文件在该检查点不存在（新增或删除）。
+     */
+    getFileContentFromCheckpoint(options: {
+        readonly cwd: string;
+        readonly checkpointId: string;
+        readonly path: string;
+    }): Promise<Buffer | null>;
     /** 实际创建 manifest 的内部路径：调用方必须已持有工作区锁。 */
     private createLocked;
     /** 列出恢复点（默认不含 turn 与 rescue；调用方按需打开）。 */

@@ -27,18 +27,38 @@ import type { ConversationSnapshot, ISessions, SessionId } from '@deepseek-ai/ds
 import type { ChatFileMentions } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { TabDescriptor } from 'dsh-better-sidebar/client/service'
-import type { FileReviewRequest, FileReviewResult } from '../file-review/change-types.ts'
+import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { FileReviewRequest, FileReviewResult, ProducedFileReview } from '../file-review/change-types.ts'
 import { TYPERT_REMOTE } from '../file-review/remote.ts'
 import { FileReviewTab } from './FileReviewTab.tsx'
 import { ProducedFiles } from './ProducedFiles.tsx'
+import { LiveChangesBar, bindLiveBarSessions, bindLiveBarOpenSidebar } from './live-bar.tsx'
 import { attachLocale, en, LOCALE_NS, t, zh } from './locales.ts'
 import {
   en as chatEn, NS as CHAT_NS, zh as chatZh, type DeliverablesKey,
 } from './chat-locales.ts'
 import { countChangedFiles, deriveSessionChanges } from './session-changes.ts'
+import { cachedFsTurnFor, warmFsChanges } from './fs-diff-utils.ts'
+import { dedupeStatus } from './status-dedupe.ts'
 import {
   deliverablesDefinition, producedFileMentions, selectProducedFiles,
 } from './turn-deliverables.ts'
+
+/**
+ * Turn-tail claim with file-system awareness: tool-produced reviews claim as
+ * before; a turn whose only writes happened outside the tools (PowerShell etc.)
+ * claims with an EMPTY match when the warmed fs-changes cache already knows
+ * that turn (keyed by the turn/start seq, unique per session) — the mounted
+ * card then fetches contents and fills itself. select() is synchronous, so the
+ * async endpoint result can only arrive via this cache.
+ */
+function selectProducedFilesWithFs(owner: TurnTailOwnerProps): readonly ProducedFileReview[] | null {
+  const reviews = selectProducedFiles(owner)
+  if (reviews !== null) return reviews
+  const startSeq = owner.turn.start?.seq
+  if (startSeq !== undefined && cachedFsTurnFor(startSeq)?.turn === owner.turn.turn) return []
+  return null
+}
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -107,6 +127,8 @@ function snapshotFingerprint(snapshot: ConversationSnapshot | null): string {
 }
 
 function badgeCount(ctx: Context, sessionId: string): number | null {
+  // 搭车预热 fs-changes 缓存：tab 条渲染高频且覆盖所有会话，warm 内部节流。
+  warmFsChanges(sessionId)
   // Host and browser sessions services share one Cordis key (see
   // dsh-file-review): narrow to the browser ISessions at this boundary.
   const sessions = (ctx as unknown as { readonly sessions: ISessions }).sessions
@@ -220,7 +242,7 @@ export function applyFileReview(ctx: Context): void {
   ctx.effect(
     () => ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
       name: 'conversation.chat.turnTail',
-      select: selectProducedFiles,
+      select: selectProducedFilesWithFs,
       priority: -2,
       locale: CHAT_NS,
       registrant: 'dsh-shadow-rewind',
@@ -246,7 +268,9 @@ export function applyFileReview(ctx: Context): void {
         }
         return {
           projectRoot,
-          inspectChanges: (request: FileReviewRequest) => invoke('status', request),
+          // status 巡检在传输层做 in-flight 去重（同会话同请求只发一次）；
+          // apply 有副作用，绝不参与去重。
+          inspectChanges: (request: FileReviewRequest) => dedupeStatus(sessionId, request, (bound) => invoke('status', bound)),
           applyChanges: (request: FileReviewRequest) => invoke('apply', request),
           // 审查 button / per-file chip: open (or focus) the sidebar tab with
           // these paths pre-expanded. updateTab runs FIRST: an already-open
@@ -277,6 +301,33 @@ export function applyFileReview(ctx: Context): void {
       },
     }, ProducedFiles)),
     'shadow-rewind: turn-tail row',
+  )
+
+  // Live readout while a turn is in flight: the one-line ambient seat above
+  // the composer card. Renders nothing when idle or unchanged; the completed
+  // turn's tail card takes over once the turn closes. The dock seat has no
+  // inject face, so the sessions handle (for cwd lookup) is bound once here.
+  bindLiveBarSessions((ctx as unknown as { readonly sessions: ISessions }).sessions)
+  bindLiveBarOpenSidebar((sessionId, paths, turn) => {
+    const sidebar = ctx.betterSidebar
+    const first = paths[0]
+    if (sidebar === undefined || first === undefined) return
+    const sessions = (ctx as unknown as { readonly sessions: ISessions }).sessions
+    const projectRoot = sessions.list.getSnapshot().byId[sessionId as SessionId]?.cwd
+    const meta = { expandPaths: [...paths], ...(turn !== undefined ? { turn } : {}) }
+    const scope = { sessionId, ...(projectRoot !== undefined ? { cwd: projectRoot } : {}) }
+    sidebar.updateTab('file-review', { meta })
+    sidebar.openTab({ type: 'file-review', path: first, meta }, scope)
+    sidebar.activateTab('file-review', scope)
+  })
+  ctx.effect(
+    () => ctx.slots.register({
+      name: 'conversation.input.dock',
+      id: 'shadow-rewind-live',
+      locale: CHAT_NS,
+      registrant: 'dsh-shadow-rewind',
+    }, LiveChangesBar),
+    'shadow-rewind: live changes bar',
   )
 
   // The prose side of the same vocabulary: the chat view reaches this face

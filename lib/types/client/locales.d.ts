@@ -31,6 +31,8 @@ export declare const zh: {
     readonly stateError: "错误";
     readonly deleted: "已删除";
     readonly deletedHint: "该文件在本轮中被终端命令删除，内容已不存在，无法查看差异或撤销。";
+    readonly dirBadge: "目录";
+    readonly dirHint: "这是一个空目录的增删记录，没有文件内容可展示；撤销/重新应用将重建或移除该目录。";
     readonly undoSuccess: "已成功撤销更改";
     readonly redoSuccess: "已成功重新应用更改";
     readonly undoPartial: "部分文件未能撤销";

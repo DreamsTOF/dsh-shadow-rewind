@@ -10,7 +10,7 @@
 import { randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
 import { homedir } from 'node:os'
-import { lstat, open, readlink, rm } from 'node:fs/promises'
+import { chmod, lstat, mkdir, open, readlink, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { captureSnapshot } from './capture.js'
 import { clearCaptureCache, readCaptureCache, writeCaptureCache } from './capture-cache.js'
@@ -238,6 +238,7 @@ export class ShadowRewindEngine {
       root: scan.root,
       paths: scan.paths,
       skippedAtScan: scan.skipped,
+      emptyDirs: scan.emptyDirs,
       maxFiles: this.config.maxFiles,
       maxSnapshotBytes: this.config.maxSnapshotBytes,
       strict: this.config.turnCheckpointTrust === 'strict',
@@ -450,6 +451,69 @@ export class ShadowRewindEngine {
     await this.assertReady()
     const workspace = await canonicalDirectory(options.cwd)
     return this.store.readTurnSkip(workspace, options.sessionId, options.turn, options.turnStartSeq)
+  }
+
+  /** 列出某会话的所有 turn 检查点（按 turn 升序）。 */
+  async listTurnCheckpoints(options: {
+    readonly cwd: string
+    readonly sessionId: string
+  }): Promise<readonly RestorePointSummary[]> {
+    await this.assertReady()
+    const workspace = await canonicalDirectory(options.cwd)
+    const manifests = await this.store.listManifests(workspace)
+    return manifests
+      .filter((manifest) => manifest.kind === 'turn' && manifest.sessionId === options.sessionId)
+      .sort((left, right) => (left.turn ?? 0) - (right.turn ?? 0) || left.id.localeCompare(right.id))
+      .map(summarize)
+  }
+
+  /**
+   * 对比两个检查点的 entries，生成文件系统级别的变更列表。
+   * 用于捕获 PowerShell 等终端命令创建/修改/删除的文件（这些没有工具结果节点）。
+   * 返回的 changes 结构与 diffTrees 一致，但来源是快照间对比而非当前树。
+   */
+  async diffCheckpoints(options: {
+    readonly cwd: string
+    readonly prevCheckpointId: string
+    readonly currCheckpointId: string
+  }): Promise<{
+    readonly changes: readonly WorkspaceChange[]
+    readonly skippedPaths: readonly SkippedPath[]
+  }> {
+    await this.assertReady()
+    const workspace = await canonicalDirectory(options.cwd)
+    const prevManifest = await this.store.readManifest(workspace, options.prevCheckpointId)
+    const currManifest = await this.store.readManifest(workspace, options.currCheckpointId)
+    
+    // 直接对比两个 manifest 的 entries
+    const changes = diffTrees(prevManifest.entries, currManifest.entries)
+    
+    // 合并跳过项（任一方跳过的都透出）
+    const skippedMap = new Map<string, SkippedPath>()
+    for (const skip of prevManifest.skippedPaths) skippedMap.set(skip.path, skip)
+    for (const skip of currManifest.skippedPaths) skippedMap.set(skip.path, skip)
+    
+    return {
+      changes,
+      skippedPaths: [...skippedMap.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0),
+    }
+  }
+
+  /**
+   * 从指定检查点读取文件内容。用于为文件系统变更生成完整 diff。
+   * 返回 null 表示文件在该检查点不存在（新增或删除）。
+   */
+  async getFileContentFromCheckpoint(options: {
+    readonly cwd: string
+    readonly checkpointId: string
+    readonly path: string
+  }): Promise<Buffer | null> {
+    await this.assertReady()
+    const workspace = await canonicalDirectory(options.cwd)
+    const manifest = await this.store.readManifest(workspace, options.checkpointId)
+    const entry = manifest.entries[options.path]
+    if (!entry || entry.kind !== 'file') return null
+    return this.readSnapshotContent(manifest, options.path)
   }
 
   /** 实际创建 manifest 的内部路径：调用方必须已持有工作区锁。 */
@@ -878,7 +942,9 @@ export class ShadowRewindEngine {
     // 防御性过滤：快照时显式跳过的路径永远不该出现在删除集合里（即使上层
     // 计划已过滤，这里再兜一次底——回滚等旁路也会调到本函数）。
     const skippedSet = new Set(manifest.skippedPaths.map((skip) => skip.path))
-    const deletions = paths.filter((path) => manifest.entries[path] === undefined && !skippedSet.has(path))
+    const deletions = paths.filter((path) => manifest.entries[path] === undefined
+      && !skippedSet.has(path)
+      && !hasDescendantEntry(manifest, path))
       .sort((left, right) => depthOf(right) - depthOf(left))
     const restorations = paths.filter((path) => manifest.entries[path] !== undefined)
       .sort((left, right) => depthOf(left) - depthOf(right))
@@ -902,6 +968,13 @@ export class ShadowRewindEngine {
         await replaceSymbolicLink(target, entry.target)
         continue
       }
+      if (entry.kind === 'dir') {
+        // 空目录条目：占位路径先移除，再按记录的权限位重建。
+        await removeRestoreTarget(target)
+        await mkdir(target)
+        if (process.platform !== 'win32') await chmod(target, entry.mode)
+        continue
+      }
       const content = await this.readSnapshotContent(manifest, path, signal)
       if (sha256Hex(content) !== entry.blob) {
         throw new ShadowRewindError('BLOB_CORRUPT', `路径 ${JSON.stringify(path)} 的快照字节未通过哈希校验`)
@@ -919,6 +992,22 @@ export class ShadowRewindEngine {
       const entry = manifest.entries[path]
       const target = resolveWorkspacePath(root, path)
       if (entry === undefined) {
+        if (hasDescendantEntry(manifest, path)) {
+          // 隐式目录：快照没有它的条目，但子条目经它恢复——验证它是目录即可。
+          let info
+          try {
+            info = await lstat(target)
+          } catch (error) {
+            if (isNodeError(error, 'ENOENT')) {
+              throw new ShadowRewindError('RESTORE_VERIFY_FAILED', `恢复后隐式目录缺失：${JSON.stringify(path)}`)
+            }
+            throw error
+          }
+          if (!info.isDirectory()) {
+            throw new ShadowRewindError('RESTORE_VERIFY_FAILED', `恢复后类型不符（应为目录）：${JSON.stringify(path)}`)
+          }
+          continue
+        }
         // 期望不存在：验证它确实没了。
         let gone = false
         try {
@@ -947,6 +1036,15 @@ export class ShadowRewindEngine {
         const targetValue = await readlink(target)
         if (targetValue !== entry.target) {
           throw new ShadowRewindError('RESTORE_VERIFY_FAILED', `恢复后符号链接指向不符：${JSON.stringify(path)}`)
+        }
+        continue
+      }
+      if (entry.kind === 'dir') {
+        if (!info.isDirectory()) {
+          throw new ShadowRewindError('RESTORE_VERIFY_FAILED', `恢复后类型不符（应为目录）：${JSON.stringify(path)}`)
+        }
+        if (process.platform !== 'win32' && Number(info.mode & 0o7777n) !== entry.mode) {
+          throw new ShadowRewindError('RESTORE_VERIFY_FAILED', `恢复后目录权限不符：${JSON.stringify(path)}`)
         }
         continue
       }
@@ -1024,11 +1122,21 @@ function entriesEquivalent(left: SnapshotEntry | null, right: SnapshotEntry | nu
   if (left === null || right === null) return left === right
   if (left.kind !== right.kind || left.mode !== right.mode) return false
   if (left.kind === 'file' && right.kind === 'file') return left.blob === right.blob && left.size === right.size
+  if (left.kind === 'dir') return true
   return left.kind === 'symlink' && right.kind === 'symlink' && left.target === right.target
 }
 
 function depthOf(path: string): number {
   return path.split('/').length
+}
+
+/** 该目录路径下是否存在快照条目（隐式目录由子条目在恢复时重建）。 */
+function hasDescendantEntry(manifest: Manifest, path: string): boolean {
+  const prefix = `${path}/`
+  for (const other of Object.keys(manifest.entries)) {
+    if (other.startsWith(prefix)) return true
+  }
+  return false
 }
 
 /** 有界读文件：精确读满 expectedSize（不足即视为变化中的文件，返回短读由上层重试）。 */

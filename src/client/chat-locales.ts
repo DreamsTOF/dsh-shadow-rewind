@@ -32,6 +32,7 @@ export const en = {
   'produced.noticeClose': 'Dismiss notification',
   'produced.noticeDismiss': 'Close',
   'produced.deleted': 'deleted',
+  'produced.dir': 'directory',
   'produced.deletedOne': 'Deleted 1 file',
   'produced.deletedAll': 'Deleted {count} files',
   'review.title': 'Review',
@@ -45,8 +46,13 @@ export const en = {
   'review.copied': 'Copied',
   'review.showUnchanged': '{count} unchanged lines',
   'review.hideUnchanged': 'Hide {count} unchanged lines',
+  'review.hunkN': 'Hunk {n}',
+  'review.hunkInclude': 'Include this hunk in undo/reapply',
   'review.stats': '{added} lines added, {removed} lines removed',
   'review.unavailable': 'No reconstructable diff is available for this change. You can still open the current file.',
+  'live.changes': '{count} files changed this turn',
+  'live.deleted': 'deleted',
+  'live.more': '{count} more',
 }
 
 /** Union of this namespace's dictionary keys. */
@@ -81,6 +87,7 @@ export const zh: Record<DeliverablesKey, string> = {
   'produced.noticeClose': '关闭提示',
   'produced.noticeDismiss': '关闭',
   'produced.deleted': '已删除',
+  'produced.dir': '目录',
   'produced.deletedOne': '已删除 1 个文件',
   'produced.deletedAll': '已删除 {count} 个文件',
   'review.title': '审查',
@@ -94,6 +101,11 @@ export const zh: Record<DeliverablesKey, string> = {
   'review.copied': '已复制',
   'review.showUnchanged': '显示 {count} 行未更改内容',
   'review.hideUnchanged': '隐藏 {count} 行未更改内容',
+  'review.hunkN': '块 {n}',
+  'review.hunkInclude': '将此块纳入撤销/重新应用',
   'review.stats': '新增 {added} 行，删除 {removed} 行',
   'review.unavailable': '无法为此更改还原可审查的差异。你仍可打开当前文件。',
+  'live.changes': '本轮已更改 {count} 个文件',
+  'live.deleted': '已删除',
+  'live.more': '另有 {count} 个',
 }

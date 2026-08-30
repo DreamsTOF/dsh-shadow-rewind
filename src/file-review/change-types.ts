@@ -7,6 +7,10 @@ export interface ProducedFileDiff {
   readonly newText: string
   readonly oldStart?: number | undefined
   readonly newStart?: number | undefined
+  /** 检查点记录的旧侧权限位（fs 派生条目）；写回时原样恢复。 */
+  readonly oldMode?: number | undefined
+  /** 检查点记录的新侧权限位（fs 派生条目）；重做时原样恢复。 */
+  readonly newMode?: number | undefined
 }
 
 /** One produced file and the applied hunks available for review. */
@@ -20,6 +24,12 @@ export interface ProducedFileReview {
    * only.
    */
   readonly deleted?: true
+  /** 条目来源：'fs' = 检查点对比派生（终端写盘）；缺省 = 工具结果视图。 */
+  readonly origin?: 'fs'
+  /** 空目录条目（检查点 dir 条目派生）：撤销语义是 mkdir/rmdir，不涉内容。 */
+  readonly dir?: true
+  /** 服务端预算的行数（fs 条目懒加载全文前的显示用；缺省按 diffs 汇总）。 */
+  readonly counts?: { readonly added: number; readonly removed: number }
 }
 
 /** Direction requested by the produced-files toggle. */
@@ -29,6 +39,18 @@ export type FileReviewAction = 'undo' | 'redo'
 export interface FileReviewChange {
   readonly path: string
   readonly diffs: readonly ProducedFileDiff[]
+  /**
+   * 条目来源标记：'fs' 表示该条目由检查点对比派生（终端写盘），其撤销
+   * 走宿主的 fs 语义（创建→删除、删除→写回）。缺省时宿主按 diff 形状
+   * 识别（旧行为，兼容旧 bundle）；显式标记消除了「write 创建的文件」
+   * 与「fs 派生条目」在形状上的歧义。
+   */
+  readonly origin?: 'fs'
+  /**
+   * 空目录条目方向标记：'added' = 本轮新建的目录（撤销=删空目录），
+   * 'deleted' = 本轮删除的目录（撤销=重建）。走宿主目录语义，不涉内容。
+   */
+  readonly dirKind?: 'added' | 'deleted'
 }
 
 /** Host request for status inspection or one toggle direction. */

@@ -6,6 +6,9 @@
  * 分页预览、计划生成与恢复执行；会话分叉交给 DSH 官方 create/fork。
  */
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import { isAbsolute, relative, resolve } from 'node:path'
+import { diffLines } from 'diff'
 import { createDeadline } from './deadline.js'
 import { ShadowRewindError, errorMessage } from './errors.js'
 import { canonicalDirectory } from './path-utils.js'
@@ -14,7 +17,7 @@ import { attributePaths, serializeOwner } from './attribution.js'
 import type { PathAttribution } from './attribution.js'
 import type { WorkspaceWriteGate } from './write-gate.js'
 import type { ShadowRewindEngine } from './engine.js'
-import type { RestoreResult } from './types.js'
+import type { RestoreResult, WorkspaceChange } from './types.js'
 
 export const REWIND_HTTP_PATH = '/shadow-rewind'
 /** 写入闸运行时开关的查询/翻转端点（仅回环；不持久化，重启回到配置初值）。 */
@@ -124,6 +127,8 @@ export class TurnCheckpointCoordinator {
           turnStartSeq: start.seq,
           signal: captureSignal,
         })
+        // 数据版本随检查点递增：fs-changes 的客户端 warm 据此跳过无变化轮询。
+        void bumpWorkspaceRevision(cwd)
       } catch (error) {
         await this.recordFailure(ctx, agent.id, turn, asCheckpointError(error, timeoutMs, captureDeadline.signal.aborted), {
           cwd,
@@ -292,6 +297,18 @@ export function installShadowRewindHttp(ctx: RewindHttpDeps & { webServer?: { re
     path: REWIND_GATE_PATH,
     handler: (request, response) => handleGateHttp(ctx, writeGate, request, response),
   })
+  // 新增：获取检查点中的文件内容（用于为文件系统变更生成 diff）
+  ctx.webServer?.register({
+    kind: 'exact',
+    path: `${REWIND_HTTP_PATH}/file`,
+    handler: (request, response) => handleFileContentHttp(ctx, engine, request, response),
+  })
+  // 新增：批量返回会话所有轮次的文件系统变更（侧边栏按轮合并展示用）。
+  ctx.webServer?.register({
+    kind: 'exact',
+    path: `${REWIND_HTTP_PATH}/fs-changes`,
+    handler: (request, response) => handleFsChangesHttp(ctx, engine, request, response),
+  })
 }
 
 async function handleGateHttp(deps: RewindHttpDeps, writeGate: WorkspaceWriteGate, request: Request, response: Response): Promise<void> {
@@ -390,6 +407,53 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
       }
       const changes = inspection.changes.slice(offset, offset + limit)
       const restoreBlocked = blocking.length > 0
+      
+      // 文件系统差异（捕获 PowerShell 等终端命令的文件变更）：
+      // 第 N 轮的变更 = diff(第 N 轮轮起检查点, 第 N+1 轮轮起检查点)——
+      // 第 N+1 轮第一步之前的捕获天然等于第 N 轮的轮末树状态，零新增捕获。
+      // 无下一轮检查点时（最后一轮/被跳过）不返回该字段，预览的 changes
+      // （轮起检查点 vs 当前磁盘）已覆盖这一轮。
+      let nextCheckpointId: string | undefined
+      let fileSystemChanges: readonly { path: string; kind: 'added' | 'modified' | 'deleted' }[] | undefined
+      if (checkpoint.turn !== undefined) {
+        // 从引擎读取当前检查点的完整 manifest 以获取 sessionId
+        const manifests = await engine.list({ cwd: checkpoint.cwd, includeTurnCheckpoints: true })
+        const currentManifest = manifests.find((m) => m.id === checkpoint.id)
+        const sessionIdForLookup = currentManifest?.sessionId
+        
+        if (sessionIdForLookup) {
+          const allCheckpoints = await engine.listTurnCheckpoints({
+            cwd: checkpoint.cwd,
+            sessionId: sessionIdForLookup,
+          })
+          const currentIndex = allCheckpoints.findIndex((cp) => cp.id === checkpoint.id)
+          const nextCheckpoint = currentIndex >= 0 ? allCheckpoints[currentIndex + 1] : undefined
+          if (nextCheckpoint !== undefined) {
+            nextCheckpointId = nextCheckpoint.id
+            try {
+              const fsDiff = await engine.diffCheckpoints({
+                cwd: checkpoint.cwd,
+                prevCheckpointId: checkpoint.id,
+                currCheckpointId: nextCheckpoint.id,
+              })
+              // 保留 added/modified/deleted/mode-changed（后者映射为 modified，
+              // 内容两侧相同）；type-changed 仍过滤。
+              fileSystemChanges = fsDiff.changes
+                .filter((change) =>
+                  change.kind === 'added' || change.kind === 'modified'
+                  || change.kind === 'deleted' || change.kind === 'mode-changed')
+                .map((change) => ({
+                  path: change.path,
+                  kind: (change.kind === 'mode-changed' ? 'modified' : change.kind) as 'added' | 'modified' | 'deleted',
+                }))
+            } catch (error) {
+              // 对比失败不影响主流程，只记录警告
+              deps.logger.warn(`[shadow-rewind] 文件系统差异计算失败：${errorMessage(error)}`)
+            }
+          }
+        }
+      }
+      
       const common = {
           status: 'ready',
           sessionId,
@@ -397,6 +461,8 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
           turn: checkpoint.turn,
           checkpointId: checkpoint.id,
           turnStartSeq: checkpoint.turnStartSeq,
+          ...(nextCheckpointId === undefined ? {} : { nextCheckpointId }),
+          ...(fileSystemChanges === undefined ? {} : { fileSystemChanges }),
           totalChanges: inspection.changes.length,
           changes: changes.map((change) => {
             const attributed = ownership?.get(change.path)
@@ -744,7 +810,10 @@ async function applyGuarded(deps: RewindHttpDeps, engine: ShadowRewindEngine, se
   if (planId === undefined || confirmation === undefined) {
     throw new ShadowRewindError('NO_CHANGES', '该回合没有可恢复的项目文件变更')
   }
-  return engine.applyRestore({ planId, confirmation, sessionId })
+  const result = await engine.applyRestore({ planId, confirmation, sessionId })
+  // 恢复改变了磁盘与快照历史：数据版本递增，客户端 fs 缓存随之失效。
+  await bumpWorkspaceRevision(cwd)
+  return result
 }
 
 async function createConversationRestart(deps: RewindHttpDeps, sourceId: string, checkpoint: { cwd: string; messageSeq: number; turn: number; turnStartSeq: number; previousTurnEndSeq?: number }): Promise<{ sessionId: string }> {
@@ -883,4 +952,351 @@ function pageSize(value: string | null, fallback: number): number {
     throw new ShadowRewindError('INVALID_ARGUMENTS', `limit 必须在 1 到 ${String(MAX_CHANGE_PAGE_SIZE)} 之间`)
   }
   return parsed
+}
+
+/** GET /shadow-rewind/file：从指定检查点读取文件内容（base64 编码）。 */
+async function handleFileContentHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, request: Request, response: Response): Promise<void> {
+  try {
+    if (!isLoopback(request.socket.remoteAddress)) {
+      json(response, 403, { error: 'forbidden', code: 'FORBIDDEN' })
+      return
+    }
+    if (request.method !== 'GET') {
+      json(response, 405, { error: 'method not allowed', code: 'METHOD_NOT_ALLOWED' })
+      return
+    }
+    const url = new URL(request.url ?? REWIND_HTTP_PATH, 'http://dsh.local')
+    const checkpointId = requiredText(url.searchParams.get('checkpointId'), 'checkpointId')
+    const path = requiredText(url.searchParams.get('path'), 'path')
+    const cwdParam = url.searchParams.get('cwd')
+    if (!cwdParam) {
+      throw new ShadowRewindError('INVALID_ARGUMENTS', 'cwd 必须是非空字符串')
+    }
+    const cwd = await canonicalDirectory(cwdParam)
+    
+    // live = 读当前磁盘（live-tail 条目的 after 内容）；围栏：必须落在工作区内。
+    if (checkpointId === 'live') {
+      const candidate = resolve(cwd, path)
+      const rel = relative(cwd, candidate)
+      if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+        throw new ShadowRewindError('INVALID_ARGUMENTS', 'path 必须在工作区之内')
+      }
+      let liveContent: Buffer
+      try {
+        liveContent = await readFile(candidate)
+      } catch {
+        json(response, 404, { error: 'file not found on disk', code: 'FILE_NOT_FOUND' })
+        return
+      }
+      json(response, 200, {
+        checkpointId,
+        path,
+        content: liveContent.toString('base64'),
+        encoding: 'base64',
+      })
+      return
+    }
+
+    const content = await engine.getFileContentFromCheckpoint({ cwd, checkpointId, path })
+    if (content === null) {
+      json(response, 404, { error: 'file not found in checkpoint', code: 'FILE_NOT_FOUND' })
+      return
+    }
+    
+    // 返回 base64 编码的内容（避免 UTF-8 解码问题）
+    json(response, 200, {
+      checkpointId,
+      path,
+      content: content.toString('base64'),
+      encoding: 'base64',
+    })
+  } catch (error) {
+    json(response, 409, {
+      error: errorMessage(error),
+      code: error instanceof ShadowRewindError ? error.code : 'FILE_CONTENT_FAILED',
+    })
+  }
+}
+
+// ── 工作区数据版本（fs-changes 客户端 warm 的跳过依据）────────────────────
+// 检查点捕获 / 恢复成功即递增；键为 canonical realpath。进程内计数即可：
+// 它只回答「变没变」，不需要跨进程唯一。
+
+const workspaceRevisions = new Map<string, number>()
+
+async function bumpWorkspaceRevision(cwd: string): Promise<void> {
+  const key = await canonicalDirectory(cwd).catch(() => undefined)
+  if (key === undefined) return
+  workspaceRevisions.set(key, (workspaceRevisions.get(key) ?? 0) + 1)
+}
+
+async function workspaceRevision(cwd: string): Promise<number> {
+  const key = await canonicalDirectory(cwd).catch(() => undefined)
+  return key === undefined ? 0 : workspaceRevisions.get(key) ?? 0
+}
+
+// ── fs-changes 的服务端行数统计 ─────────────────────────────────────────
+// 轮次配对与 live-tail 的两侧内容宿主本来就持有（检查点 blob / live 扫描读
+// 盘），在服务端把 added/removed 算好随响应下发——过去客户端为渲染 +/− 要
+// 把每个文件的新旧全文各拉一遍，一轮 30 个文件就是 60 个请求。
+
+/** 行数统计的单侧字节上限：超出视为统计不可得（数量级保护，非语义边界）。 */
+const DIFF_COUNT_MAX_BYTES = 2 * 1024 * 1024
+/** 单次 fs-changes 请求的行数统计预算（按变更条数计）：超出后剩余变更不带行数。 */
+const DIFF_COUNT_BUDGET = 600
+
+function decodeUtf8(bytes: Buffer): string | null {
+  const text = bytes.toString('utf8')
+  // 往返校验：非 UTF-8 内容按「统计不可得」处理，绝不猜着算。
+  return Buffer.from(text, 'utf8').equals(bytes) ? text : null
+}
+
+function countLines(text: string): number {
+  if (text === '') return 0
+  let count = 0
+  for (let at = text.indexOf('\n'); at !== -1; at = text.indexOf('\n', at + 1)) count += 1
+  return text.endsWith('\n') ? count : count + 1
+}
+
+function lineCounts(before: string, after: string): { added: number; removed: number } {
+  // 行数按 LF 规范化统计：CRLF 文件不会产生幽灵增删。
+  let added = 0
+  let removed = 0
+  for (const part of diffLines(before.replace(/\r\n/g, '\n').replace(/\r/g, '\n'), after.replace(/\r\n/g, '\n').replace(/\r/g, '\n'))) {
+    if (part.added === true) added += part.count ?? 0
+    else if (part.removed === true) removed += part.count ?? 0
+  }
+  return { added, removed }
+}
+
+/** 读变更单侧内容：checkpointId 或 'live'（当前磁盘，围栏同 /file 端点）。 */
+async function readChangeSide(engine: ShadowRewindEngine, cwd: string, sourceId: string, path: string): Promise<Buffer | null> {
+  if (sourceId === 'live') {
+    const candidate = resolve(cwd, path)
+    const rel = relative(cwd, candidate)
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null
+    try {
+      return await readFile(candidate)
+    } catch {
+      return null
+    }
+  }
+  return engine.getFileContentFromCheckpoint({ cwd, checkpointId: sourceId, path })
+}
+
+/** 端点变更条目：path/kind + 服务端预算行数 + 检查点权限位 + 目录标记。
+ * oldMode/newMode 供客户端透传给宿主撤销（写回时恢复权限位）；
+ * dir 条目的撤销语义是 mkdir/rmdir，不产生行数。 */
+interface FsChangeItem {
+  path: string
+  kind: 'added' | 'modified' | 'deleted'
+  added?: number
+  removed?: number
+  oldMode?: number
+  newMode?: number
+  dir?: true
+}
+
+/** 为一条变更补行数与元数据；内容缺失/超限/非 UTF-8/预算耗尽都静默省略行数字段。
+ * mode-changed（纯权限位变更）对外映射为 'modified'——内容两侧相同，行数自然为 0。 */
+async function withLineCounts(
+  engine: ShadowRewindEngine,
+  cwd: string,
+  change: WorkspaceChange,
+  prevId: string,
+  nextId: string,
+  budget: { remaining: number },
+): Promise<FsChangeItem> {
+  const base: FsChangeItem = {
+    path: change.path,
+    // 调用方已过滤：进来的只有 added/modified/deleted/mode-changed。
+    kind: (change.kind === 'mode-changed' ? 'modified' : change.kind) as FsChangeItem['kind'],
+    ...(change.before !== undefined && change.before.kind !== 'dir' ? { oldMode: change.before.mode } : {}),
+    ...(change.after !== undefined && change.after.kind !== 'dir' ? { newMode: change.after.mode } : {}),
+    ...(change.before?.kind === 'dir' || change.after?.kind === 'dir' ? { dir: true as const } : {}),
+  }
+  if (base.dir === true || budget.remaining <= 0) return base
+  budget.remaining -= 1
+  try {
+    if (base.kind === 'added') {
+      const after = await readChangeSide(engine, cwd, nextId, change.path)
+      if (after === null || after.byteLength > DIFF_COUNT_MAX_BYTES) return base
+      const text = decodeUtf8(after)
+      return text === null ? base : { ...base, added: countLines(text), removed: 0 }
+    }
+    if (base.kind === 'deleted') {
+      const before = await readChangeSide(engine, cwd, prevId, change.path)
+      if (before === null || before.byteLength > DIFF_COUNT_MAX_BYTES) return base
+      const text = decodeUtf8(before)
+      return text === null ? base : { ...base, added: 0, removed: countLines(text) }
+    }
+    const [before, after] = await Promise.all([
+      readChangeSide(engine, cwd, prevId, change.path),
+      readChangeSide(engine, cwd, nextId, change.path),
+    ])
+    if (before === null || after === null
+      || before.byteLength > DIFF_COUNT_MAX_BYTES || after.byteLength > DIFF_COUNT_MAX_BYTES) return base
+    const beforeText = decodeUtf8(before)
+    const afterText = decodeUtf8(after)
+    if (beforeText === null || afterText === null) return base
+    return { ...base, ...lineCounts(beforeText, afterText) }
+  } catch {
+    return base
+  }
+}
+
+/**
+ * GET /shadow-rewind/fs-changes：批量返回会话所有轮次的文件系统变更。
+ *
+ * 归属语义：第 N 轮的变更 = diff(第 N 轮轮起检查点, 第 N+1 轮轮起检查点)——
+ * 第 N+1 轮第一步之前的捕获天然等于第 N 轮的轮末树状态。最后一轮没有下一轮
+ * 检查点，不在此返回（侧边栏对该轮的展示由「轮起检查点 vs 当前磁盘」的
+ * 现有预览覆盖）。单轮对比失败只跳过该轮，不中断整体响应。
+ *
+ * 本构建起每个 change 附带服务端预算的 added/removed 行数——客户端渲染
+ * 行与 +/− 统计不再需要逐文件拉全文（全文仅在悬停/展开/撤销时按需取）。
+ */
+async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, request: Request, response: Response): Promise<void> {
+  try {
+    if (!isLoopback(request.socket.remoteAddress)) {
+      json(response, 403, { error: 'forbidden', code: 'FORBIDDEN' })
+      return
+    }
+    if (request.method !== 'GET') {
+      json(response, 405, { error: 'method not allowed', code: 'METHOD_NOT_ALLOWED' })
+      return
+    }
+    const url = new URL(request.url ?? REWIND_HTTP_PATH, 'http://dsh.local')
+    const sessionId = requiredText(url.searchParams.get('sessionId'), 'sessionId')
+    const session = await readSession(deps, sessionId)
+    const cwd = session.header.cwd
+    if (cwd === undefined || cwd.trim() === '') {
+      json(response, 200, { sessionId, turns: [] })
+      return
+    }
+    const checkpoints = await engine.listTurnCheckpoints({ cwd, sessionId })
+    const turns: {
+      turn: number
+      turnStartSeq: number
+      checkpointId: string
+      nextCheckpointId: string
+      live?: true
+      changes: readonly FsChangeItem[]
+    }[] = []
+    // 整个请求共享一份行数统计预算：预算耗尽后剩余变更只回 path/kind。
+    const countBudget = { remaining: DIFF_COUNT_BUDGET }
+    for (let index = 0; index < checkpoints.length - 1; index += 1) {
+      const current = checkpoints[index]
+      const next = checkpoints[index + 1]
+      if (current === undefined || next === undefined) continue
+      try {
+        const fsDiff = await engine.diffCheckpoints({
+          cwd,
+          prevCheckpointId: current.id,
+          currCheckpointId: next.id,
+        })
+        const raw = fsDiff.changes.filter((change) =>
+          (change.kind === 'added' || change.kind === 'modified'
+            || change.kind === 'deleted' || change.kind === 'mode-changed')
+          // 空目录的纯权限位变化没有可撤销语义，直接省略。
+          && !(change.kind === 'mode-changed' && change.before?.kind === 'dir'))
+        // 轮间窗口归属过滤：窗口 (current, next] 落盘者未必是本会话（其它会话
+        // 的检查点窗口会插进来）。用窗口内的快照做归属，剔除非本会话独有的
+        // 路径——与 live-tail 同一规则，防止卡片撤销动到别的会话的写入。
+        // 归属失败保守保留全部路径（宿主 CAS 仍兜底防误删）。
+        let kept = raw
+        if (raw.length > 0) {
+          try {
+            const attributed = await engine.listSnapshotsAfter({
+              cwd,
+              restorePointId: current.id,
+              paths: raw.map((change) => change.path),
+            })
+            const within = attributed.snapshots.filter((snapshot) => snapshot.createdAt < next.createdAt)
+            const ownership = attributePaths({
+              targetSessionId: attributed.targetSessionId,
+              changes: raw,
+              snapshots: within,
+            })
+            kept = raw.filter((change) => {
+              const owner = ownership.get(change.path)?.owner
+              return owner === undefined || owner.kind === 'target'
+            })
+          } catch (error) {
+            deps.logger.warn(`[shadow-rewind] 轮 ${String(current.turn ?? '?')} 归因失败，保留全部路径：${errorMessage(error)}`)
+          }
+        }
+        if (kept.length > 0 && current.turn !== undefined && current.turnStartSeq !== undefined) {
+          const changes = await Promise.all(kept.map((change) => withLineCounts(engine, cwd, change, current.id, next.id, countBudget)))
+          turns.push({
+            turn: current.turn,
+            turnStartSeq: current.turnStartSeq,
+            checkpointId: current.id,
+            nextCheckpointId: next.id,
+            changes,
+          })
+        }
+      } catch (error) {
+        // 单轮对比失败只跳过该轮；对比失败不影响整体响应。
+        deps.logger.warn(`[shadow-rewind] 轮 ${String(current.turn ?? '?')} 文件系统差异计算失败：${errorMessage(error)}`)
+      }
+    }
+    // live-tail：最后一个检查点 vs 当前磁盘——覆盖最新一轮（尚无下一轮检查点）
+    // 的终端写盘。after 内容经 /shadow-rewind/file?checkpointId=live 读当前磁盘。
+    const last = checkpoints[checkpoints.length - 1]
+    if (last !== undefined && last.turn !== undefined && last.turnStartSeq !== undefined) {
+      try {
+        const live = await engine.inspect({ cwd, restorePointId: last.id })
+        // live-tail 归属过滤：最后检查点之后磁盘上的变化未必是本会话写的
+        // （其它会话的检查点窗口、恢复操作都会动盘）。非本会话窗口独有的
+        // 路径一律剔除——live 条目的 after 内容就是「当前磁盘」，据此派生
+        // 的整文件 diff 一旦撤销会删掉/覆盖别的会话刚写的工作（fs-added
+        // 的撤销是真实 rm）。
+        const raw = live.changes.filter((change) =>
+          (change.kind === 'added' || change.kind === 'modified'
+            || change.kind === 'deleted' || change.kind === 'mode-changed')
+          && !(change.kind === 'mode-changed' && change.before?.kind === 'dir'))
+        let kept = raw
+        if (raw.length > 0) {
+          try {
+            const attributed = await engine.listSnapshotsAfter({
+              cwd,
+              restorePointId: last.id,
+              paths: raw.map((change) => change.path),
+            })
+            const ownership = attributePaths({
+              targetSessionId: attributed.targetSessionId,
+              changes: raw,
+              snapshots: attributed.snapshots,
+            })
+            kept = raw.filter((change) => {
+              const owner = ownership.get(change.path)?.owner
+              return owner === undefined || owner.kind === 'target'
+            })
+          } catch (error) {
+            deps.logger.warn(`[shadow-rewind] live-tail 归因失败，保留全部路径：${errorMessage(error)}`)
+          }
+        }
+        if (kept.length > 0) {
+          const changes = await Promise.all(kept.map((change) => withLineCounts(engine, cwd, change, last.id, 'live', countBudget)))
+          turns.push({
+            turn: last.turn,
+            turnStartSeq: last.turnStartSeq,
+            checkpointId: last.id,
+            nextCheckpointId: 'live',
+            live: true,
+            changes,
+          })
+        }
+      } catch (error) {
+        deps.logger.warn(`[shadow-rewind] 轮 ${String(last.turn)} live 文件系统差异计算失败：${errorMessage(error)}`)
+      }
+    }
+    json(response, 200, { sessionId, rev: await workspaceRevision(cwd), turns })
+  } catch (error) {
+    json(response, 409, {
+      error: errorMessage(error),
+      code: error instanceof ShadowRewindError ? error.code : 'FS_CHANGES_FAILED',
+    })
+  }
 }

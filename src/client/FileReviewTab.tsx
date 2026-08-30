@@ -20,6 +20,7 @@ import {
   basename, deriveSessionChanges, deriveSessionRoots, mergeRecordedTurns,
   resolveSessionPath, type SessionFileChange, type TurnFileChanges,
 } from './session-changes.ts'
+import { ensureFsFileDiff, fetchAllFsChanges, type FsChangeTurn } from './fs-diff-utils.ts'
 import { summarizeDiffs, UnifiedDiff, type UnifiedDiffStats } from './UnifiedDiff.tsx'
 import { fetchSubsetPlan, pathsTooLong } from './subset-plan.ts'
 import { t } from './locales.ts'
@@ -62,6 +63,12 @@ interface FlatChange {
   readonly diffs: SessionFileChange['diffs']
   /** Deleted paths stay listed but never reach the Host inspector. */
   readonly deleted?: true
+  /** 条目来源：'fs' = 检查点对比派生（终端写盘）；缺省 = 工具结果视图。 */
+  readonly origin?: 'fs'
+  /** 空目录条目：提交时转成 dirKind，宿主走 mkdir/rmdir 语义。 */
+  readonly dir?: true
+  /** 服务端预算的行数（fs 条目懒加载全文前的显示用）。 */
+  readonly counts?: { readonly added: number; readonly removed: number }
 }
 
 /** State map key for one (turn, file) change group. */
@@ -83,6 +90,8 @@ interface FileTurnEntry {
   readonly live: boolean
   readonly deleted?: true
   readonly diffs: SessionFileChange['diffs']
+  /** 服务端预算的行数（fs 条目懒加载全文前的显示用）。 */
+  readonly counts?: { readonly added: number; readonly removed: number }
 }
 
 /** 恢复窗口内一个路径的累计统计与最近改动轮次（恢复对话框 +/− 跳转用）。 */
@@ -93,6 +102,16 @@ interface PathWindowStats {
 
 /** A change group is reversible only with complete contextual hunks. */
 function isReversible(file: SessionFileChange): boolean {
+  // Whole-file fs-change shapes (checkpoint comparison): a single diff that is
+  // either an addition (no before side) or a deletion (empty after side). The
+  // host reverses them via file presence, not hunk replay.
+  if (file.diffs.length === 1) {
+    const only = file.diffs[0]
+    if (only !== undefined && only.path === file.path) {
+      if (only.oldText === null) return true
+      if (only.newText === '' && only.oldText !== '') return true
+    }
+  }
   return file.diffs.length > 0 && file.diffs.every(diff =>
     diff.path === file.path
     && diff.oldText !== null
@@ -225,6 +244,10 @@ interface TurnRewindPreview {
   /** 分页（对称模式拉全清单时使用）。 */
   readonly truncated?: boolean
   readonly offset?: number
+  /** 下一轮检查点 ID（本轮的变更 = 本轮轮起检查点与该检查点对比）。 */
+  readonly nextCheckpointId?: string
+  /** 文件系统级别的变更（PowerShell 等终端命令创建/修改/删除的文件）。 */
+  readonly fileSystemChanges?: readonly { readonly path: string; readonly kind: 'added' | 'modified' | 'deleted' }[]
 }
 
 function decodeTurnPreview(value: unknown): TurnRewindPreview {
@@ -278,6 +301,25 @@ function decodeTurnPreview(value: unknown): TurnRewindPreview {
         }
       }).filter(skip => skip.path !== '')
       : [],
+    // 新增：文件系统差异（PowerShell 等终端命令创建的文件）
+    ...(typeof record.nextCheckpointId === 'string' ? { nextCheckpointId: record.nextCheckpointId } : {}),
+    ...(Array.isArray(record.fileSystemChanges)
+      ? {
+          fileSystemChanges: record.fileSystemChanges
+            .map((entry): { readonly path: string; readonly kind: 'added' | 'modified' | 'deleted' } => {
+              const item = typeof entry === 'object' && entry !== null && !Array.isArray(entry)
+                ? entry as Record<string, unknown>
+                : {}
+              const path = typeof item.path === 'string' ? item.path : ''
+              const rawKind = typeof item.kind === 'string' ? item.kind : 'modified'
+              const kind = (rawKind === 'added' || rawKind === 'modified' || rawKind === 'deleted')
+                ? rawKind
+                : 'modified'
+              return { path, kind }
+            })
+            .filter(change => change.path !== ''),
+        }
+      : {}),
   }
 }
 
@@ -311,11 +353,13 @@ function TurnRewindDialog({ sessionId, turn, windowStats, onJumpToDiff, onClose,
   // 对称模式的勾选集（null = 非对称模式，整树恢复）。
   const [selected, setSelected] = useState<ReadonlySet<string> | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    setStale(false)
-    setError(null)
-    setDone(false)
+  const load = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true)
+      setStale(false)
+      setError(null)
+      setDone(false)
+    }
     try {
       const response = await fetch(`/shadow-rewind?sessionId=${encodeURIComponent(sessionId)}&turn=${String(turn)}`, {
         headers: { accept: 'application/json' }, cache: 'no-store',
@@ -365,9 +409,10 @@ function TurnRewindDialog({ sessionId, turn, windowStats, onJumpToDiff, onClose,
         ? new Set(first.changes.filter(change => change.autoSelect === true).map(change => change.path))
         : null)
     } catch (caught) {
-      setError(`${t('snapshotFailed')}: ${caught instanceof Error ? caught.message : String(caught)}`)
+      // 静默重查失败不动已有预览（占用未解除是常态，不算错误）。
+      if (!silent) setError(`${t('snapshotFailed')}: ${caught instanceof Error ? caught.message : String(caught)}`)
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }, [sessionId, turn])
 
@@ -378,6 +423,15 @@ function TurnRewindDialog({ sessionId, turn, windowStats, onJumpToDiff, onClose,
   // activeSessionIds 计数。
   const blocked = ready !== null
     && (ready.restoreBlocked ?? ready.activeSessionIds.length > 0)
+
+  // 占用自动重查：blocked 期间每 3s 静默重取预览，占用解除的瞬间按钮就地
+  // 变活——否则 blocked 时的预览不带 planId/confirmation，恢复按钮会一直
+  // 死在禁用态，只能靠用户手点「重新检查」。
+  useEffect(() => {
+    if (!blocked || done || applying) return
+    const timer = window.setInterval(() => { void load(true) }, 3000)
+    return () => { window.clearInterval(timer) }
+  }, [blocked, done, applying, load])
   const gatedRunning = ready?.gatedSessionIds?.length ?? 0
   const symmetric = ready?.mode === 'symmetric'
   const selectedCount = selected?.size ?? 0
@@ -597,26 +651,25 @@ function FileTimelineDialog({ path, entries, onPick, onClose }: FileTimelineDial
                 <p className="srw-status" key="hint">{t('timelineHint')}</p>,
                 <ul className={css.timelineList} key="list">
                   {[...entries].reverse().map((entry) => {
-                    const stats = summarizeDiffs(entry.diffs)
+                    const stats = entry.counts ?? summarizeDiffs(entry.diffs)
                     return (
                       <li className={css.timelineItem} key={entry.turn}>
                         <span className={css.timelineDot} aria-hidden="true" />
                         <span className={css.turnTitle}>{t('turn', { n: entry.turn })}</span>
                         {entry.live && <span className={css.liveBadge}>{t('turnLive')}</span>}
-                        {entry.deleted === true
-                          ? <span className={css.deletedBadge}>{t('deleted')}</span>
-                          : entry.diffs.length === 0
-                            ? <span className={css.turnCount}>{t('timelineNoDiff')}</span>
-                            : (
-                              <button
-                                type="button"
-                                className={css.statsButton}
-                                title={t('viewDiff', { n: entry.turn })}
-                                onClick={() => { onPick(entry.turn) }}
-                              >
-                                <Stats stats={stats} />
-                              </button>
-                            )}
+                        {entry.deleted === true && <span className={css.deletedBadge}>{t('deleted')}</span>}
+                        {entry.diffs.length === 0
+                          ? <span className={css.turnCount}>{t('timelineNoDiff')}</span>
+                          : (
+                            <button
+                              type="button"
+                              className={css.statsButton}
+                              title={t('viewDiff', { n: entry.turn })}
+                              onClick={() => { onPick(entry.turn) }}
+                            >
+                              <Stats stats={stats} />
+                            </button>
+                          )}
                       </li>
                     )
                   })}
@@ -671,6 +724,84 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     [roots],
   )
   const [recorded, setRecorded] = useState<readonly RecordedMutation[]>(() => [])
+  // File-system changes detected via checkpoint comparison (PowerShell etc.):
+  // the host's /shadow-rewind/fs-changes endpoint pairs each turn's start
+  // checkpoint with the NEXT turn's start checkpoint (= end-of-turn tree) and
+  // precomputes per-file added/removed line counts. 全文（整文件 diff）按需
+  // 懒加载：展开 diff、撤销提交、恢复窗口统计时才拉，且按 (turn, path) 记忆。
+  const [fsRaw, setFsRaw] = useState<readonly FsChangeTurn[]>([])
+  const [ensuredFs, setEnsuredFs] = useState<ReadonlyMap<string, SessionFileChange>>(() => new Map())
+  const fsRawRef = useRef(fsRaw)
+  fsRawRef.current = fsRaw
+  const ensuredFsRef = useRef(ensuredFs)
+  ensuredFsRef.current = ensuredFs
+
+  useEffect(() => {
+    if (!visible || cwd === undefined || cwd.trim() === '') {
+      setFsRaw([])
+      return
+    }
+
+    let active = true
+
+    fetchAllFsChanges(sessionId).then((payload) => {
+      if (!active) return
+      setFsRaw(payload.turns)
+    }).catch(() => {
+      if (!active) return
+      setFsRaw([])
+    })
+
+    return () => { active = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, tick, sessionId, cwd])
+
+  /** 按需补齐 fs 条目全文（展开 diff、撤销提交、恢复窗口统计共用）。 */
+  const ensureFsTurnFiles = useCallback(async (turn: number, paths?: readonly string[]): Promise<void> => {
+    if (cwd === undefined) return
+    const fsTurn = fsRawRef.current.find(entry => entry.turn === turn)
+    if (fsTurn === undefined) return
+    const wanted = fsTurn.changes.filter(change => (paths === undefined || paths.includes(change.path))
+      && !ensuredFsRef.current.has(`${String(turn)}|${change.path}`))
+    if (wanted.length === 0) return
+    const settled = await Promise.all(wanted.map(async (change) => [
+      `${String(turn)}|${change.path}`,
+      await ensureFsFileDiff(fsTurn, change.path, cwd),
+    ] as const))
+    setEnsuredFs((current) => {
+      const next = new Map(current)
+      for (const [key, value] of settled) if (value !== null) next.set(key, value)
+      return next
+    })
+  }, [cwd])
+
+  // fs 占位（计数）→ 已补齐条目的合并视图：同 (turn, path) 优先用懒加载全文。
+  const fsTurns = useMemo<TurnFileChanges[]>(() => {
+    const result: TurnFileChanges[] = []
+    for (const fsTurn of fsRaw) {
+      const files: SessionFileChange[] = []
+      for (const change of fsTurn.changes) {
+        const ensured = ensuredFs.get(`${String(fsTurn.turn)}|${change.path}`)
+        if (ensured !== undefined) {
+          files.push(ensured)
+          continue
+        }
+        files.push({
+          path: change.path,
+          diffs: [],
+          origin: 'fs',
+          ...(change.dir === true ? { dir: true as const } : {}),
+          ...(change.added !== undefined || change.removed !== undefined
+            ? { counts: { added: change.added ?? 0, removed: change.removed ?? 0 } }
+            : {}),
+          ...(change.kind === 'deleted' ? { deleted: true as const } : {}),
+        })
+      }
+      if (files.length > 0) result.push({ turn: fsTurn.turn, live: false, files })
+    }
+    return result
+  }, [fsRaw, ensuredFs])
+  
   useEffect(() => {
     if (!visible || roots.length === 0) return
     let active = true
@@ -696,19 +827,46 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   }, [visible, rootsKey, tick, sessions, sessionId])
 
   const turns = useMemo(
-    () => mergeRecordedTurns(deriveSessionChanges(snapshot), roots, recorded),
-    [snapshot, roots, recorded],
+    () => {
+      const base = mergeRecordedTurns(deriveSessionChanges(snapshot), roots, recorded)
+      // Merge file-system changes (PowerShell etc.) into the turn list:
+      // same-turn groups are merged file-by-file so one turn never renders twice.
+      if (fsTurns.length === 0) return base
+      const byTurn = new Map<number, TurnFileChanges>()
+      for (const turn of base) byTurn.set(turn.turn, turn)
+      for (const fsTurn of fsTurns) {
+        const existing = byTurn.get(fsTurn.turn)
+        if (existing === undefined) {
+          byTurn.set(fsTurn.turn, fsTurn)
+          continue
+        }
+        const files = [...existing.files]
+        for (const fsFile of fsTurn.files) {
+          const index = files.findIndex(f => f.path === fsFile.path)
+          if (index === -1) files.push(fsFile)
+          // Same-path entries from tool views already carry hunks; keep them.
+        }
+        byTurn.set(fsTurn.turn, { turn: existing.turn, live: existing.live, files })
+      }
+      return [...byTurn.values()].sort((a, b) => a.turn - b.turn)
+    },
+    [snapshot, roots, recorded, fsTurns],
   )
   const flat = useMemo<FlatChange[]>(
     () => turns.flatMap(turn => turn.files.map(file => ({
       turn: turn.turn, path: file.path, diffs: file.diffs,
       ...(file.deleted === true ? { deleted: true as const } : {}),
+      ...(file.origin !== undefined ? { origin: file.origin } : {}),
+      ...(file.counts !== undefined ? { counts: file.counts } : {}),
     }))),
     [turns],
   )
-  // Deleted entries have nothing to inspect or toggle on the Host side.
+  // Deleted entries WITHOUT diffs (rm-command records) have nothing to inspect
+  // or toggle; fs-level deletions carry a whole-file diff and ARE toggleable.
+  // fs 占位条目（全文未补齐）同样不参与巡检——补齐后经 flatKey 自动加入。
   const inspectable = useMemo(
-    () => flat.filter(item => item.deleted !== true),
+    () => flat.filter(item => (item.deleted !== true || item.diffs.length > 0)
+      && !(item.origin === 'fs' && item.diffs.length === 0)),
     [flat],
   )
   // Stable content key: the inspect effect re-fires only when the change SET
@@ -922,7 +1080,8 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     })
   }, [])
 
-  /** Toggle one change set (a whole turn, or one file) undo ↔ redo. */
+  /** Toggle one change set (a whole turn, or one file) undo ↔ redo.
+   * fs 占位条目先按需补齐全文再提交（零全文条目宿主无法回放）。 */
   const runToggle = useCallback((
     key: string,
     items: readonly FlatChange[],
@@ -930,11 +1089,40 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   ) => {
     if (busyKey !== null || items.length === 0) return
     setBusyKey(key)
-    invoke('apply', {
-      action,
-      files: items.map(item => ({ path: item.path, diffs: item.diffs })),
-    }).then((result) => {
-      mergeResultStates(items, result)
+    let submitted: FlatChange[] = []
+    void (async () => {
+      const ensuredItems: FlatChange[] = []
+      for (const item of items) {
+        if (item.diffs.length > 0 || item.origin !== 'fs') {
+          ensuredItems.push(item)
+          continue
+        }
+        await ensureFsTurnFiles(item.turn, [item.path])
+        const ensured = ensuredFsRef.current.get(`${String(item.turn)}|${item.path}`)
+        if (ensured !== undefined) {
+          ensuredItems.push({
+            ...item,
+            diffs: ensured.diffs,
+            ...(ensured.deleted === true ? { deleted: true as const } : {}),
+          })
+        }
+      }
+      submitted = ensuredItems.filter(item => item.diffs.length > 0)
+      if (submitted.length === 0) return undefined
+      return invoke('apply', {
+        action,
+        files: submitted.map(item => ({
+          path: item.path,
+          diffs: item.diffs,
+          ...(item.origin !== undefined ? { origin: item.origin } : {}),
+          ...(item.dir === true
+            ? { dirKind: item.deleted === true ? 'deleted' as const : 'added' as const }
+            : {}),
+        })),
+      })
+    })().then((result) => {
+      if (result === undefined) return
+      mergeResultStates(submitted, result)
       const target = action === 'undo' ? 'undone' : 'applied'
       const failures = result.files.filter(file => file.state !== target)
       if (failures.length === 0) {
@@ -945,7 +1133,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     }).catch((error: unknown) => {
       showNotice('error', `${t('toggleError')}: ${error instanceof Error ? error.message : String(error)}`)
     }).finally(() => { setBusyKey(null) })
-  }, [busyKey, invoke, mergeResultStates, showNotice])
+  }, [busyKey, ensureFsTurnFiles, invoke, mergeResultStates, showNotice])
 
   const toggleExpanded = useCallback((key: string) => {
     setExpanded((current) => {
@@ -988,7 +1176,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   }, [ctx, cwd, sessionId])
 
   const totalStats = useMemo(() => flat.reduce<UnifiedDiffStats>(
-    (total, item) => addStats(total, summarizeDiffs(item.diffs)),
+    (total, item) => addStats(total, item.counts ?? summarizeDiffs(item.diffs)),
     { added: 0, removed: 0 },
   ), [flat])
 
@@ -1001,6 +1189,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         list.push({
           turn: turn.turn, live: turn.live, diffs: file.diffs,
           ...(file.deleted === true ? { deleted: true as const } : {}),
+          ...(file.counts !== undefined ? { counts: file.counts } : {}),
         })
         map.set(file.path, list)
       }
@@ -1016,7 +1205,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     for (const entry of flat) {
       if (entry.turn < rewindTurn) continue
       const existing = map.get(entry.path)
-      const stats = summarizeDiffs(entry.diffs)
+      const stats = entry.counts ?? summarizeDiffs(entry.diffs)
       map.set(entry.path, {
         stats: existing === undefined ? stats : addStats(existing.stats, stats),
         latestTurn: existing === undefined ? entry.turn : Math.max(existing.latestTurn, entry.turn),
@@ -1042,10 +1231,13 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   /** Render one turn group (latest turn first). */
   const renderTurn = (turn: TurnFileChanges) => {
     const turnStats = turn.files.reduce<UnifiedDiffStats>(
-      (total, file) => addStats(total, summarizeDiffs(file.diffs)),
+      (total, file) => addStats(total, file.counts ?? summarizeDiffs(file.diffs)),
       { added: 0, removed: 0 },
     )
     const reversible = turn.files.filter(isReversible)
+    // fs 占位条目（全文未补齐）也可操作：提交时按需补齐。
+    const toggleable = turn.files.filter(file => file.deleted !== true || file.diffs.length > 0 || file.dir === true)
+    const hasToggleable = toggleable.some(file => file.diffs.length > 0 || file.origin === 'fs')
     const allUndone = reversible.length > 0
       && reversible.every(file => states.get(stateKey(turn.turn, file.path)) === 'undone')
     const turnAction: FileReviewAction = allUndone ? 'redo' : 'undo'
@@ -1070,11 +1262,14 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           <button
             type="button"
             className={css.actionButton}
-            disabled={statusPending || busyKey !== null || reversible.length === 0}
-            title={reversible.length === 0 ? t('toggleUnavailable') : undefined}
+            disabled={statusPending || busyKey !== null || !hasToggleable}
+            title={!hasToggleable ? t('toggleUnavailable') : undefined}
             onClick={() => {
-              runToggle(turnKey, turn.files.filter(file => file.deleted !== true).map(file => ({
+              runToggle(turnKey, toggleable.map(file => ({
                 turn: turn.turn, path: file.path, diffs: file.diffs,
+                ...(file.origin !== undefined ? { origin: file.origin } : {}),
+                ...(file.dir === true ? { dir: true as const } : {}),
+                ...(file.deleted === true ? { deleted: true as const } : {}),
               })), turnAction)
             }}
           >
@@ -1090,6 +1285,8 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
             title={t('snapshotRestoreTitle')}
             onClick={(event) => {
               event.stopPropagation()
+              // 恢复窗口统计需要 fs 条目的 +/-：先按需补齐（幂等，已补的跳过）。
+              void ensureFsTurnFiles(turn.turn)
               setRewindTurn(turn.turn)
             }}
           >
@@ -1109,10 +1306,20 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     const isOpen = expanded.has(key)
     const state = states.get(key)
     const reversible = isReversible(file)
+    // fs 占位条目（全文未补齐）也可撤销：提交时按需补齐。
+    const fsPending = file.origin === 'fs' && file.diffs.length === 0
     const fileAction: FileReviewAction = state === 'undone' ? 'redo' : 'undo'
     const fileBusy = busyKey === key
-    const stats = summarizeDiffs(file.diffs)
+    const stats = file.counts ?? summarizeDiffs(file.diffs)
     const selectedCount = selectedHunkCount(file, key)
+    // rm-command records: display-only badge. Fs-level deletions carry a
+    // whole-file diff and behave like any other toggleable change.
+    // 目录删除同理（补齐后走 dirKind 语义）——不算「无 diff 的删除」。
+    const deletedNoDiff = file.deleted === true && file.diffs.length === 0 && file.dir !== true
+    const expand = () => {
+      toggleExpanded(key)
+      if (fsPending) void ensureFsTurnFiles(turn.turn, [file.path])
+    }
     return (
       <li
         key={file.path}
@@ -1128,20 +1335,20 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           tabIndex={0}
           title={file.path}
           aria-expanded={isOpen}
-          onClick={() => { toggleExpanded(key) }}
+          onClick={expand}
           onKeyDown={(event) => {
             if (event.key === 'Enter' || event.key === ' ') {
               event.preventDefault()
-              toggleExpanded(key)
+              expand()
             }
           }}
         >
           <Chevron open={isOpen} />
           <span className={css.fileName}>{basename(file.path)}</span>
-          {file.deleted === true
-            ? <span className={css.deletedBadge}>{t('deleted')}</span>
-            : <Stats stats={stats} />}
-          {file.deleted !== true && <StateBadge state={state} />}
+          {file.deleted === true && <span className={css.deletedBadge}>{t('deleted')}</span>}
+          {file.dir === true && <span className={css.deletedBadge}>{t('dirBadge')}</span>}
+          {!deletedNoDiff && <Stats stats={stats} />}
+          {!deletedNoDiff && <StateBadge state={state} />}
           <button
             type="button"
             className={css.smallButton}
@@ -1153,7 +1360,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           >
             {t('timeline')}
           </button>
-          {file.deleted !== true && (
+          {file.deleted !== true && file.dir !== true && (
             <button
               type="button"
               className={css.smallButton}
@@ -1168,15 +1375,20 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           <button
             type="button"
             className={css.smallButton}
-            disabled={statusPending || busyKey !== null || !reversible || selectedCount === 0}
-            title={file.deleted === true
+            disabled={statusPending || busyKey !== null || !(reversible || fsPending) || (reversible && selectedCount === 0)}
+            title={deletedNoDiff
               ? t('deletedHint')
-              : (!reversible
+              : (!(reversible || fsPending)
                 ? t('toggleUnavailable')
-                : selectedCount === 0 ? t('hunkNoneSelected') : undefined)}
+                : (reversible && selectedCount === 0) ? t('hunkNoneSelected') : undefined)}
             onClick={(event) => {
               event.stopPropagation()
-              runToggle(key, [{ turn: turn.turn, path: file.path, diffs: hunksForRequest(file, key) }], fileAction)
+              runToggle(key, [{
+                turn: turn.turn, path: file.path, diffs: hunksForRequest(file, key),
+                ...(file.origin !== undefined ? { origin: file.origin } : {}),
+                ...(file.dir === true ? { dir: true as const } : {}),
+                ...(file.deleted === true ? { deleted: true as const } : {}),
+              }], fileAction)
             }}
           >
             {fileBusy
@@ -1187,11 +1399,13 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         {isOpen && (
           <div className={css.diffWrap}>
             <LazyDiff>
-              {file.deleted === true
+              {deletedNoDiff
                 ? <p className={css.diffUnavailable}>{t('deletedHint')}</p>
-                : file.diffs.length === 0
-                  ? <p className={css.diffUnavailable}>{t('unavailable')}</p>
-                  : (
+                : file.dir === true
+                  ? <p className={css.diffUnavailable}>{t('dirHint')}</p>
+                  : file.diffs.length === 0
+                    ? <p className={css.diffUnavailable}>{t('unavailable')}</p>
+                    : (
                   <UnifiedDiff
                     diffs={file.diffs}
                     contextLines={3}

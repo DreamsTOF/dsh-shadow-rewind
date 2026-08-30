@@ -12,15 +12,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {
-  FileReviewAction, FileReviewFileState, FileReviewRequest, FileReviewResult,
+  FileReviewAction, FileReviewChange, FileReviewFileState, FileReviewRequest, FileReviewResult,
 } from '../file-review/change-types.ts'
 import { basename, type ProducedFileReview } from './turn-deliverables.ts'
 import type { NS } from './chat-locales.ts'
+import { cachedFsTurnFor, fsTurnReviews, ensureFsFileDiff, subscribeFsCache } from './fs-diff-utils.ts'
+import type { FsChangeTurn } from './fs-diff-utils.ts'
+import { DiffPopover, type PopoverAnchorRect } from './diff-popover.tsx'
 import { summarizeDiffs, type UnifiedDiffStats } from './UnifiedDiff.tsx'
 import css from './ProducedFiles.module.css'
 
-/** Keep the turn-tail card compact; the sidebar tab always lists every file. */
-const SHOWN_LIMIT = 6
 const SUCCESS_NOTICE_DURATION = 2000
 const ERROR_NOTICE_DURATION = 5000
 
@@ -206,7 +207,8 @@ function Stats({ stats, label }: { readonly stats: UnifiedDiffStats; readonly la
 
 /** Render one turn's produced files as a summary card opening the sidebar tab. */
 export function ProducedFiles({
-  matched: reviews, openFile, turn: turnLocation,
+  matched: matchedReviews, openFile, turn: turnLocation,
+  projectRoot,
   inspectChanges = unavailableChanges, applyChanges = unavailableChanges,
   openInSidebarTab, t,
 }: ProducedFilesProps) {
@@ -221,11 +223,115 @@ export function ProducedFiles({
   const [fileBusy, setFileBusy] = useState<string | null>(null)
   const [toast, setToast] = useState<ToggleNotice | null>(null)
   const toastSeqRef = useRef(0)
+  // 文件系统级变更（PowerShell 等终端写盘）：select 以空 match claim 后，
+  // 卡片在这里按 turn/start seq 从缓存取本轮条目。条目先以「零全文 + 服务端
+  // 行数」的占位形态渲染，全文只在悬停/撤销时经 ensureFsFileDiff 按需补齐
+  // （先前每轮 warm 通知都全量拉全文，一轮 30 个文件 = 60 个请求/次）。
+  const [fsReviews, setFsReviews] = useState<readonly ProducedFileReview[]>([])
+  const fsTurnRef = useRef<FsChangeTurn | undefined>(undefined)
+  const lastFsJsonRef = useRef('')
+  const startSeq = turnLocation.start?.seq
 
+  useEffect(() => {
+    if (startSeq === undefined || projectRoot === undefined) {
+      fsTurnRef.current = undefined
+      lastFsJsonRef.current = ''
+      setFsReviews([])
+      return
+    }
+    let active = true
+    const refresh = () => {
+      const fsTurn = cachedFsTurnFor(startSeq)
+      if (fsTurn === undefined || fsTurn.turn !== turnNumber) {
+        if (lastFsJsonRef.current !== '') {
+          lastFsJsonRef.current = ''
+          fsTurnRef.current = undefined
+          if (active) setFsReviews([])
+        }
+        return
+      }
+      // 本卡无变化：不重转、不重渲染（warm 的通知对所有挂载卡片广播）。
+      const serialized = JSON.stringify(fsTurn)
+      if (serialized === lastFsJsonRef.current) return
+      lastFsJsonRef.current = serialized
+      fsTurnRef.current = fsTurn
+      if (active) setFsReviews(fsTurnReviews(fsTurn))
+    }
+    refresh()
+    const unsubscribe = subscribeFsCache(refresh)
+    return () => {
+      active = false
+      unsubscribe()
+    }
+  }, [startSeq, turnNumber, projectRoot])
+
+  // 工具变更 + 文件系统变更合并；同路径工具优先（fs 条目跳过）。
+  const reviews = useMemo(() => {
+    if (fsReviews.length === 0) return matchedReviews
+    const seen = new Set(matchedReviews.map(review => review.path))
+    return [...matchedReviews, ...fsReviews.filter(review => !seen.has(review.path))]
+  }, [matchedReviews, fsReviews])
+  // 悬停 diff 浮层：chip 上停留片刻才弹出，移入浮层可滚动查看。
+  // 锚点是卡片框架的 rect——浮层宽度/左缘与卡片对齐（live 条同一套逻辑）。
+  const [popover, setPopover] = useState<{ review: ProducedFileReview; rect: PopoverAnchorRect } | null>(null)
+  const cardRef = useRef<HTMLElement | null>(null)
+  const showTimerRef = useRef<number | null>(null)
+  const hideTimerRef = useRef<number | null>(null)
+
+  const clearPopoverTimers = useCallback((which: 'show' | 'hide' | 'both') => {
+    if ((which === 'show' || which === 'both') && showTimerRef.current !== null) {
+      window.clearTimeout(showTimerRef.current)
+      showTimerRef.current = null
+    }
+    if ((which === 'hide' || which === 'both') && hideTimerRef.current !== null) {
+      window.clearTimeout(hideTimerRef.current)
+      hideTimerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => () => { clearPopoverTimers('both') }, [clearPopoverTimers])
+
+  const schedulePopoverShow = useCallback((review: ProducedFileReview) => {
+    if (review.dir === true) return
+    if (review.diffs.length === 0 && review.origin !== 'fs') return
+    clearPopoverTimers('both')
+    showTimerRef.current = window.setTimeout(() => {
+      const frame = cardRef.current?.getBoundingClientRect()
+      if (frame === undefined) return
+      const rect: PopoverAnchorRect = { top: frame.top, bottom: frame.bottom, left: frame.left, width: frame.width }
+      void (async () => {
+        let resolved = review
+        // fs 占位条目：浮层首次展示前补齐全文（结果记忆化，此后瞬时）。
+        if (resolved.diffs.length === 0 && resolved.origin === 'fs'
+          && fsTurnRef.current !== undefined && projectRoot !== undefined) {
+          const ensured = await ensureFsFileDiff(fsTurnRef.current, resolved.path, projectRoot)
+          if (ensured === null) return
+          resolved = { ...resolved, diffs: ensured.diffs }
+          setFsReviews(current => current.map(entry => entry.path === resolved.path && entry.origin === 'fs'
+            ? { ...entry, diffs: ensured.diffs }
+            : entry))
+        }
+        if (resolved.diffs.length === 0) return
+        setPopover({ review: resolved, rect })
+      })()
+    }, 300)
+  }, [clearPopoverTimers, projectRoot])
+
+  const schedulePopoverHide = useCallback(() => {
+    clearPopoverTimers('both')
+    hideTimerRef.current = window.setTimeout(() => { setPopover(null) }, 200)
+  }, [clearPopoverTimers])
+
+  const cancelPopoverHide = useCallback(() => { clearPopoverTimers('hide') }, [clearPopoverTimers])
+
+  // fs 占位条目（懒加载全文前）用服务端行数；工具条目按 hunks 汇总。
+  const statsForReview = useCallback((review: ProducedFileReview): UnifiedDiffStats => (
+    review.counts ?? summarizeDiffs(review.diffs)
+  ), [])
   const reviewsWithStats = useMemo(() => reviews.map(review => ({
     review,
-    stats: summarizeDiffs(review.diffs),
-  })), [reviews])
+    stats: statsForReview(review),
+  })), [reviews, statsForReview])
   const totalStats = useMemo(
     () => reviewsWithStats.reduce<UnifiedDiffStats>(
       (total, item) => addStats(total, item.stats),
@@ -234,20 +340,45 @@ export function ProducedFiles({
     [reviewsWithStats],
   )
   // Deleted paths carry no hunks and cannot be inspected or toggled; they are
-  // display vocabulary on the chips only.
-  const toggleFiles = useMemo(() => reviews
-    .filter(review => review.deleted !== true)
-    .map(review => ({ path: review.path, diffs: review.diffs })), [reviews])
+  // display vocabulary on the chips only. Fs-level deletions DO carry a
+  // whole-file diff and are toggleable (host fs semantics restore the file).
+  // 已补齐全文的条目才参与巡检与整轮提交；fs 占位条目在操作时按需补齐。
+  const inspectFiles = useMemo(() => reviews
+    .filter(review => review.diffs.length > 0)
+    .map(review => ({
+      path: review.path,
+      diffs: review.diffs,
+      ...(review.origin !== undefined ? { origin: review.origin } : {}),
+    })), [reviews])
   const reversiblePaths = useMemo(() => new Set(reviews.filter(review =>
-    review.diffs.length > 0 && review.diffs.every(diff =>
-      diff.path === review.path
-      && diff.oldText !== null
-      && diff.oldText !== diff.newText
-      && (diff.oldText !== '' || diff.oldStart !== undefined)
-      && (diff.newText !== '' || diff.newStart !== undefined))).map(review => review.path)), [reviews])
+    // 目录条目天生可逆（mkdir/rmdir 互逆），占位形态即可判定。
+    review.dir === true
+    // mode-only fs 条目：内容两侧相同、权限位不同（补齐全文后方可判定）。
+    || (review.origin === 'fs' && review.diffs.length === 1
+      && review.diffs[0] !== undefined
+      && review.diffs[0].path === review.path
+      && review.diffs[0].oldText !== null
+      && review.diffs[0].oldText === review.diffs[0].newText
+      && review.diffs[0].oldMode !== undefined && review.diffs[0].newMode !== undefined
+      && review.diffs[0].oldMode !== review.diffs[0].newMode)
+    || (review.diffs.length > 0 && (
+      // fs shapes: single whole-file diff (added: no before; deleted: empty after).
+      (review.diffs.length === 1
+        && review.diffs[0] !== undefined
+        && review.diffs[0].path === review.path
+        && (review.diffs[0].oldText === null
+          || (review.diffs[0].newText === '' && review.diffs[0].oldText !== '')))
+      || review.diffs.every(diff =>
+        diff.path === review.path
+        && diff.oldText !== null
+        && diff.oldText !== diff.newText
+        && (diff.oldText !== '' || diff.oldStart !== undefined)
+        && (diff.newText !== '' || diff.newStart !== undefined))))
+  ).map(review => review.path)), [reviews])
   const hasReversibleFiles = reversiblePaths.size > 0
-  const shown = reviewsWithStats.slice(0, SHOWN_LIMIT)
-  const hidden = reviewsWithStats.length - shown.length
+  // 整轮开关的可操作性：有可逆条目，或存在 fs 条目（全文在提交时按需补齐）。
+  const hasToggleableFiles = useMemo(() => reviews.some(review =>
+    review.diffs.length > 0 || review.origin === 'fs'), [reviews])
   const allPaths = useMemo(() => reviews.map(review => review.path), [reviews])
   // A turn that only deleted files reads as a deletion summary, not an edit.
   const allDeleted = reviews.length > 0 && reviews.every(review => review.deleted === true)
@@ -270,10 +401,23 @@ export function ProducedFiles({
       : currentAction
   }, [reversiblePaths])
 
+  // 巡检（挂载/条目变化时）：确定每个文件当前是 applied 还是 undone。
+  // 依赖用内容签名而非数组身份——上游 slot 每次渲染都换 inspectChanges 与
+  // matched 的身份，按身份依赖会让巡检（连带按钮禁用窗口）反复重放。
+  const inspectRef = useRef(inspectChanges)
+  inspectRef.current = inspectChanges
+  const inspectKey = useMemo(() => JSON.stringify(inspectFiles), [inspectFiles])
+  const reversibleKey = useMemo(() => [...reversiblePaths].sort().join('\n'), [reversiblePaths])
+
   useEffect(() => {
     let active = true
+    if (inspectFiles.length === 0) {
+      setFileStates(new Map())
+      setStatusPending(false)
+      return () => { active = false }
+    }
     setStatusPending(true)
-    void inspectChanges({ action: 'undo', files: toggleFiles }).then((result) => {
+    void inspectRef.current({ action: 'undo', files: inspectFiles }).then((result) => {
       if (!active) return
       setFileStates(new Map(result.files.map(file => [file.path, file.state])))
       const allUndone = reversiblePaths.size > 0
@@ -287,13 +431,47 @@ export function ProducedFiles({
       if (active) setStatusPending(false)
     })
     return () => { active = false }
-  }, [inspectChanges, reversiblePaths, toggleFiles])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inspectKey, reversibleKey])
 
   const runToggle = useCallback(() => {
-    if (statusPending || togglePending || !hasReversibleFiles) return
+    if (statusPending || togglePending || !hasToggleableFiles) return
     const action = toggleAction
     setTogglePending(true)
-    void applyChanges({ action, files: toggleFiles }).then((result) => {
+    let requestedPaths: readonly string[] = []
+    void (async () => {
+      // fs 占位条目先补齐全文再提交（零全文条目宿主无法回放）。
+      const files: FileReviewChange[] = []
+      for (const review of reviews) {
+        if (review.deleted === true && review.diffs.length === 0 && review.dir !== true) continue
+        if (review.diffs.length > 0) {
+          files.push({
+            path: review.path,
+            diffs: review.diffs,
+            ...(review.origin !== undefined ? { origin: review.origin } : {}),
+            ...(review.dir === true
+              ? { dirKind: review.deleted === true ? 'deleted' as const : 'added' as const }
+              : {}),
+          })
+          continue
+        }
+        if (review.origin !== 'fs' || fsTurnRef.current === undefined || projectRoot === undefined) continue
+        const ensured = await ensureFsFileDiff(fsTurnRef.current, review.path, projectRoot)
+        if (ensured !== null) {
+          files.push({
+            path: ensured.path,
+            diffs: ensured.diffs,
+            origin: 'fs',
+            ...(ensured.dir === true
+              ? { dirKind: ensured.deleted === true ? 'deleted' as const : 'added' as const }
+              : {}),
+          })
+        }
+      }
+      requestedPaths = files.map(file => file.path)
+      return files.length === 0 ? null : applyChanges({ action, files })
+    })().then((result) => {
+      if (result === null) return
       // 整轮操作后同步每文件状态，chip 上的单文件按钮随之翻转。
       setFileStates((current) => {
         const next = new Map(current)
@@ -303,10 +481,10 @@ export function ProducedFiles({
       setToggleAction(phaseForResult(result, action))
       const targetState = action === 'undo' ? 'undone' : 'applied'
       const byPath = new Map(result.files.map(file => [file.path, file]))
-      const failures: NoticeFile[] = toggleFiles.flatMap((file) => {
-        const outcome = byPath.get(file.path)
+      const failures: NoticeFile[] = requestedPaths.flatMap((path) => {
+        const outcome = byPath.get(path)
         if (outcome?.state === targetState) return []
-        return [{ path: file.path }]
+        return [{ path }]
       })
       if (failures.length === 0) {
         showToast({
@@ -333,19 +511,54 @@ export function ProducedFiles({
       })
     }).finally(() => { setTogglePending(false) })
   }, [
-    applyChanges, hasReversibleFiles, phaseForResult, showToast, t,
-    statusPending, toggleAction, toggleFiles, togglePending,
+    applyChanges, hasToggleableFiles, phaseForResult, projectRoot, reviews, showToast, t,
+    statusPending, toggleAction, togglePending,
   ])
 
   /** 单文件撤销/重新应用：整文件粒度（提交该文件本轮的全部 hunks；hunk 子集
-   * 选择只在侧边栏 diff 视图里）。状态来自挂载巡检与每次操作结果，零额外请求。 */
+   * 选择只在侧边栏 diff 视图里）。状态来自挂载巡检与每次操作结果，零额外请求。
+   * fs 占位条目先按需补齐全文再提交。 */
   const runFileToggle = useCallback((review: ProducedFileReview) => {
     const path = review.path
-    if (statusPending || togglePending || fileBusy !== null || !reversiblePaths.has(path)) return
+    if (statusPending || togglePending || fileBusy !== null) return
+    if (!reversiblePaths.has(path) && review.origin !== 'fs') return
     const action: FileReviewAction = fileStates.get(path) === 'undone' ? 'redo' : 'undo'
     const target: FileReviewFileState = action === 'undo' ? 'undone' : 'applied'
     setFileBusy(path)
-    void applyChanges({ action, files: [{ path, diffs: review.diffs }] }).then((result) => {
+    void (async () => {
+      let diffs = review.diffs
+      let dirFlag = review.dir === true
+      if (diffs.length === 0) {
+        if (review.origin !== 'fs' || fsTurnRef.current === undefined || projectRoot === undefined) return null
+        const ensured = await ensureFsFileDiff(fsTurnRef.current, path, projectRoot)
+        if (ensured === null) return null
+        diffs = ensured.diffs
+        dirFlag = ensured.dir === true
+        // 补齐后的全文回填占位条目：popover/整轮提交不再重复拉取。
+        setFsReviews(current => current.map(entry => entry.path === path && entry.origin === 'fs'
+          ? { ...entry, diffs: ensured.diffs }
+          : entry))
+      }
+      return applyChanges({
+        action,
+        files: [{
+          path,
+          diffs,
+          ...(review.origin !== undefined ? { origin: review.origin } : {}),
+          ...(dirFlag
+            ? { dirKind: review.deleted === true ? 'deleted' as const : 'added' as const }
+            : {}),
+        }],
+      })
+    })().then((result) => {
+      if (result === null) {
+        showToast({
+          tone: 'error',
+          title: t(action === 'undo' ? 'produced.undoError' : 'produced.redoError'),
+          files: [],
+        })
+        return
+      }
       const outcome = result.files.find(file => file.path === path)
       const next = new Map(fileStates)
       next.set(path, outcome?.state ?? 'unsupported')
@@ -379,13 +592,13 @@ export function ProducedFiles({
       })
     }).finally(() => { setFileBusy(null) })
   }, [
-    applyChanges, fileBusy, fileStates, reversiblePaths, showToast, t,
+    applyChanges, fileBusy, fileStates, projectRoot, reversiblePaths, showToast, t,
     statusPending, togglePending,
   ])
 
   return (
     <>
-      <section className={css.card} aria-label={t('produced.summary')}>
+      <section ref={cardRef} className={css.card} aria-label={t('produced.summary')}>
         <header className={css.cardHeader}>
           <span className={css.fileIconWrap}><FileIcon /></span>
           <div className={css.cardTitleBlock}>
@@ -410,8 +623,8 @@ export function ProducedFiles({
           <button
             type="button"
             className={css.toggleButton}
-            disabled={statusPending || togglePending || !hasReversibleFiles}
-            title={!hasReversibleFiles ? t('produced.toggleUnavailable') : undefined}
+            disabled={statusPending || togglePending || !hasToggleableFiles}
+            title={!hasToggleableFiles ? t('produced.toggleUnavailable') : undefined}
             aria-label={toggleAction === 'undo' ? t('produced.undo') : t('produced.redo')}
             onClick={runToggle}
           >
@@ -430,7 +643,7 @@ export function ProducedFiles({
           </button>
         </header>
         <div className={css.fileList}>
-          {shown.map(({ review, stats }) => {
+          {reviewsWithStats.map(({ review, stats }) => {
             const reversible = reversiblePaths.has(review.path)
             const fileAction: FileReviewAction = fileStates.get(review.path) === 'undone' ? 'redo' : 'undo'
             return (
@@ -439,21 +652,32 @@ export function ProducedFiles({
                   type="button"
                   className={css.fileLink}
                   aria-label={t('produced.review', { name: review.path })}
-                  onClick={() => { openInSidebarTab?.([review.path], turnNumber) }}
+                  onMouseEnter={() => { schedulePopoverShow(review) }}
+                  onMouseLeave={schedulePopoverHide}
+                  onFocus={() => { schedulePopoverShow(review) }}
+                  onBlur={schedulePopoverHide}
+                  onClick={() => {
+                    setPopover(null)
+                    clearPopoverTimers('both')
+                    openInSidebarTab?.([review.path], turnNumber)
+                  }}
                 >
                   <span className={css.fileName}>{basename(review.path)}</span>
                   {review.deleted === true
                     ? <span className={css.deletedBadge}>{t('produced.deleted')}</span>
-                    : (
-                      <Stats
-                        stats={stats}
-                        label={t('review.stats', {
-                          added: String(stats.added), removed: String(stats.removed),
-                        })}
-                      />
-                    )}
+                    : review.dir === true
+                      ? <span className={css.deletedBadge}>{t('produced.dir')}</span>
+                      : (
+                        <Stats
+                          stats={stats}
+                          label={t('review.stats', {
+                            added: String(stats.added), removed: String(stats.removed),
+                          })}
+                        />
+                      )}
                 </button>
-                {review.deleted !== true && reversible && (
+                {/* fs 占位条目（全文未补齐）也给出撤销按钮：点击时按需补齐再提交。 */}
+                {(review.deleted !== true || review.diffs.length > 0 || review.dir === true) && (reversible || review.origin === 'fs') && (
                   <button
                     type="button"
                     className={css.fileUndoButton}
@@ -468,15 +692,23 @@ export function ProducedFiles({
               </div>
             )
           })}
-          {hidden > 0 && (
-            <div className={css.moreFiles}>
-              {hidden === 1
-                ? t('produced.moreOne')
-                : t('produced.more', { count: String(hidden) })}
-            </div>
-          )}
         </div>
       </section>
+
+      {popover !== null && (
+        <DiffPopover
+          review={popover.review}
+          anchor={popover.rect}
+          stats={summarizeDiffs(popover.review.diffs)}
+          statsLabel={t('review.stats', {
+            added: String(summarizeDiffs(popover.review.diffs).added),
+            removed: String(summarizeDiffs(popover.review.diffs).removed),
+          })}
+          t={t}
+          onEnter={cancelPopoverHide}
+          onLeave={schedulePopoverHide}
+        />
+      )}
 
       {toast !== null && (
         <ResultToast
