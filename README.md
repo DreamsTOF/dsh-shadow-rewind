@@ -1,8 +1,6 @@
 # dsh-shadow-rewind
 
-> **致谢**：文件审查半边源自 [dsh-file-review-tab](https://github.com/Lzh3070/dsh-file-review-tab)（林子洪移植），其上游为 left0ver 的 [dsh-file-review](https://github.com/left0ver/dsh-file-review)（ZhangWenChao 等贡献）。感谢原项目的 MIT 授权。
-
-针对 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的**会话级文件快照与回退 + AI 改动文件审查 + 终端写盘审计**插件（v0.2 起融合了 dsh-file-review-tab 的全部能力，v0.7 起终端写盘全链路可审可撤，v0.8 起轮末检查点精确归属）。
+针对 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的**会话级文件快照与回退 + AI 改动文件审查 + 终端写盘审计**插件。
 
 ## 功能全景
 
@@ -155,7 +153,7 @@ HTTP 端点均为同源、仅接受回环请求：
 - 终端写盘归属是窗口语义：轮末检查点之后的轮间手动/外部修改不属于任何轮（不再误挂给前一轮）；同一路径被多会话触碰时从单会话视图保守剔除；轮内创建又删除的临时文件两端检查点都不含、不可见；
 - Windows 上权限位语义受限（只读位有效）；
 - 跨机共享存储未设计（锁判活按单机 pid）；
-- Code Mode 录制按结果形状 `{path, before, after}` 识别嵌套修改，返回该形状的非文件工具会被误录（与原 dsh-file-review-tab 一致）。
+- Code Mode 录制按结果形状 `{path, before, after}` 识别嵌套修改，返回该形状的非文件工具会被误录。
 
 ## License
 
