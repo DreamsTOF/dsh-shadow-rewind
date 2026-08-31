@@ -14,10 +14,16 @@
  * cache entry changes (warm replacement invalidates the turn's memo).
  */
 import type { ProducedFileDiff, ProducedFileReview } from '../file-review/change-types.ts'
-import type { TurnFileChanges, SessionFileChange } from './session-changes.ts'
+import type { FsAttributionFields, TurnFileChanges, SessionFileChange } from './session-changes.ts'
+import { diffsFromBeforeAfter } from './recorded-diffs.ts'
+
+/** 与宿主 hunk 数学同一基准的换行归一（file-review-service 的 normalizeNewlines 语义）。 */
+function normalizeLf(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+}
 
 /** One fs-level change; added/removed 是服务端预算好的行数（缺省 = 旧宿主）。 */
-export interface FsChange {
+export interface FsChange extends FsAttributionFields {
   readonly path: string
   readonly kind: 'added' | 'modified' | 'deleted'
   readonly added?: number
@@ -27,6 +33,17 @@ export interface FsChange {
   readonly newMode?: number
   /** 空目录条目：撤销语义是 mkdir/rmdir，无全文。 */
   readonly dir?: boolean
+}
+
+/** 归因字段投影（占位/补齐/提交各构造点共用）：全缺省时返回空对象。 */
+export function fsAttributionOf(source: FsAttributionFields): FsAttributionFields {
+  return {
+    ...(source.owner !== undefined ? { owner: source.owner } : {}),
+    ...(source.autoSelect !== undefined ? { autoSelect: source.autoSelect } : {}),
+    ...(source.attribution !== undefined ? { attribution: source.attribution } : {}),
+    ...(source.command !== undefined ? { command: source.command } : {}),
+    ...(source.writtenAt !== undefined ? { writtenAt: source.writtenAt } : {}),
+  }
 }
 
 /** One turn's file-system changes as returned by /shadow-rewind/fs-changes. */
@@ -81,6 +98,22 @@ async function fetchCheckpointFileContent(
   }
 }
 
+/** 命令归因引用的宽松解析（形状非法返回 null）。 */
+function parseFsCommand(raw: unknown): FsChange['command'] | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const record = raw as Record<string, unknown>
+  if (typeof record.tool !== 'string' || record.tool === '') return null
+  if (typeof record.sessionId !== 'string' || record.sessionId === '') return null
+  if (typeof record.startedAt !== 'number' || typeof record.endedAt !== 'number') return null
+  return {
+    tool: record.tool,
+    ...(typeof record.callId === 'string' && record.callId !== '' ? { callId: record.callId } : {}),
+    sessionId: record.sessionId,
+    startedAt: record.startedAt,
+    endedAt: record.endedAt,
+  }
+}
+
 /**
  * Fetch every turn's file-system changes from the batch endpoint
  * (lenient parse: unknown/missing fields degrade to an empty list).
@@ -110,6 +143,7 @@ export async function fetchAllFsChanges(sessionId: string): Promise<FsChangesPay
           if (typeof c.path !== 'string' || c.path === '') return null
           const kind = c.kind === 'added' || c.kind === 'modified' || c.kind === 'deleted' ? c.kind : null
           if (kind === null) return null
+          const command = parseFsCommand(c.command)
           return {
             path: c.path,
             kind,
@@ -118,6 +152,14 @@ export async function fetchAllFsChanges(sessionId: string): Promise<FsChangesPay
             ...(typeof c.oldMode === 'number' ? { oldMode: c.oldMode } : {}),
             ...(typeof c.newMode === 'number' ? { newMode: c.newMode } : {}),
             ...(c.dir === true ? { dir: true } : {}),
+            // 归因字段宽松解析（旧宿主/开闸缺省；未知枚举丢字段）。
+            ...(typeof c.owner === 'string' && c.owner !== '' ? { owner: c.owner } : {}),
+            ...(typeof c.autoSelect === 'boolean' ? { autoSelect: c.autoSelect } : {}),
+            ...(c.attribution === 'command' || c.attribution === 'ambiguous'
+              || c.attribution === 'external' || c.attribution === 'window'
+              || c.attribution === 'unknown' ? { attribution: c.attribution } : {}),
+            ...(command === null ? {} : { command }),
+            ...(typeof c.writtenAt === 'number' ? { writtenAt: c.writtenAt } : {}),
           }
         })
         .filter((change): change is FsChange => change !== null)
@@ -232,16 +274,19 @@ function invalidateLazyTurn(turnStartSeq: number): void {
   }
 }
 
-/** Generate a ProducedFileDiff for a file-system change by fetching before/after
+/** Generate ProducedFileDiffs for a file-system change by fetching before/after
  * checkpoint contents. For added files oldText = null (the host's fs undo
  * removes the file); for deleted files newText = '' (the host's fs undo writes
- * the old content back). nextCheckpointId may be 'live' (current disk). */
+ * the old content back) — both keep the single whole-file shape that carries
+ * host file-presence semantics. Modified files are split into real line-level
+ * hunks (same basis as the host's hunk math: LF-normalized) so multi-hunk
+ * subset undo works like tool writes. nextCheckpointId may be 'live' (current disk). */
 async function generateFsDiff(
   fsChange: FsChange,
   checkpointId: string,
   nextCheckpointId: string,
   cwd: string,
-): Promise<ProducedFileDiff | null> {
+): Promise<readonly ProducedFileDiff[] | null> {
   const { path, kind } = fsChange
   // 权限位随条目透传：宿主写回时据此恢复（缺省回落 0o644）。
   const modes = {
@@ -253,13 +298,13 @@ async function generateFsDiff(
     // New file: only the end-of-turn content exists.
     const content = await fetchCheckpointFileContent(nextCheckpointId, path, cwd)
     if (content === null) return null
-    return { path, oldText: null, newText: content, ...modes }
+    return [{ path, oldText: null, newText: content, ...modes }]
   }
   if (kind === 'deleted') {
     // Deleted file: only the start-of-turn content exists.
     const content = await fetchCheckpointFileContent(checkpointId, path, cwd)
     if (content === null) return null
-    return { path, oldText: content, newText: '', ...modes }
+    return [{ path, oldText: content, newText: '', ...modes }]
   }
   // Modified file: fetch both sides.
   const [oldContent, newContent] = await Promise.all([
@@ -267,7 +312,15 @@ async function generateFsDiff(
     fetchCheckpointFileContent(nextCheckpointId, path, cwd),
   ])
   if (oldContent === null || newContent === null) return null
-  return { path, oldText: oldContent, newText: newContent, ...modes }
+  // 切 hunk 前先归一行尾（与宿主同式）：不归一时 CRLF/LF 差异会被当成内容变更。
+  // 归一后相同 = 纯行尾/纯 mode 变更 → 回落单条整文件形状，保宿主的 mode 形状识别。
+  const oldLf = normalizeLf(oldContent)
+  const newLf = normalizeLf(newContent)
+  if (oldLf === newLf) return [{ path, oldText: oldContent, newText: newContent, ...modes }]
+  const hunks = diffsFromBeforeAfter(path, oldLf, newLf)
+  // diffContentLines 不计尾部换行：仅尾部换行差异切不出 hunk，同样回落整文件形状。
+  if (hunks.length === 0) return [{ path, oldText: oldContent, newText: newContent, ...modes }]
+  return hunks.map((hunk) => ({ ...hunk, ...modes }))
 }
 
 /**
@@ -303,6 +356,8 @@ export function ensureFsFileDiff(
   const cached = lazyDiffs.get(key)
   if (cached !== undefined) return cached
   const task = (async (): Promise<SessionFileChange | null> => {
+    // 归因随补齐条目透传：合并视图里补齐条目会顶替占位，徽标不能丢。
+    const attribution = fsAttributionOf(change)
     if (change.dir === true) {
       // 目录条目没有全文可拉：静态标记即可，宿主按 dirKind 走 mkdir/rmdir。
       return {
@@ -311,15 +366,17 @@ export function ensureFsFileDiff(
         origin: 'fs',
         dir: true,
         ...(change.kind === 'deleted' ? { deleted: true as const } : {}),
+        ...attribution,
       }
     }
-    const diff = await generateFsDiff(change, fsTurn.checkpointId, fsTurn.nextCheckpointId, cwd)
-    if (diff === null) return null
+    const diffs = await generateFsDiff(change, fsTurn.checkpointId, fsTurn.nextCheckpointId, cwd)
+    if (diffs === null) return null
     return {
       path,
-      diffs: [diff],
+      diffs,
       origin: 'fs',
       ...(change.kind === 'deleted' ? { deleted: true as const } : {}),
+      ...attribution,
     }
   })()
   if (lazyDiffs.size >= LAZY_MEMO_CAP) {

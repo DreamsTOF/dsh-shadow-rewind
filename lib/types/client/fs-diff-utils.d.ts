@@ -14,9 +14,9 @@
  * cache entry changes (warm replacement invalidates the turn's memo).
  */
 import type { ProducedFileReview } from '../file-review/change-types.ts';
-import type { TurnFileChanges, SessionFileChange } from './session-changes.ts';
+import type { FsAttributionFields, TurnFileChanges, SessionFileChange } from './session-changes.ts';
 /** One fs-level change; added/removed 是服务端预算好的行数（缺省 = 旧宿主）。 */
-export interface FsChange {
+export interface FsChange extends FsAttributionFields {
     readonly path: string;
     readonly kind: 'added' | 'modified' | 'deleted';
     readonly added?: number;
@@ -27,6 +27,8 @@ export interface FsChange {
     /** 空目录条目：撤销语义是 mkdir/rmdir，无全文。 */
     readonly dir?: boolean;
 }
+/** 归因字段投影（占位/补齐/提交各构造点共用）：全缺省时返回空对象。 */
+export declare function fsAttributionOf(source: FsAttributionFields): FsAttributionFields;
 /** One turn's file-system changes as returned by /shadow-rewind/fs-changes. */
 export interface FsChangeTurn {
     readonly turn: number;

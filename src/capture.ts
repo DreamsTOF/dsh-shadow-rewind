@@ -82,7 +82,7 @@ export async function captureSnapshot(options: CaptureOptions): Promise<CaptureO
       if (cached.kind === 'file' && cached.blob !== undefined
         && (options.verifyContent === undefined || await options.verifyContent(file.path, cached.blob))) {
         // 缓存命中：stat 指纹未变 + 内容仍在目标存储 → 直接复用。
-        entries[file.path] = { kind: 'file', blob: cached.blob, size: cached.size, mode: cached.mode }
+        entries[file.path] = { kind: 'file', blob: cached.blob, size: cached.size, mode: cached.mode, mtimeNs: cached.mtimeNs }
         // totalBytes 统计快照全量字节（不只是新读部分），与 manifest 语义一致。
         addBytes(cached.size)
         nextPaths[file.path] = cached
@@ -112,7 +112,7 @@ export async function captureSnapshot(options: CaptureOptions): Promise<CaptureO
     }
     const blob = createHash('sha256').update(read.content).digest('hex')
     addBytes(read.content.length)
-    entries[file.path] = { kind: 'file', blob, size: read.content.length, mode: read.stat.mode }
+    entries[file.path] = { kind: 'file', blob, size: read.content.length, mode: read.stat.mode, mtimeNs: read.stat.mtimeNs.toString() }
     newContent.set(file.path, read.content)
     // 以「打开时的 stat 对」为指纹事实：扫描后文件变化的路径按新事实入缓存，
     // 绝不让旧指纹配上新内容污染增量判定。
@@ -206,7 +206,11 @@ interface BigIntStats {
   readonly ctimeNs: bigint
 }
 
-/** 全树确定性哈希：路径 + 条目完整签名（与存储后端无关）。 */
+/**
+ * 全树确定性哈希：路径 + 条目完整签名（与存储后端无关）。
+ * 刻意不含 mtimeNs：树哈希是内容寻址，恢复写回不保留时间戳——若时间戳进哈希，
+ * 恢复后树哈希必变，会击穿 planRestore 的树哈希 CAS（旧清单也因而判「损坏」）。
+ */
 export function hashTree(entries: Readonly<Record<string, SnapshotEntry>>): string {
   const hash = createHash('sha256')
   for (const path of Object.keys(entries).sort((a, b) => Buffer.from(a).compare(Buffer.from(b)))) {

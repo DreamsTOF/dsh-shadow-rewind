@@ -1,4 +1,5 @@
 import type { WorkspaceWriteGate } from './write-gate.js';
+import type { CommandWindowRegistry } from './command-windows.js';
 import type { ShadowRewindEngine } from './engine.js';
 export declare const REWIND_HTTP_PATH = "/shadow-rewind";
 /** 写入闸运行时开关的查询/翻转端点（仅回环；不持久化，重启回到配置初值）。 */
@@ -167,7 +168,7 @@ export declare function installShadowRewindHttp(ctx: RewindHttpDeps & {
             handler: (request: Request, response: Response) => Promise<void>;
         }): () => void;
     };
-}, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator, writeGate: WorkspaceWriteGate): void;
+}, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator, writeGate: WorkspaceWriteGate, commandWindows?: CommandWindowRegistry): void;
 /**
  * 运行中的共享工作区会话分诊：哪些真正阻塞恢复，哪些只是被闸住的旁观者。
  *  - 闸开启：只有「请求者自身」（恢复期间它可能写文件）与「当前所有者」

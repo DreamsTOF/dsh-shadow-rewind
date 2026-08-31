@@ -112,8 +112,11 @@ function hunkSupported(diff: ProducedFileDiff, path: string): boolean {
  * has an empty after side. They are reversible without hunk replay — undo of
  * an addition removes the file; undo of a deletion writes the old content
  * back — so they bypass transformFile but keep the same applied/undone model.
- * A file "modified to empty" is shaped exactly like 'deleted'; the operations
- * are identical (restore the old content), so the aliasing is harmless.
+ * A file "modified to empty" used to alias 'deleted' when it rode the same
+ * anchorless whole-file shape (operations identical: restore the old content);
+ * hunks now split modified files with line anchors, and an anchored
+ * "changed-to-empty" hunk must NOT be mistaken for a whole-file deletion —
+ * the oldStart guard below keeps the two apart.
  *
  * Two more fs shapes ride the same model:
  *  - mode-only: content identical on both sides but permission bits differ —
@@ -141,7 +144,9 @@ function fsChangeShape(file: FileReviewChange): FsChangeShape | null {
     return { kind: 'mode' }
   }
   if (diff.oldText === null) return { kind: 'added', dir: false }
-  if (diff.newText === '' && diff.oldText !== '') return { kind: 'deleted', dir: false }
+  // oldStart 锚点区分「改到空的行级 hunk」与「整文件删除」：前者走通用
+  // hunk 路径（要求文件在场），后者要求文件已不在——识别错了必冲突。
+  if (diff.newText === '' && diff.oldText !== '' && diff.oldStart === undefined) return { kind: 'deleted', dir: false }
   return null
 }
 
@@ -420,7 +425,8 @@ export function transformFile(
 function hunkSidePresent(text: string, file: FileReviewChange, side: 'old' | 'new'): boolean {
   for (const diff of file.diffs) {
     const source = side === 'old' ? diff.oldText : diff.newText
-    if (source === null) continue
+    // 空侧在任何文本里都平凡「在场」，不构成证据（调用方负责全空时的裁决）。
+    if (source === null || source === '') continue
     const line = side === 'old' ? diff.oldStart : diff.newStart
     if (line !== undefined) {
       const located = offsetAtLine(text, line)
@@ -445,7 +451,13 @@ function inspectText(text: string, file: FileReviewChange): InspectedFile {
     // text actually contains: the after hunks are present => applied (undo
     // strips them); otherwise the change is undone and only before hunks
     // remain.
-    return hunkSidePresent(text, file, 'new')
+    // 在场证据只数非空新侧：空 newText（改到空/纯删除块）平凡在场，若参与
+    // 裁决会把撤销后的状态误判为 applied；新侧全无证据时双向可行即意味
+    // 旧内容在锚点在场 → undone。
+    const newEvidence = file.diffs.filter((diff) => diff.newText !== null && diff.newText !== '')
+    const newPresent = newEvidence.length > 0
+      && hunkSidePresent(text, { ...file, diffs: newEvidence }, 'new')
+    return newPresent
       ? { state: 'applied', text, nextText: undone }
       : { state: 'undone', text, nextText: redone }
   }

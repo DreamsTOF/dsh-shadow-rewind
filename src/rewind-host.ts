@@ -13,9 +13,10 @@ import { createDeadline } from './deadline.js'
 import { ShadowRewindError, errorMessage } from './errors.js'
 import { canonicalDirectory } from './path-utils.js'
 import { isCheckpointSkipCode } from './engine.js'
-import { attributePaths, serializeOwner } from './attribution.js'
-import type { PathAttribution } from './attribution.js'
+import { attributeFsChanges, attributePaths, serializeOwner } from './attribution.js'
+import type { FsAttribution, PathAttribution } from './attribution.js'
 import type { WorkspaceWriteGate } from './write-gate.js'
+import type { CommandWindowRegistry } from './command-windows.js'
 import type { ShadowRewindEngine } from './engine.js'
 import type { RestoreResult, WorkspaceChange } from './types.js'
 
@@ -343,11 +344,11 @@ export interface RewindHttpDeps {
 }
 
 /** 注册同源端点；非回环请求一律 403（与旧插件同一安全边界）。 */
-export function installShadowRewindHttp(ctx: RewindHttpDeps & { webServer?: { register(route: { kind: 'exact'; path: string; handler: (request: Request, response: Response) => Promise<void> }): () => void } }, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator, writeGate: WorkspaceWriteGate): void {
+export function installShadowRewindHttp(ctx: RewindHttpDeps & { webServer?: { register(route: { kind: 'exact'; path: string; handler: (request: Request, response: Response) => Promise<void> }): () => void } }, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator, writeGate: WorkspaceWriteGate, commandWindows?: CommandWindowRegistry): void {
   ctx.webServer?.register({
     kind: 'exact',
     path: REWIND_HTTP_PATH,
-    handler: (request, response) => handleRewindHttp(ctx, engine, coordinator, writeGate, request, response),
+    handler: (request, response) => handleRewindHttp(ctx, engine, coordinator, writeGate, commandWindows, request, response),
   })
   ctx.webServer?.register({
     kind: 'exact',
@@ -364,7 +365,7 @@ export function installShadowRewindHttp(ctx: RewindHttpDeps & { webServer?: { re
   ctx.webServer?.register({
     kind: 'exact',
     path: `${REWIND_HTTP_PATH}/fs-changes`,
-    handler: (request, response) => handleFsChangesHttp(ctx, engine, request, response),
+    handler: (request, response) => handleFsChangesHttp(ctx, engine, request, response, writeGate, commandWindows),
   })
 }
 
@@ -397,7 +398,7 @@ async function handleGateHttp(deps: RewindHttpDeps, writeGate: WorkspaceWriteGat
   }
 }
 
-async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator, writeGate: WorkspaceWriteGate, request: Request, response: Response): Promise<void> {
+async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, coordinator: TurnCheckpointCoordinator, writeGate: WorkspaceWriteGate, commandWindows: CommandWindowRegistry | undefined, request: Request, response: Response): Promise<void> {
   try {
     if (!isLoopback(request.socket.remoteAddress)) {
       response.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
@@ -461,6 +462,24 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
           changes: inspection.changes,
           snapshots: attributed.snapshots,
         })
+        // 包围轮降级（与卡片流同源）：网格判为本会话、但终值 mtime 指向其
+        // 它会话命令窗口的写入，是明确的他写者证据——改为 multi，默认勾
+        // 选不得静默纳入它会话写入。预览目标无 createdAt，全窗口查询（剪
+        // 枝无意义传 0；匹配本就以 mtime 为准）。
+        const evidence = await attributeFsChanges({
+          targetSessionId: attributed.targetSessionId,
+          cwd: checkpoint.cwd,
+          changes: inspection.changes,
+          ownership,
+          windowStartMs: 0,
+          windowEndMs: Date.now(),
+          commandWindows,
+        })
+        for (const [path, attr] of evidence) {
+          if (attr.owner === 'multi' && ownership.get(path)?.owner.kind === 'target') {
+            ownership.set(path, { owner: { kind: 'multi' }, autoSelect: false })
+          }
+        }
       }
       const changes = inspection.changes.slice(offset, offset + limit)
       const restoreBlocked = blocking.length > 0
@@ -478,41 +497,39 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
         const currentManifest = manifests.find((m) => m.id === checkpoint.id)
         const sessionIdForLookup = currentManifest?.sessionId
         
-        if (sessionIdForLookup) {
+        if (sessionIdForLookup && currentManifest !== undefined) {
           const allCheckpoints = await engine.listTurnCheckpoints({
             cwd: checkpoint.cwd,
             sessionId: sessionIdForLookup,
           })
           // 优先同轮轮末检查点（精确轮末树），回退下一轮轮起（旧语义）。
           const startCheckpoints = allCheckpoints.filter((cp) => cp.phase !== 'end')
-          const endCheckpoint = checkpoint.turn === undefined
-            ? undefined
-            : allCheckpoints.find((cp) => cp.phase === 'end' && cp.turn === checkpoint.turn)
+          const endCheckpoint = allCheckpoints.find((cp) => cp.phase === 'end' && cp.turn === checkpoint.turn)
           const currentIndex = startCheckpoints.findIndex((cp) => cp.id === checkpoint.id)
           const nextCheckpoint = currentIndex >= 0 ? startCheckpoints[currentIndex + 1] : undefined
           const pairEnd = endCheckpoint ?? nextCheckpoint
           if (pairEnd !== undefined) {
             nextCheckpointId = pairEnd.id
-            try {
-              const fsDiff = await engine.diffCheckpoints({
-                cwd: checkpoint.cwd,
-                prevCheckpointId: checkpoint.id,
-                currCheckpointId: pairEnd.id,
-              })
-              // 保留 added/modified/deleted/mode-changed（后者映射为 modified，
-              // 内容两侧相同）；type-changed 仍过滤。
-              fileSystemChanges = fsDiff.changes
-                .filter((change) =>
-                  change.kind === 'added' || change.kind === 'modified'
-                  || change.kind === 'deleted' || change.kind === 'mode-changed')
-                .map((change) => ({
-                  path: change.path,
-                  kind: (change.kind === 'mode-changed' ? 'modified' : change.kind) as 'added' | 'modified' | 'deleted',
-                }))
-            } catch (error) {
-              // 对比失败不影响主流程，只记录警告
-              deps.logger.warn(`[shadow-rewind] 文件系统差异计算失败：${errorMessage(error)}`)
-            }
+            // 配对 diff 与归属走共享助手（与 fs-changes 端点同源）；预览只
+            // 消费 path/kind，行数预算置 0 不读内容。对比失败助手返回
+            // undefined（已记警告），nextCheckpointId 不受影响。
+            const computed = await computeTurnFsChanges(engine, deps, {
+              cwd: checkpoint.cwd,
+              current: {
+                id: checkpoint.id,
+                sessionId: sessionIdForLookup,
+                createdAt: currentManifest.createdAt,
+                turn: checkpoint.turn,
+                turnStartSeq: checkpoint.turnStartSeq,
+              },
+              pairEnd,
+              gateEnabled: writeGate.isEnabled,
+              commandWindows,
+              countBudget: { remaining: 0 },
+            })
+            // 保留 added/modified/deleted/mode-changed（后者映射为 modified，
+            // 内容两侧相同）；type-changed 仍过滤。
+            fileSystemChanges = computed?.changes.map((change) => ({ path: change.path, kind: change.kind }))
           }
         }
       }
@@ -1149,7 +1166,8 @@ async function readChangeSide(engine: ShadowRewindEngine, cwd: string, sourceId:
 
 /** 端点变更条目：path/kind + 服务端预算行数 + 检查点权限位 + 目录标记。
  * oldMode/newMode 供客户端透传给宿主撤销（写回时恢复权限位）；
- * dir 条目的撤销语义是 mkdir/rmdir，不产生行数。 */
+ * dir 条目的撤销语义是 mkdir/rmdir，不产生行数。
+ * 归因字段（闸关时才透出）：见 attribution.ts 的 FsAttribution。 */
 interface FsChangeItem {
   path: string
   kind: 'added' | 'modified' | 'deleted'
@@ -1158,6 +1176,14 @@ interface FsChangeItem {
   oldMode?: number
   newMode?: number
   dir?: true
+  /** serializeOwner 形态：'target' | 'multi' | 'unknown' | <sessionId>。 */
+  owner?: string
+  /** 回滚勾选清单默认值：仅归属本会话为 true。 */
+  autoSelect?: boolean
+  attribution?: FsAttribution['attribution']
+  command?: FsAttribution['command']
+  /** 当前内容的写入时间（ms epoch，来自快照条目的 mtimeNs）。 */
+  writtenAt?: number
 }
 
 /** 为一条变更补行数与元数据；内容缺失/超限/非 UTF-8/预算耗尽都静默省略行数字段。
@@ -1208,6 +1234,150 @@ async function withLineCounts(
   }
 }
 
+/** 一轮的文件系统变更条目（配对轮与 live-tail 同形）。 */
+interface TurnFsChange {
+  readonly turn: number
+  readonly turnStartSeq: number
+  readonly checkpointId: string
+  readonly nextCheckpointId: string
+  readonly live?: true
+  readonly changes: readonly FsChangeItem[]
+}
+
+/**
+ * 共享配对助手：一轮的「检查点 diff + 窗口归属 + 行数预算」。轮配对
+ * （diffCheckpoints）与 live-tail（inspect = 最后检查点 vs 当前磁盘）共用，
+ * 两端点（/shadow-rewind 预览与 /shadow-rewind/fs-changes）不再各持一份拷贝。
+ *
+ * 归属行为按写入闸开关切换：
+ *  - 闸开：剔除非本会话窗口独有的路径（现有语义，开闸回归的硬门槛）；
+ *  - 闸关：全部保留并附归因（命令窗口 × 文件 mtime 关联；尽力归因、
+ *    诚实标注歧义）。归属失败保守保留全部路径（宿主 CAS 仍兜底防误删）。
+ *
+ * 返回 undefined = 结构性跳过（无 sessionId / 无配对终点）或对比失败
+ * （已记警告）；空 changes 数组原样返回，由调用方决定是否透出。
+ */
+async function computeTurnFsChanges(
+  engine: ShadowRewindEngine,
+  deps: Pick<RewindHttpDeps, 'logger'>,
+  options: {
+    readonly cwd: string
+    readonly current: {
+      readonly id: string
+      readonly sessionId?: string
+      readonly createdAt: number
+      readonly turn: number
+      readonly turnStartSeq: number
+    }
+    /** 归属终点：优先同轮轮末检查点（精确轮末树），回退下一轮轮起（旧语义）。 */
+    readonly pairEnd?: { readonly id: string; readonly createdAt: number }
+    /** live-tail：无配对终点，对比源是当前磁盘。 */
+    readonly live?: boolean
+    readonly gateEnabled: boolean
+    readonly commandWindows?: CommandWindowRegistry
+    readonly countBudget: { remaining: number }
+  },
+): Promise<TurnFsChange | undefined> {
+  const { cwd, current, gateEnabled, commandWindows, countBudget } = options
+  const live = options.live === true
+  if (current.sessionId === undefined) return undefined
+  if (!live && options.pairEnd === undefined) return undefined
+  // live-tail 的配对终点是哨兵（'live', +∞）：快照剪枝与窗口查询天然
+  // 延伸到当前磁盘，后续分支与配对轮同形。
+  const pairEnd = options.pairEnd ?? { id: 'live', createdAt: Number.MAX_SAFE_INTEGER }
+  try {
+    const fsDiff = live
+      ? await engine.inspect({ cwd, restorePointId: current.id })
+      : await engine.diffCheckpoints({ cwd, prevCheckpointId: current.id, currCheckpointId: pairEnd.id })
+    const raw = fsDiff.changes.filter((change) =>
+      (change.kind === 'added' || change.kind === 'modified'
+        || change.kind === 'deleted' || change.kind === 'mode-changed')
+      // 空目录的纯权限位变化没有可撤销语义，直接省略。
+      && !(change.kind === 'mode-changed' && change.before?.kind === 'dir'))
+    if (raw.length === 0) {
+      return finishTurnFsChange(current, live, pairEnd, [])
+    }
+    // 窗口 (current, pairEnd] 落盘者未必是本会话（其它会话的检查点窗口会
+    // 插进来）。先用窗口内快照做网格归属，再用终值证据（净值内容 mtime ×
+    // 命令窗口）归因——包围轮盲区在此降级：完全包住本窗口的其它会话轮没
+    // 有窗口内检查点，网格会把它的写入误判为本会话，而 mtime 落在它的命令
+    // 窗口即明确他写者，降级为 multi（闸开⇒剔除，闸关⇒不默认勾选+弹窗）。
+    // 闸开剔除非本会话独有的路径——与 live-tail 同一规则，防止卡片撤销动
+    // 到别的会话的写入；闸关全部保留，归属/置信级/命令信息随条目透出。
+    let kept = raw
+    let attribution = new Map<string, FsAttribution>()
+    try {
+      const attributed = await engine.listSnapshotsAfter({
+        cwd,
+        restorePointId: current.id,
+        paths: raw.map((change) => change.path),
+      })
+      // 窗口内快照按终点时间剪枝（配对轮 = pairEnd.createdAt；live-tail 的
+      // 哨兵终点 = +∞，等价全保留）。
+      const within = attributed.snapshots.filter((snapshot) => snapshot.createdAt < pairEnd.createdAt)
+      const ownership = attributePaths({
+        targetSessionId: attributed.targetSessionId,
+        changes: raw,
+        snapshots: within,
+      })
+      // 窗口查询剪枝用轮配对 [current.createdAt, pairEnd.createdAt]；
+      // 匹配只以 mtime ∈ [startedAt, endedAt] 为准（长命令跨轮不漏配）。
+      const evidence = await attributeFsChanges({
+        targetSessionId: attributed.targetSessionId,
+        cwd,
+        changes: raw,
+        ownership,
+        windowStartMs: current.createdAt,
+        windowEndMs: pairEnd.createdAt,
+        commandWindows,
+      })
+      if (gateEnabled) {
+        kept = raw.filter((change) => {
+          const owner = evidence.get(change.path)?.owner
+          return owner === undefined || owner === 'target'
+        })
+      } else {
+        attribution = evidence
+      }
+    } catch (error) {
+      deps.logger.warn(`[shadow-rewind] 轮 ${String(current.turn)} ${live ? 'live-tail ' : ''}归因失败，保留全部路径：${errorMessage(error)}`)
+    }
+    const changes = await Promise.all(kept.map(async (change) => {
+      const item = await withLineCounts(engine, cwd, change, current.id, pairEnd.id, countBudget)
+      const attr = attribution.get(change.path)
+      return attr === undefined ? item : {
+        ...item,
+        owner: attr.owner,
+        autoSelect: attr.autoSelect,
+        attribution: attr.attribution,
+        ...(attr.command === undefined ? {} : { command: attr.command }),
+        ...(attr.writtenAt === undefined ? {} : { writtenAt: attr.writtenAt }),
+      }
+    }))
+    return finishTurnFsChange(current, live, pairEnd, changes)
+  } catch (error) {
+    // 单轮对比失败只跳过该轮；对比失败不影响整体响应。
+    deps.logger.warn(`[shadow-rewind] 轮 ${String(current.turn)} ${live ? 'live ' : ''}文件系统差异计算失败：${errorMessage(error)}`)
+    return undefined
+  }
+}
+
+function finishTurnFsChange(
+  current: { readonly id: string; readonly turn: number; readonly turnStartSeq: number },
+  live: boolean,
+  pairEnd: { readonly id: string },
+  changes: readonly FsChangeItem[],
+): TurnFsChange {
+  return {
+    turn: current.turn,
+    turnStartSeq: current.turnStartSeq,
+    checkpointId: current.id,
+    nextCheckpointId: pairEnd.id,
+    ...(live ? { live: true as const } : {}),
+    changes,
+  }
+}
+
 /**
  * GET /shadow-rewind/fs-changes：批量返回会话所有轮次的文件系统变更。
  *
@@ -1219,7 +1389,7 @@ async function withLineCounts(
  * 本构建起每个 change 附带服务端预算的 added/removed 行数——客户端渲染
  * 行与 +/− 统计不再需要逐文件拉全文（全文仅在悬停/展开/撤销时按需取）。
  */
-async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, request: Request, response: Response): Promise<void> {
+async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, request: Request, response: Response, writeGate: WorkspaceWriteGate, commandWindows?: CommandWindowRegistry): Promise<void> {
   try {
     if (!isLoopback(request.socket.remoteAddress)) {
       json(response, 403, { error: 'forbidden', code: 'FORBIDDEN' })
@@ -1246,73 +1416,29 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
     for (const point of checkpoints) {
       if (point.phase === 'end' && point.turn !== undefined) endByTurn.set(point.turn, point)
     }
-    const turns: {
-      turn: number
-      turnStartSeq: number
-      checkpointId: string
-      nextCheckpointId: string
-      live?: true
-      changes: readonly FsChangeItem[]
-    }[] = []
+    const turns: TurnFsChange[] = []
     // 整个请求共享一份行数统计预算：预算耗尽后剩余变更只回 path/kind。
     const countBudget = { remaining: DIFF_COUNT_BUDGET }
     for (let index = 0; index < starts.length; index += 1) {
       const current = starts[index]
-      if (current === undefined) continue
+      if (current === undefined || current.turn === undefined || current.turnStartSeq === undefined) continue
       const next = starts[index + 1]
-      const pairEnd = (current.turn !== undefined ? endByTurn.get(current.turn) : undefined) ?? next
-      if (pairEnd === undefined) continue
-      try {
-        const fsDiff = await engine.diffCheckpoints({
-          cwd,
-          prevCheckpointId: current.id,
-          currCheckpointId: pairEnd.id,
-        })
-        const raw = fsDiff.changes.filter((change) =>
-          (change.kind === 'added' || change.kind === 'modified'
-            || change.kind === 'deleted' || change.kind === 'mode-changed')
-          // 空目录的纯权限位变化没有可撤销语义，直接省略。
-          && !(change.kind === 'mode-changed' && change.before?.kind === 'dir'))
-        // 窗口 (current, pairEnd] 落盘者未必是本会话（其它会话的检查点窗口会
-        // 插进来）。用窗口内的快照做归属，剔除非本会话独有的路径——与
-        // live-tail 同一规则，防止卡片撤销动到别的会话的写入。
-        // 归属失败保守保留全部路径（宿主 CAS 仍兜底防误删）。
-        let kept = raw
-        if (raw.length > 0) {
-          try {
-            const attributed = await engine.listSnapshotsAfter({
-              cwd,
-              restorePointId: current.id,
-              paths: raw.map((change) => change.path),
-            })
-            const within = attributed.snapshots.filter((snapshot) => snapshot.createdAt < pairEnd.createdAt)
-            const ownership = attributePaths({
-              targetSessionId: attributed.targetSessionId,
-              changes: raw,
-              snapshots: within,
-            })
-            kept = raw.filter((change) => {
-              const owner = ownership.get(change.path)?.owner
-              return owner === undefined || owner.kind === 'target'
-            })
-          } catch (error) {
-            deps.logger.warn(`[shadow-rewind] 轮 ${String(current.turn ?? '?')} 归因失败，保留全部路径：${errorMessage(error)}`)
-          }
-        }
-        if (kept.length > 0 && current.turn !== undefined && current.turnStartSeq !== undefined) {
-          const changes = await Promise.all(kept.map((change) => withLineCounts(engine, cwd, change, current.id, pairEnd.id, countBudget)))
-          turns.push({
-            turn: current.turn,
-            turnStartSeq: current.turnStartSeq,
-            checkpointId: current.id,
-            nextCheckpointId: pairEnd.id,
-            changes,
-          })
-        }
-      } catch (error) {
-        // 单轮对比失败只跳过该轮；对比失败不影响整体响应。
-        deps.logger.warn(`[shadow-rewind] 轮 ${String(current.turn ?? '?')} 文件系统差异计算失败：${errorMessage(error)}`)
-      }
+      const pairEnd = endByTurn.get(current.turn) ?? next
+      const computed = await computeTurnFsChanges(engine, deps, {
+        cwd,
+        current: {
+          id: current.id,
+          sessionId: current.sessionId,
+          createdAt: current.createdAt,
+          turn: current.turn,
+          turnStartSeq: current.turnStartSeq,
+        },
+        pairEnd,
+        gateEnabled: writeGate.isEnabled,
+        commandWindows,
+        countBudget,
+      })
+      if (computed !== undefined && computed.changes.length > 0) turns.push(computed)
     }
     // live-tail：最新轮起检查点 vs 当前磁盘——只覆盖尚无轮末快照的最新一轮
     // （进行中的回合，或轮末捕获失败/旧数据的回退）。已有轮末快照的轮不需要
@@ -1320,52 +1446,24 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
     const last = starts[starts.length - 1]
     if (last !== undefined && last.turn !== undefined && last.turnStartSeq !== undefined
       && !endByTurn.has(last.turn)) {
-      try {
-        const live = await engine.inspect({ cwd, restorePointId: last.id })
-        // live-tail 归属过滤：最后检查点之后磁盘上的变化未必是本会话写的
-        // （其它会话的检查点窗口、恢复操作都会动盘）。非本会话窗口独有的
-        // 路径一律剔除——live 条目的 after 内容就是「当前磁盘」，据此派生
-        // 的整文件 diff 一旦撤销会删掉/覆盖别的会话刚写的工作（fs-added
-        // 的撤销是真实 rm）。
-        const raw = live.changes.filter((change) =>
-          (change.kind === 'added' || change.kind === 'modified'
-            || change.kind === 'deleted' || change.kind === 'mode-changed')
-          && !(change.kind === 'mode-changed' && change.before?.kind === 'dir'))
-        let kept = raw
-        if (raw.length > 0) {
-          try {
-            const attributed = await engine.listSnapshotsAfter({
-              cwd,
-              restorePointId: last.id,
-              paths: raw.map((change) => change.path),
-            })
-            const ownership = attributePaths({
-              targetSessionId: attributed.targetSessionId,
-              changes: raw,
-              snapshots: attributed.snapshots,
-            })
-            kept = raw.filter((change) => {
-              const owner = ownership.get(change.path)?.owner
-              return owner === undefined || owner.kind === 'target'
-            })
-          } catch (error) {
-            deps.logger.warn(`[shadow-rewind] live-tail 归因失败，保留全部路径：${errorMessage(error)}`)
-          }
-        }
-        if (kept.length > 0) {
-          const changes = await Promise.all(kept.map((change) => withLineCounts(engine, cwd, change, last.id, 'live', countBudget)))
-          turns.push({
-            turn: last.turn,
-            turnStartSeq: last.turnStartSeq,
-            checkpointId: last.id,
-            nextCheckpointId: 'live',
-            live: true,
-            changes,
-          })
-        }
-      } catch (error) {
-        deps.logger.warn(`[shadow-rewind] 轮 ${String(last.turn)} live 文件系统差异计算失败：${errorMessage(error)}`)
-      }
+      // live 条目的 after 内容就是「当前磁盘」，归属过滤/归因走同一助手
+      // （闸开剔除非本会话窗口路径——整文件 diff 一旦撤销会删掉/覆盖别的
+      // 会话刚写的工作；闸关全部保留并附归因）。
+      const computed = await computeTurnFsChanges(engine, deps, {
+        cwd,
+        current: {
+          id: last.id,
+          sessionId: last.sessionId,
+          createdAt: last.createdAt,
+          turn: last.turn,
+          turnStartSeq: last.turnStartSeq,
+        },
+        live: true,
+        gateEnabled: writeGate.isEnabled,
+        commandWindows,
+        countBudget,
+      })
+      if (computed !== undefined && computed.changes.length > 0) turns.push(computed)
     }
     json(response, 200, { sessionId, rev: await workspaceRevision(cwd), turns })
   } catch (error) {

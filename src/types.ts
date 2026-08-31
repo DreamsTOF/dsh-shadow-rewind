@@ -19,6 +19,10 @@ export interface FileEntry {
   readonly size: number
   /** 完整权限位（含可执行位），恢复时原样写回。 */
   readonly mode: number
+  /** 当前内容的写入时间（十进制纳秒字符串，同缓存指纹形态；number 会丢精度）。
+   * 写盘归因的「何时」信息源。旧清单无此字段，故可选；不参与树哈希与条目
+   * 等价判定（树哈希内容寻址，恢复写回不保留时间戳）。 */
+  readonly mtimeNs?: string
 }
 
 /** 单个符号链接的快照条目。target 原样保留，mode 是链接自身的权限位。 */

@@ -70,6 +70,15 @@ export declare const zh: {
     readonly ownerMulti: "双方都改过";
     readonly ownerSession: "会话 {id}";
     readonly ownerUnknown: "来源不明";
+    readonly attrAmbiguous: "本会话命令（哪条不确定）";
+    readonly attrExternal: "外部写入";
+    readonly turnOtherSessions: "含其它会话写入 {count}";
+    readonly multiConfirmTitle: "多会话写入冲突";
+    readonly multiConfirmWarn: "以下文件被多个会话交叉写入，继续操作会改动其它会话可能依赖的内容：";
+    readonly multiConfirmOthers: "本次提交还包含其它会话的写入：";
+    readonly multiConfirmManual: "改为手动勾选";
+    readonly multiConfirmProceedUndo: "继续撤销";
+    readonly multiConfirmProceedRedo: "继续应用";
     readonly selectAll: "全部选中（整树恢复）";
     readonly snapshotTotalSelected: "将恢复 {count} / {total} 个文件";
     readonly pathsTooLong: "勾选的文件过多，无法构造恢复请求；请减少勾选";

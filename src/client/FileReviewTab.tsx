@@ -18,9 +18,9 @@ import type {
 } from '../file-review/change-types.ts'
 import {
   basename, deriveSessionChanges, deriveSessionRoots, mergeRecordedTurns,
-  resolveSessionPath, type SessionFileChange, type TurnFileChanges,
+  resolveSessionPath, type FsAttributionFields, type SessionFileChange, type TurnFileChanges,
 } from './session-changes.ts'
-import { ensureFsFileDiff, fetchAllFsChanges, type FsChangeTurn } from './fs-diff-utils.ts'
+import { ensureFsFileDiff, fetchAllFsChanges, fsAttributionOf, type FsChangeTurn } from './fs-diff-utils.ts'
 import { summarizeDiffs, UnifiedDiff, type UnifiedDiffStats } from './UnifiedDiff.tsx'
 import { fetchSubsetPlan, pathsTooLong } from './subset-plan.ts'
 import { t } from './locales.ts'
@@ -57,7 +57,7 @@ interface Notice {
 }
 
 /** One flattened (turn, file) change unit used for status requests. */
-interface FlatChange {
+interface FlatChange extends FsAttributionFields {
   readonly turn: number
   readonly path: string
   readonly diffs: SessionFileChange['diffs']
@@ -74,6 +74,32 @@ interface FlatChange {
 /** State map key for one (turn, file) change group. */
 function stateKey(turn: number, path: string): string {
   return `${turn}|${path}`
+}
+
+/** ms epoch → HH:MM（归因徽标的写入时间展示）。 */
+function formatClock(ms: number): string {
+  const date = new Date(ms)
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+}
+
+/** fs 条目的归因徽标文案：开闸/旧宿主无归因（owner 缺省）→ 无徽标。
+ * 命令级展示「命令 · 写入时间」；他会话展示会话标题；歧义/外部如实标注。 */
+function fsOwnerBadge(file: SessionFileChange, sessionTitle: (id: string) => string | undefined): string | null {
+  if (file.owner === undefined) return null
+  if (file.attribution === 'command' && file.command !== undefined) {
+    return `${file.command.tool} · ${formatClock(file.writtenAt ?? file.command.startedAt)}`
+  }
+  if (file.owner === 'multi') return t('ownerMulti')
+  if (file.owner === 'unknown') return t('ownerUnknown')
+  if (file.owner !== 'target') {
+    const title = sessionTitle(file.owner)
+    return title ?? t('ownerSession', {
+      id: file.owner.length > 12 ? `${file.owner.slice(0, 12)}…` : file.owner,
+    })
+  }
+  if (file.attribution === 'ambiguous') return t('attrAmbiguous')
+  if (file.attribution === 'external') return t('attrExternal')
+  return null
 }
 
 /** Deep-link scroll target: the turn group for whole-turn links, else the row. */
@@ -212,6 +238,8 @@ interface TurnRewindDialogProps {
   readonly windowStats: ReadonlyMap<string, PathWindowStats>
   /** 点击某路径的 +/-：跳到该文件最近一轮的差异（父级负责关闭对话框）。 */
   readonly onJumpToDiff: (turn: number, path: string) => void
+  /** 其它会话 id → displayTitle（会话列表快照查不到时回落截断 id）。 */
+  readonly sessionTitle: (id: string) => string | undefined
   readonly onClose: () => void
   /** 恢复成功后回调（刷新 tab 的状态巡检）。 */
   readonly onRestored: () => void
@@ -343,7 +371,7 @@ function snapshotKindLabel(kind: string): string {
   }
 }
 
-function TurnRewindDialog({ sessionId, turn, windowStats, onJumpToDiff, onClose, onRestored }: TurnRewindDialogProps) {
+function TurnRewindDialog({ sessionId, turn, windowStats, onJumpToDiff, sessionTitle, onClose, onRestored }: TurnRewindDialogProps) {
   const [loading, setLoading] = useState(true)
   const [preview, setPreview] = useState<TurnRewindPreview | null>(null)
   const [applying, setApplying] = useState(false)
@@ -570,7 +598,8 @@ function TurnRewindDialog({ sessionId, turn, windowStats, onJumpToDiff, onClose,
                         ? t('ownerMulti')
                         : change.owner === 'unknown'
                           ? t('ownerUnknown')
-                          : t('ownerSession', { id: change.owner.length > 12 ? `${change.owner.slice(0, 12)}…` : change.owner })
+                          : sessionTitle(change.owner)
+                            ?? t('ownerSession', { id: change.owner.length > 12 ? `${change.owner.slice(0, 12)}…` : change.owner })
                     const windowEntry = windowStats.get(change.path)
                     return (
                       <div className="srw-file" key={change.path}>
@@ -616,6 +645,69 @@ function TurnRewindDialog({ sessionId, turn, windowStats, onJumpToDiff, onClose,
           <button type="button" onClick={onClose} disabled={applying}>{t('cancel')}</button>
           <button type="button" onClick={() => { void apply() }} disabled={!canApply}>
             {applying ? t('snapshotApplying') : done ? t('close') : t('snapshotApply')}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── 多会话确认弹窗：提交批次含 owner === 'multi'（真冲突）才弹 ──
+
+interface MultiSessionConfirmProps {
+  /** 已过提交闸（显式勾选）的待提交批次。 */
+  readonly items: readonly FlatChange[]
+  readonly action: FileReviewAction
+  /** 其它会话 id → displayTitle（列表快照查不到时回落原始 id）。 */
+  readonly sessionTitle: (id: string) => string | undefined
+  readonly onCancel: () => void
+  /** 改为手动勾选：关弹窗 + 展开冲突行并滚动到位。 */
+  readonly onManual: () => void
+  readonly onProceed: () => void
+}
+
+/** 骨架复刻 TurnRewindDialog 的 srw-* 样式；纯同步确认，无 fetch 状态机。 */
+function MultiSessionConfirmDialog({ items, action, sessionTitle, onCancel, onManual, onProceed }: MultiSessionConfirmProps) {
+  const conflicts = items.filter(item => item.owner === 'multi')
+  const others = items.filter((item): item is FlatChange & { readonly owner: string } =>
+    item.owner !== undefined && item.owner !== 'target'
+    && item.owner !== 'multi' && item.owner !== 'unknown')
+  return (
+    <div className="srw-overlay" role="dialog" aria-modal="true">
+      <div className="srw-dialog">
+        <div className="srw-dialog-head">
+          <strong>{t('multiConfirmTitle')}</strong>
+          <button type="button" className="srw-trigger" onClick={onCancel} aria-label={t('close')}>✕</button>
+        </div>
+        <div className="srw-content">
+          <div className="srw-body">
+            <p className="srw-warning">{t('multiConfirmWarn')}</p>
+            <div className="srw-files">
+              {conflicts.map(item => (
+                <div className="srw-file" key={stateKey(item.turn, item.path)}>
+                  <code>{item.path}</code>
+                  <span className="srw-kind">{t('ownerMulti')}</span>
+                </div>
+              ))}
+            </div>
+            {others.length > 0 && (
+              <p className="srw-status">
+                {t('multiConfirmOthers')}
+                {others.map((item, index) => (
+                  <span key={stateKey(item.turn, item.path)}>
+                    {index > 0 ? '、' : ' '}
+                    {sessionTitle(item.owner) ?? item.owner}
+                  </span>
+                ))}
+              </p>
+            )}
+          </div>
+        </div>
+        <div className="srw-foot">
+          <button type="button" onClick={onCancel}>{t('cancel')}</button>
+          <button type="button" onClick={onManual}>{t('multiConfirmManual')}</button>
+          <button type="button" onClick={onProceed}>
+            {t(action === 'undo' ? 'multiConfirmProceedUndo' : 'multiConfirmProceedRedo')}
           </button>
         </div>
       </div>
@@ -700,6 +792,12 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   const [rewindTurn, setRewindTurn] = useState<number | null>(null)
   // 打开文件级时间线对话框的路径；null = 关闭。
   const [timelinePath, setTimelinePath] = useState<string | null>(null)
+  // 多会话确认弹窗的待提交批次（批次含 owner === 'multi' 时暂存）；null = 关闭。
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    key: string
+    items: readonly FlatChange[]
+    action: FileReviewAction
+  } | null>(null)
   const noticeSeqRef = useRef(0)
   const noticeTimerRef = useRef<number | null>(null)
 
@@ -710,6 +808,16 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     [session],
   )
   const snapshot = useSyncExternalStore(subscribe, () => session?.getSnapshot() ?? null)
+
+  // 会话标题查询（归因徽标把「他会话 id」升级成可读标题；缺省回落 id 截断）。
+  const sessionList = useSyncExternalStore(
+    useCallback((listener: () => void) => sessions.list.subscribe(listener), [sessions]),
+    () => sessions.list.getSnapshot(),
+  )
+  const sessionTitle = useCallback(
+    (id: string) => sessionList.byId[id as SessionId]?.displayTitle,
+    [sessionList],
+  )
 
   // Code Mode (run_code) roots and their Host-recorded mutations: nested
   // dispatches carry no reuseable views, so each root's file changes are
@@ -773,6 +881,19 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
       for (const [key, value] of settled) if (value !== null) next.set(key, value)
       return next
     })
+    // 自动勾选：归因非本会话（autoSelect === false）的条目此时才知道 hunk 数，
+    // 初始化为显式空勾选（行按钮默认禁用，须显式勾选才提交）；本会话写入与
+    // 无归因条目保持隐式全选；已有用户选择绝不覆盖。
+    setHunkSelection((current) => {
+      let changed = false
+      const next = new Map(current)
+      for (const [key, value] of settled) {
+        if (value === null || value.autoSelect !== false || next.has(key)) continue
+        next.set(key, new Set<number>())
+        changed = true
+      }
+      return changed ? next : current
+    })
   }, [cwd])
 
   // fs 占位（计数）→ 已补齐条目的合并视图：同 (turn, path) 优先用懒加载全文。
@@ -795,6 +916,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
             ? { counts: { added: change.added ?? 0, removed: change.removed ?? 0 } }
             : {}),
           ...(change.kind === 'deleted' ? { deleted: true as const } : {}),
+          ...fsAttributionOf(change),
         })
       }
       if (files.length > 0) result.push({ turn: fsTurn.turn, live: false, files })
@@ -858,6 +980,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
       ...(file.deleted === true ? { deleted: true as const } : {}),
       ...(file.origin !== undefined ? { origin: file.origin } : {}),
       ...(file.counts !== undefined ? { counts: file.counts } : {}),
+      ...fsAttributionOf(file),
     }))),
     [turns],
   )
@@ -1080,9 +1203,12 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     })
   }, [])
 
-  /** Toggle one change set (a whole turn, or one file) undo ↔ redo.
-   * fs 占位条目先按需补齐全文再提交（零全文条目宿主无法回放）。 */
-  const runToggle = useCallback((
+  /** Toggle one change set (a whole turn, or one file) undo ↔ redo — 提交闸
+   * 单点：轮/文件按钮都传全文，筛选在此统一完成。
+   * ① autoSelect === false 的条目（其它会话/歧义写入）须有显式勾选才纳入；
+   * ② 批次含 owner === 'multi'（真多会话冲突）⇒ 先弹确认窗，确认后走
+   * applyToggle；其余批次直接提交。 */
+  const applyToggle = useCallback((
     key: string,
     items: readonly FlatChange[],
     action: FileReviewAction,
@@ -1091,6 +1217,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     setBusyKey(key)
     let submitted: FlatChange[] = []
     void (async () => {
+      // fs 占位条目先按需补齐全文再提交（零全文条目宿主无法回放）。
       const ensuredItems: FlatChange[] = []
       for (const item of items) {
         if (item.diffs.length > 0 || item.origin !== 'fs') {
@@ -1107,7 +1234,14 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           })
         }
       }
-      submitted = ensuredItems.filter(item => item.diffs.length > 0)
+      // hunk 子集裁剪：有勾选则只提交勾选部分（子集为空 ⇒ 该条不提交）。
+      submitted = ensuredItems.flatMap((item) => {
+        if (item.diffs.length === 0) return []
+        const selection = hunkSelection.get(stateKey(item.turn, item.path))
+        if (selection === undefined || selection.size >= item.diffs.length) return [item]
+        const subset = item.diffs.filter((_, index) => selection.has(index))
+        return subset.length > 0 ? [{ ...item, diffs: subset }] : []
+      })
       if (submitted.length === 0) return undefined
       return invoke('apply', {
         action,
@@ -1133,7 +1267,28 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     }).catch((error: unknown) => {
       showNotice('error', `${t('toggleError')}: ${error instanceof Error ? error.message : String(error)}`)
     }).finally(() => { setBusyKey(null) })
-  }, [busyKey, ensureFsTurnFiles, invoke, mergeResultStates, showNotice])
+  }, [busyKey, ensureFsTurnFiles, hunkSelection, invoke, mergeResultStates, showNotice])
+
+  const runToggle = useCallback((
+    key: string,
+    items: readonly FlatChange[],
+    action: FileReviewAction,
+  ) => {
+    if (busyKey !== null || items.length === 0) return
+    // autoSelect === false 且无显式勾选 ⇒ 不纳入提交批次（默认不勾选 ⇒
+    // 提交必经用户显式勾选，纯他会话文件由此无需弹窗确认）。
+    const candidates = items.filter((item) => {
+      if (item.autoSelect !== false) return true
+      const selection = hunkSelection.get(stateKey(item.turn, item.path))
+      return selection !== undefined && selection.size > 0
+    })
+    if (candidates.length === 0) return
+    if (candidates.some(item => item.owner === 'multi')) {
+      setPendingConfirm({ key, items: candidates, action })
+      return
+    }
+    void applyToggle(key, candidates, action)
+  }, [busyKey, hunkSelection, applyToggle])
 
   const toggleExpanded = useCallback((key: string) => {
     setExpanded((current) => {
@@ -1153,14 +1308,6 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
       return map
     })
   }, [])
-
-  /** 每文件按钮实际提交的 hunks：勾选子集（空子集时按钮已被禁用，不会到达）。 */
-  const hunksForRequest = useCallback((file: SessionFileChange, key: string): SessionFileChange['diffs'] => {
-    const selection = hunkSelection.get(key)
-    if (selection === undefined) return file.diffs
-    const subset = file.diffs.filter((_, index) => selection.has(index))
-    return subset.length > 0 ? subset : file.diffs
-  }, [hunkSelection])
 
   const selectedHunkCount = useCallback((file: SessionFileChange, key: string): number => {
     const selection = hunkSelection.get(key)
@@ -1243,6 +1390,9 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     const turnAction: FileReviewAction = allUndone ? 'redo' : 'undo'
     const turnKey = `turn:${turn.turn}`
     const turnBusy = busyKey === turnKey
+    // 轮头部汇总：该轮存在非本会话归属的 fs 写入时提示总数（不逐文件枚举）。
+    const otherWrites = turn.files.filter(file => file.origin === 'fs'
+      && file.owner !== undefined && file.owner !== 'target').length
     return (
       <section
         key={turn.turn}
@@ -1259,6 +1409,9 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
             {turn.files.length === 1 ? t('filesOne') : t('files', { count: turn.files.length })}
           </span>
           <Stats stats={turnStats} />
+          {otherWrites > 0 && (
+            <span className={css.ownerBadge}>{t('turnOtherSessions', { count: otherWrites })}</span>
+          )}
           <button
             type="button"
             className={css.actionButton}
@@ -1270,6 +1423,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
                 ...(file.origin !== undefined ? { origin: file.origin } : {}),
                 ...(file.dir === true ? { dir: true as const } : {}),
                 ...(file.deleted === true ? { deleted: true as const } : {}),
+                ...fsAttributionOf(file),
               })), turnAction)
             }}
           >
@@ -1316,6 +1470,8 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     // whole-file diff and behave like any other toggleable change.
     // 目录删除同理（补齐后走 dirKind 语义）——不算「无 diff 的删除」。
     const deletedNoDiff = file.deleted === true && file.diffs.length === 0 && file.dir !== true
+    // fs 条目的归因徽标（开闸/旧宿主无归因 → 无徽标）。
+    const fsBadge = file.origin === 'fs' ? fsOwnerBadge(file, sessionTitle) : null
     const expand = () => {
       toggleExpanded(key)
       if (fsPending) void ensureFsTurnFiles(turn.turn, [file.path])
@@ -1347,6 +1503,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           <span className={css.fileName}>{basename(file.path)}</span>
           {file.deleted === true && <span className={css.deletedBadge}>{t('deleted')}</span>}
           {file.dir === true && <span className={css.deletedBadge}>{t('dirBadge')}</span>}
+          {fsBadge !== null && <span className={css.ownerBadge}>{fsBadge}</span>}
           {!deletedNoDiff && <Stats stats={stats} />}
           {!deletedNoDiff && <StateBadge state={state} />}
           <button
@@ -1375,19 +1532,20 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           <button
             type="button"
             className={css.smallButton}
-            disabled={statusPending || busyKey !== null || !(reversible || fsPending) || (reversible && selectedCount === 0)}
+            disabled={statusPending || busyKey !== null || !(reversible || fsPending) || ((reversible || file.autoSelect === false) && selectedCount === 0)}
             title={deletedNoDiff
               ? t('deletedHint')
               : (!(reversible || fsPending)
                 ? t('toggleUnavailable')
-                : (reversible && selectedCount === 0) ? t('hunkNoneSelected') : undefined)}
+                : ((reversible || file.autoSelect === false) && selectedCount === 0) ? t('hunkNoneSelected') : undefined)}
             onClick={(event) => {
               event.stopPropagation()
               runToggle(key, [{
-                turn: turn.turn, path: file.path, diffs: hunksForRequest(file, key),
+                turn: turn.turn, path: file.path, diffs: file.diffs,
                 ...(file.origin !== undefined ? { origin: file.origin } : {}),
                 ...(file.dir === true ? { dir: true as const } : {}),
                 ...(file.deleted === true ? { deleted: true as const } : {}),
+                ...fsAttributionOf(file),
               }], fileAction)
             }}
           >
@@ -1475,10 +1633,37 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           turn={rewindTurn}
           windowStats={windowStats}
           onJumpToDiff={jumpToFile}
+          sessionTitle={sessionTitle}
           onClose={() => { setRewindTurn(null) }}
           onRestored={() => {
             setTick(value => value + 1)
             showNotice('success', t('snapshotDone'))
+          }}
+        />
+      )}
+      {pendingConfirm !== null && (
+        <MultiSessionConfirmDialog
+          items={pendingConfirm.items}
+          action={pendingConfirm.action}
+          sessionTitle={sessionTitle}
+          onCancel={() => { setPendingConfirm(null) }}
+          onManual={() => {
+            const conflicts = pendingConfirm.items.filter(item => item.owner === 'multi')
+            setPendingConfirm(null)
+            // 展开冲突行并滚到首条；先补齐全文让勾选框即刻可用。
+            for (const item of conflicts) void ensureFsTurnFiles(item.turn, [item.path])
+            setExpanded((current) => {
+              const next = new Set(current)
+              for (const item of conflicts) next.add(stateKey(item.turn, item.path))
+              return next
+            })
+            const first = conflicts[0]
+            if (first !== undefined) pendingScrollRef.current = { rowKey: stateKey(first.turn, first.path), turn: null }
+          }}
+          onProceed={() => {
+            const pending = pendingConfirm
+            setPendingConfirm(null)
+            void applyToggle(pending.key, pending.items, pending.action)
           }}
         />
       )}

@@ -64,6 +64,14 @@ export interface WriteGateOptions {
  * 保证新装的可写工具默认不会绕过闸。可用 config.writeGateAllow 扩充。
  */
 export declare const DEFAULT_READONLY_TOOLS: readonly string[];
+/**
+ * 沿 parentSession 谱系上溯：从起始 header 出发按序访问每个祖先会话 id
+ * （回调返回 false 提前终止）。深度上限与防环访问集内置。写入闸的所有者
+ * 可达判定与命令窗口的顶层会话解析共用此行走，语义集中一处。
+ * 访问顺序与 lineageReaches 一致：先看父会话缺省，再交回调裁决，
+ * 之后才做防环与查找——「目标是所有者」优先于「已经见过」。
+ */
+export declare function walkParentLineage(header: GateAgentHeader, lookup: (sessionId: string) => GateAgentHeader | undefined, visit: (ancestorId: string) => boolean, initialSeen?: readonly string[]): void;
 export declare class WorkspaceWriteGate {
     private readonly deps;
     /** 规范化工作区 key → 所有者 agent id（= 会话 id）。 */

@@ -1,7 +1,7 @@
 {
   "name": "dsh-shadow-rewind",
-  "version": "0.8.1",
-  "description": "基于隐藏影子 jj 仓库的会话级文件快照与回退，并内置 AI 改动文件审查：侧边栏 diff、聊天轮尾卡片、hunk 级撤销/重做、终端写盘审计（检查点窗口归属 + 轮末检查点精确归属 + 可撤销）、Code Mode 录制（融合 dsh-file-review-tab）。",
+  "version": "0.9.0",
+  "description": "基于隐藏影子 jj 仓库的会话级文件快照与回退，并内置 AI 改动文件审查：侧边栏 diff、聊天轮尾卡片、hunk 级撤销/重做、终端写盘审计（检查点窗口归属 + 轮末检查点精确归属 + 写盘归因 + 可撤销）、Code Mode 录制（融合 dsh-file-review-tab）。",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

@@ -6,7 +6,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, mkdir, rm, rmdir, writeFile, readFile, chmod, symlink, lstat } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdtemp, mkdir, rm, rmdir, writeFile, readFile, chmod, symlink, lstat, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ShadowRewindEngine } from '../lib/index.js'
@@ -486,6 +487,48 @@ test('空目录：检查点记录 dir 条目，轮末归属可见且整轮恢复
     const stat = await lstat(join(workspace, 'empty'))
     assert.ok(stat.isDirectory(), '恢复必须重建空目录')
     assert.equal(await readFile(join(workspace, 'a.txt'), 'utf8'), 'v1\n')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('mtime 落盘：检查点记录写入时间，旧清单兼容且树哈希不受影响', async () => {
+  const workspace = await makeWorkspace()
+  const { engine, storageDir } = await makeEngine({})
+  const { parseManifest, hashTree } = await import('../lib/manifest.js')
+  const readManifest = async (id) => {
+    // 与 store 同式：工作区 key = SHA-256(规范化路径) 前 16 位。
+    const key = createHash('sha256').update(await realpath(workspace), 'utf8').digest('hex').slice(0, 16)
+    const raw = JSON.parse(await readFile(join(storageDir, 'workspaces', key, 'manifests', `${id}.json`), 'utf8'))
+    return raw
+  }
+  try {
+    const t1 = await captureTurn(engine, workspace, 1)
+    const raw = await readManifest(t1.id)
+    const manifest = parseManifest(raw)
+    const entry = manifest.entries['a.txt']
+    assert.ok(entry !== undefined && entry.kind === 'file')
+    assert.ok(typeof entry.mtimeNs === 'string' && /^[0-9]+$/.test(entry.mtimeNs), '新读路径必须落 mtimeNs')
+    const disk = await lstat(join(workspace, 'a.txt'), { bigint: true })
+    assert.equal(entry.mtimeNs, disk.mtimeNs.toString(), 'mtimeNs 必须与磁盘事实一致')
+
+    // 无变化再捕获一轮：缓存命中路径同样带出 mtimeNs 且数值不变。
+    const t2 = await captureTurn(engine, workspace, 2)
+    const second = parseManifest(await readManifest(t2.id))
+    const cachedEntry = second.entries['a.txt']
+    assert.ok(cachedEntry !== undefined && cachedEntry.kind === 'file')
+    assert.equal(cachedEntry.mtimeNs, entry.mtimeNs, '缓存命中必须透传 mtimeNs')
+
+    // 旧清单兼容：去掉 mtimeNs 仍可解析，且树哈希不变（时间戳不进哈希）。
+    const legacy = JSON.parse(JSON.stringify(raw))
+    delete legacy.entries['a.txt'].mtimeNs
+    const legacyManifest = parseManifest(legacy)
+    assert.equal(hashTree(legacyManifest.entries), manifest.treeHash, 'mtime 不得参与树哈希')
+
+    // 非法值按损坏拒绝（fail-closed）。
+    const bad = JSON.parse(JSON.stringify(raw))
+    bad.entries['a.txt'].mtimeNs = 'not-a-number'
+    assert.throws(() => parseManifest(bad), /mtimeNs/)
   } finally {
     await rm(workspace, { recursive: true, force: true })
   }

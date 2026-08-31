@@ -73,6 +73,32 @@ export const DEFAULT_READONLY_TOOLS: readonly string[] = [
 /** 谱系上溯深度上限；防环由「访问集」保证。 */
 const LINEAGE_DEPTH_CAP = 8
 
+/**
+ * 沿 parentSession 谱系上溯：从起始 header 出发按序访问每个祖先会话 id
+ * （回调返回 false 提前终止）。深度上限与防环访问集内置。写入闸的所有者
+ * 可达判定与命令窗口的顶层会话解析共用此行走，语义集中一处。
+ * 访问顺序与 lineageReaches 一致：先看父会话缺省，再交回调裁决，
+ * 之后才做防环与查找——「目标是所有者」优先于「已经见过」。
+ */
+export function walkParentLineage(
+  header: GateAgentHeader,
+  lookup: (sessionId: string) => GateAgentHeader | undefined,
+  visit: (ancestorId: string) => boolean,
+  initialSeen?: readonly string[],
+): void {
+  let current: GateAgentHeader | undefined = header
+  const seen = new Set<string>(initialSeen ?? [])
+  for (let depth = 0; depth < LINEAGE_DEPTH_CAP; depth += 1) {
+    const parentId: string | undefined = current?.parentSession
+    if (parentId === undefined) return
+    if (!visit(parentId)) return
+    if (seen.has(parentId)) return
+    seen.add(parentId)
+    current = lookup(parentId)
+    if (current === undefined) return
+  }
+}
+
 /** cwd 原始串 → 规范 key 的备忘上限（每进程活跃工作区远小于此）。 */
 const KEY_MEMO_CAP = 256
 
@@ -161,18 +187,20 @@ export class WorkspaceWriteGate {
 
   /** exec.agent 是否在谱系上（经 parentSession 链）连接到所有者。 */
   private async lineageReaches(agent: GateAgentFace, owner: string): Promise<boolean> {
-    let current: GateAgentFace | undefined = agent
-    const seen = new Set<string>([agent.id])
-    for (let depth = 0; depth < LINEAGE_DEPTH_CAP; depth += 1) {
-      const parentId: string | undefined = current?.session.header.parentSession
-      if (parentId === undefined) return false
-      if (parentId === owner) return true
-      if (seen.has(parentId)) return false
-      seen.add(parentId)
-      current = this.deps.sessions?.get(parentId)
-      if (current === undefined) return false
-    }
-    return false
+    let reaches = false
+    walkParentLineage(
+      agent.session.header,
+      (parentId) => this.deps.sessions?.get(parentId)?.session.header,
+      (parentId) => {
+        if (parentId === owner) {
+          reaches = true
+          return false
+        }
+        return true
+      },
+      [agent.id],
+    )
+    return reaches
   }
 
   private isLive(agentId: string): boolean {

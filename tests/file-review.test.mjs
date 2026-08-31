@@ -419,3 +419,76 @@ test('fs 语义：撤销写回恢复检查点记录的权限位', async () => {
     await rm(workspace, { recursive: true, force: true })
   }
 })
+
+// ── 终端写真 hunk 化：modified 走多 hunk 子集路径，改到空不再误判删除 ────
+
+test('fs 语义：modified 真 hunk 化——多块子集撤销往返不互踩', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-fshunk-'))
+  try {
+    const service = new FileReviewService(new Context(), {})
+    const agent = fsAgent(workspace)
+    const target = join(workspace, 'multi.txt')
+    const original = ['l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'l7', 'l8', 'l9', 'l10', 'l11', 'l12'].join('\n') + '\n'
+    const edited = ['L1', 'L2', 'L3', 'l4', 'l5', 'l6', 'l7', 'l8', 'l9', 'L10', 'L11', 'L12'].join('\n') + '\n'
+    // 磁盘处于「轮末」状态：两处不相邻的终端改动都在。
+    await writeFile(target, edited, 'utf8')
+    const hunks = [
+      diff('multi.txt', 'l1\nl2\nl3\n', 'L1\nL2\nL3\n', 1, 1),
+      diff('multi.txt', 'l10\nl11\nl12\n', 'L10\nL11\nL12\n', 10, 10),
+    ]
+    const full = { files: [{ path: 'multi.txt', diffs: hunks, origin: 'fs' }] }
+
+    assert.equal((await service.status(agent, full)).files[0].state, 'applied')
+
+    // 子集撤销：只提交块 2 → 块 1 的 L1-L3 原样保留。
+    const subset = { files: [{ path: 'multi.txt', diffs: [hunks[1]], origin: 'fs' }] }
+    const undone = await service.apply(agent, { ...subset, action: 'undo' })
+    assert.equal(undone.files[0].state, 'undone')
+    assert.equal(undone.files[0].changed, true)
+    assert.equal(await readFile(target, 'utf8'),
+      ['L1', 'L2', 'L3', 'l4', 'l5', 'l6', 'l7', 'l8', 'l9', 'l10', 'l11', 'l12'].join('\n') + '\n')
+
+    // 同一子集重做 → 回到两块都在的轮末状态。
+    const redone = await service.apply(agent, { ...subset, action: 'redo' })
+    assert.equal(redone.files[0].state, 'applied')
+    assert.equal(await readFile(target, 'utf8'), edited)
+
+    // 全量撤销 → 回到轮起。
+    const all = await service.apply(agent, { ...full, action: 'undo' })
+    assert.equal(all.files[0].state, 'undone')
+    assert.equal(await readFile(target, 'utf8'), original)
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('fsChangeShape 守卫：带锚点的「改到空」hunk 不误判为整文件删除', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-fsempty-'))
+  try {
+    const service = new FileReviewService(new Context(), {})
+    const agent = fsAgent(workspace)
+    const target = join(workspace, 'emptied.txt')
+    // 终端把文件截断为空：文件在场、内容为空 = 「改到空」已生效。
+    await writeFile(target, '', 'utf8')
+    const request = {
+      files: [{ path: 'emptied.txt', diffs: [diff('emptied.txt', 'precious\n', '', 1, 1)], origin: 'fs' }],
+    }
+
+    // 守卫前该形状会被误判为整文件删除（要求文件不在场 → conflict）；
+    // 守卫后走通用 hunk 路径：空内容 = newText 侧在场 → applied。
+    assert.equal((await service.status(agent, request)).files[0].state, 'applied')
+
+    // 撤销 = 经 hunk 路径写回旧内容（不是「文件缺失 → 写回」的删除语义）。
+    const undone = await service.apply(agent, { ...request, action: 'undo' })
+    assert.equal(undone.files[0].state, 'undone')
+    assert.equal(undone.files[0].changed, true)
+    assert.equal(await readFile(target, 'utf8'), 'precious\n')
+
+    // 重做 = 再次截断为空。
+    const redone = await service.apply(agent, { ...request, action: 'redo' })
+    assert.equal(redone.files[0].state, 'applied')
+    assert.equal(await readFile(target, 'utf8'), '')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})

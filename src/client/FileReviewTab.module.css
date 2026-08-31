@@ -291,6 +291,16 @@
   white-space: nowrap;
 }
 
+/* 写盘归因徽标（文件行 / 轮头汇总）：中性信息色，区别于删除徽标的错误色。 */
+.ownerBadge {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-border-l1);
+  white-space: nowrap;
+}
+
 /* 可点击的 +/− 统计（时间线节点、恢复对话框文件行）：点击跳到对应差异。 */
 .statsButton {
   display: inline-flex;

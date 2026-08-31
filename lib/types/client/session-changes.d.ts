@@ -10,8 +10,29 @@
  */
 import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/client';
 import type { ProducedFileDiff, RecordedMutation } from '../file-review/change-types.ts';
+/** 写盘归因关联到的命令执行窗口（闸关归因命令级时附带）。 */
+export interface FsCommandRef {
+    readonly tool: string;
+    readonly callId?: string;
+    readonly sessionId: string;
+    readonly startedAt: number;
+    readonly endedAt: number;
+}
+/** 写盘归因字段（仅闸关时宿主提供；开闸/旧宿主全部缺省）：
+ * 'target' = 本会话，'multi' = 多会话，'unknown' = 不可知，其它 = 会话 id。 */
+export interface FsAttributionFields {
+    readonly owner?: string;
+    /** 归属本会话 → true（默认勾选）；其它/歧义 → false（须显式勾选）。 */
+    readonly autoSelect?: boolean;
+    /** 归因置信层级：命令级 / 歧义 / 外部写入 / 窗口级 / 不可知。 */
+    readonly attribution?: 'command' | 'ambiguous' | 'external' | 'window' | 'unknown';
+    /** 归因到的命令执行窗口（仅 attribution === 'command' 时附带）。 */
+    readonly command?: FsCommandRef;
+    /** 当前内容的写入时间（快照 mtime，ms epoch；旧清单无此字段则缺省）。 */
+    readonly writtenAt?: number;
+}
 /** One changed file inside one turn, hunks appended in settlement order. */
-export interface SessionFileChange {
+export interface SessionFileChange extends FsAttributionFields {
     readonly path: string;
     readonly diffs: readonly ProducedFileDiff[];
     /** Terminal commands deleted this path in this turn (display-only). */

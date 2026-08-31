@@ -4,6 +4,7 @@
  */
 import { ShadowRewindEngine } from './engine.js'
 import { installFileReviewHost } from './file-review/host.ts'
+import { CommandWindowRegistry, installCommandWindowRecorder } from './command-windows.js'
 import { installShadowRewindHttp, TurnCheckpointCoordinator } from './rewind-host.js'
 import type { AgentFace, HostContext } from './rewind-host.js'
 import type { RestorePointSummary, ShadowRewindConfig } from './types.js'
@@ -51,6 +52,8 @@ export class ShadowRewindService {
   private readonly coordinator: TurnCheckpointCoordinator
   /** 写入闸（「以当前为准」）；恒常构造，config.writeGate 只决定初始开关。 */
   readonly writeGate: WorkspaceWriteGate
+  /** 命令窗口注册表（写盘归因）：纯内存，宿主重启后历史窗口丢失。 */
+  readonly commandWindows: CommandWindowRegistry
 
   constructor(ctx: PluginContext, config: ShadowRewindConfig = {}) {
     ctx.provide('shadowRewind', this)
@@ -76,6 +79,11 @@ export class ShadowRewindService {
       allow: config.writeGateAllow,
     })
 
+    // 命令窗口注册表（写盘归因）：与闸同一工作区键语义；纯内存降级见模块注释。
+    this.commandWindows = new CommandWindowRegistry({
+      canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
+    })
+
     // 文件审查半边（dsh-file-review-tab 融合）：Typert `fileReview` 服务 +
     // 最终回复文件引用引导 + Code Mode 录制器；录制记录持久化到本插件存储。
     installFileReviewHost(
@@ -86,19 +94,33 @@ export class ShadowRewindService {
     // 写入闸的拒绝裁决挂在工具瀑布上（关闭时裁决直接放行，监听器常驻）。
     installWriteGateHost(ctx as unknown as Parameters<typeof installWriteGateHost>[0], this.writeGate)
 
+    // 命令窗口录制器挂在 tools/execute（around-dispatch，包住工具体本身）：
+    // 被闸拒绝的调用在 prepare 阶段（tools/pre-execute）终止、从不进入
+    // dispatch，自然不记录（注册表绝不记录未执行的调用）。会话查找面经注入
+    // 闭包惰性读取，与闸的 gateServices 同一机制（注入完成前谱系上溯停在
+    // 最深已声明祖先）。
+    const recorderServices: { sessions?: WriteGateDeps['sessions'] } = {}
+    installCommandWindowRecorder(
+      ctx as unknown as Parameters<typeof installCommandWindowRecorder>[0],
+      this.commandWindows,
+      () => recorderServices.sessions,
+    )
+
     ctx.inject(['agents'], (scope) => {
       gateServices.agents = (scope as unknown as WriteGateDeps).agents
       this.coordinator.install(scope as unknown as HostContext)
       // 所有权登记与快照共用 agent/pre-step 瀑布（step 1 抢占）。
       this.writeGate?.install(scope as unknown as HostContext)
     })
-    // 闸的谱系查找需要 sessions；独立注入，避免把它耦合进快照安装的可用面。
+    // 闸的谱系查找与录制器的顶层会话解析都需要 sessions；独立注入，
+    // 避免把它耦合进快照安装的可用面。
     ctx.inject(['sessions'], (scope) => {
       gateServices.sessions = (scope as unknown as WriteGateDeps).sessions
+      recorderServices.sessions = (scope as unknown as WriteGateDeps).sessions
     })
     ctx.inject(['webServer', 'sessions', 'sessionQuery', 'apiProxy', 'agents'], (scope) => {
       const s = scope as unknown as Parameters<typeof installShadowRewindHttp>[0]
-      installShadowRewindHttp(s, this.engine, this.coordinator, this.writeGate)
+      installShadowRewindHttp(s, this.engine, this.coordinator, this.writeGate, this.commandWindows)
     })
 
     void this.engine.ready.then((reconciled) => {
