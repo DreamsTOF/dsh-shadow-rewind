@@ -378,3 +378,138 @@ if (jjOnPath()) {
 } else {
   test('混沌（模糊）：jj 不可用，跳过影子后端搅拌', () => {})
 }
+
+// ── 轮末检查点（turn/end 捕获）：归属窗口冻结与配对升级 ───────────────────
+
+test('混沌：轮末检查点冻结轮末树——轮结束后的写盘不计入该轮', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'chaos-turnend-'))
+  const { engine, storageDir } = await makeEngine()
+  try {
+    const coordinator = new TurnCheckpointCoordinator(engine)
+    const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
+    const liveSessions = new Map([
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
+    ])
+    const handlers = makeHandlers(liveSessions, engine, coordinator, writeGate)
+
+    // s1 轮 1：轮起 → 轮内写入 → 轮末捕获。
+    await captureTurn(engine, workspace, 's1', 1)
+    await pause()
+    await writeFile(join(workspace, 's1-turn1.txt'), 'T1\n', 'utf8')
+    await pause()
+    const endCp = await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 's1', turn: 1, turnStartSeq: 100, phase: 'end' })
+
+    // 轮末幂等：同一轮同相位重复捕获返回同一检查点。
+    const again = await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 's1', turn: 1, turnStartSeq: 100, phase: 'end' })
+    assert.equal(again.id, endCp.id, '轮末捕获必须幂等')
+
+    // 轮结束后才落盘的文件：不属于轮 1。
+    await pause()
+    await writeFile(join(workspace, 'late.txt'), 'LATE\n', 'utf8')
+
+    // s1 轮 2 正常推进。
+    await captureTurn(engine, workspace, 's1', 2)
+    await pause()
+    await writeFile(join(workspace, 's1-turn2.txt'), 'T2\n', 'utf8')
+    await captureTurn(engine, workspace, 's1', 3)
+
+    const body = await callFsChanges(handlers, 's1')
+    const turn1 = body.turns.find((t) => t.turn === 1 && t.live !== true)
+    assert.ok(turn1, 's1 轮 1 必须有配对条目')
+    assert.equal(turn1.nextCheckpointId, endCp.id, '轮 1 的配对终点必须是轮末检查点')
+    const paths1 = turn1.changes.map((c) => c.path)
+    assert.ok(paths1.includes('s1-turn1.txt'), '轮内写入必须在轮 1')
+    assert.ok(!paths1.includes('late.txt'), '轮结束后的写盘不得计入轮 1')
+
+    const turn2 = body.turns.find((t) => t.turn === 2 && t.live !== true)
+    assert.ok(turn2, 's1 轮 2 必须有配对条目')
+    const paths2 = turn2.changes.map((c) => c.path)
+    assert.ok(paths2.includes('s1-turn2.txt'), '轮 2 写入归属轮 2')
+    assert.ok(!paths2.includes('late.txt'), '轮间间隙的写盘也不得混入轮 2')
+
+    // 轮末检查点可整树恢复：late.txt 被移除，轮内写入保留。
+    await rewindTo(engine, workspace, endCp.id)
+    assert.equal(await readFile(join(workspace, 's1-turn1.txt'), 'utf8'), 'T1\n')
+    await assert.rejects(() => readFile(join(workspace, 'late.txt')), { code: 'ENOENT' }, '恢复轮末必须移除轮后写入')
+    await assertTreeMatches(engine, workspace, endCp.id, '轮末检查点整树收敛')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
+
+test('混沌：协调器经 session/event 的 turn/end 事件捕获轮末检查点', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'chaos-turnend-hook-'))
+  const { engine, storageDir } = await makeEngine()
+  try {
+    const coordinator = new TurnCheckpointCoordinator(engine)
+    const listeners = []
+    const ctx = {
+      logger: { info() {}, warn() {}, error() {} },
+      on: (event, listener) => { listeners.push([event, listener]) },
+    }
+    coordinator.install(ctx)
+    assert.ok(listeners.some(([e]) => e === 'session/event'), 'install 必须订阅 session/event')
+
+    // 轮起检查点（模拟 pre-step 第一步）。
+    await captureTurn(engine, workspace, 'sX', 1)
+    await pause()
+    await writeFile(join(workspace, 'in-turn.txt'), 'X\n', 'utf8')
+
+    // 触发 turn/end 事件（fire-and-forget，等待异步捕获落盘）。
+    const sessionListener = listeners.find(([e]) => e === 'session/event')[1]
+    sessionListener(
+      { id: 'sX', header: { cwd: workspace }, events: [{ type: 'turn/start', seq: 100, data: { turn: 1 } }] },
+      { type: 'turn/end', data: { turn: 1 } },
+    )
+    await pause(80)
+    const points = await engine.listTurnCheckpoints({ cwd: workspace, sessionId: 'sX' })
+    const endCp = points.find((p) => p.phase === 'end')
+    assert.ok(endCp, 'turn/end 事件后必须存在轮末检查点')
+    assert.equal(endCp.turn, 1)
+
+    // 轮末冻结验证：事件后再写盘，恢复到轮末检查点时该文件被移除。
+    await writeFile(join(workspace, 'after-end.txt'), 'Y\n', 'utf8')
+    await rewindTo(engine, workspace, endCp.id)
+    assert.equal(await readFile(join(workspace, 'in-turn.txt'), 'utf8'), 'X\n')
+    await assert.rejects(() => readFile(join(workspace, 'after-end.txt')), { code: 'ENOENT' })
+
+    // turn/start 事件缺失时静默跳过（不抛异常）。
+    sessionListener(
+      { id: 'sY', header: { cwd: workspace }, events: [] },
+      { type: 'turn/end', data: { turn: 9 } },
+    )
+    await pause(20)
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
+
+test('混沌：轮起/轮末淘汰各按相位计窗口，互不挤占', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'chaos-turnend-evict-'))
+  const { engine, storageDir } = await makeEngine({ maxTurnCheckpointsPerSession: 3 })
+  try {
+    // 6 轮 × （轮起 + 轮末）：每相位各留最新 3 个。
+    for (let turn = 1; turn <= 6; turn += 1) {
+      await writeFile(join(workspace, `f${turn}.txt`), `v${turn}\n`, 'utf8')
+      await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 'sE', turn, turnStartSeq: turn * 10 })
+      await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 'sE', turn, turnStartSeq: turn * 10, phase: 'end' })
+    }
+    const points = await engine.listTurnCheckpoints({ cwd: workspace, sessionId: 'sE' })
+    const starts = points.filter((p) => p.phase !== 'end').map((p) => p.turn)
+    const ends = points.filter((p) => p.phase === 'end').map((p) => p.turn)
+    assert.deepEqual(starts, [4, 5, 6], '轮起只保留最新 3 个，轮末不挤占')
+    assert.deepEqual(ends, [4, 5, 6], '轮末只保留最新 3 个，轮起不挤占')
+
+    // 存活的轮末检查点仍可整树精确恢复。
+    const endCp = points.find((p) => p.phase === 'end' && p.turn === 4)
+    await rewindTo(engine, workspace, endCp.id)
+    await assertTreeMatches(engine, workspace, endCp.id, '淘汰后存活的轮末检查点')
+    assert.equal(await readFile(join(workspace, 'f4.txt'), 'utf8'), 'v4\n')
+    await assert.rejects(() => readFile(join(workspace, 'f6.txt')), { code: 'ENOENT' })
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})

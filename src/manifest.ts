@@ -142,12 +142,17 @@ export function parseManifest(value: unknown): Manifest {
   const turn = optionalNonNegativeInteger(record, 'turn')
   const turnStartSeq = optionalNonNegativeInteger(record, 'turnStartSeq')
   const turnEndSeq = optionalNonNegativeInteger(record, 'turnEndSeq')
+  const phase = record.phase
+  if (phase !== undefined && phase !== 'start' && phase !== 'end') corrupt(`非法的 phase ${JSON.stringify(phase)}`)
   if (restoreKind === 'turn') {
     if (sessionId === undefined || turn === undefined || turnStartSeq === undefined) {
       corrupt('turn 恢复点必须携带 sessionId、turn 与 turnStartSeq')
     }
-  } else if (turn !== undefined || turnStartSeq !== undefined || turnEndSeq !== undefined) {
-    corrupt('只有 turn 恢复点可以携带回合元数据')
+  } else {
+    if (turn !== undefined || turnStartSeq !== undefined || turnEndSeq !== undefined) {
+      corrupt('只有 turn 恢复点可以携带回合元数据')
+    }
+    if (phase !== undefined) corrupt('只有 turn 恢复点可以携带 phase')
   }
   const lastRestoredAt = optionalNonNegativeInteger(record, 'lastRestoredAt')
   return {
@@ -162,6 +167,7 @@ export function parseManifest(value: unknown): Manifest {
     ...(parentRestorePoint === undefined ? {} : { parentRestorePoint }),
     ...(turn === undefined ? {} : { turn }),
     ...(turnStartSeq === undefined ? {} : { turnStartSeq }),
+    ...(phase === undefined ? {} : { phase }),
     ...(turnEndSeq === undefined ? {} : { turnEndSeq }),
     createdAt,
     treeHash,

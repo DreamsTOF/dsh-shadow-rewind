@@ -75,6 +75,9 @@ export interface Manifest {
     readonly turn?: number;
     /** 回合开始事件的 seq；快照在该回合第一步之前捕获（turn 专用）。 */
     readonly turnStartSeq?: number;
+    /** 轮内相位（turn 专用）：'start' = 轮起捕获（缺省/旧数据），'end' = 轮末
+     * （turn/end 事件）捕获——轮末快照冻结轮末树状态，归属不再依赖下一轮轮起。 */
+    readonly phase?: 'start' | 'end';
     /** 旧式回合边界 seq（保留字段，当前不写入）。 */
     readonly turnEndSeq?: number;
     readonly createdAt: number;
@@ -112,6 +115,7 @@ export interface RestorePointSummary {
     readonly label?: string;
     readonly turn?: number;
     readonly turnStartSeq?: number;
+    readonly phase?: 'start' | 'end';
     readonly createdAt: number;
     readonly treeHash: string;
     readonly fileCount: number;

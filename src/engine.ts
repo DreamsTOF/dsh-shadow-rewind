@@ -344,14 +344,17 @@ export class ShadowRewindEngine {
     }
   }
 
-  /** 捕获回合检查点（turn）；重复请求同一回合时幂等返回已有检查点。 */
+  /** 捕获回合检查点（turn）；重复请求同一回合同一相位时幂等返回已有检查点。
+   * phase 'start'（缺省）= 轮第一步之前；'end' = turn/end 事件时的轮末快照。 */
   async createTurnCheckpoint(options: {
     readonly cwd: string
     readonly sessionId: string
     readonly turn: number
     readonly turnStartSeq: number
+    readonly phase?: 'start' | 'end'
     readonly signal?: AbortSignal
   }): Promise<RestorePointSummary> {
+    const phase = options.phase ?? 'start'
     const deadline = createDeadline(this.config.turnCheckpointTimeoutMs)
     const signal = options.signal === undefined ? deadline.signal : AbortSignal.any([options.signal, deadline.signal])
     try {
@@ -370,7 +373,8 @@ export class ShadowRewindEngine {
         const duplicate = existing.find((manifest) => manifest.kind === 'turn'
           && manifest.sessionId === options.sessionId
           && manifest.turn === options.turn
-          && manifest.turnStartSeq === options.turnStartSeq)
+          && manifest.turnStartSeq === options.turnStartSeq
+          && (manifest.phase ?? 'start') === phase)
         if (duplicate !== undefined) {
           await this.store.deleteTurnSkip(workspace, options.sessionId, options.turn, options.turnStartSeq).catch(() => undefined)
           return summarize(duplicate)
@@ -380,15 +384,17 @@ export class ShadowRewindEngine {
           sessionId: options.sessionId,
           turn: options.turn,
           turnStartSeq: options.turnStartSeq,
-          label: `turn ${String(options.turn)} 检查点`,
+          phase,
+          label: `turn ${String(options.turn)} ${phase === 'end' ? '轮末' : '轮起'}检查点`,
           signal,
         })
         await this.store.deleteTurnSkip(workspace, options.sessionId, options.turn, options.turnStartSeq).catch(() => undefined)
-        // 修剪：每会话只保留最新的 N 个 turn 检查点。
+        // 修剪：每会话每相位各保留最新的 N 个 turn 检查点（轮起与轮末互不挤占）。
         // jj 后端的影子 change 不随之删除——change id 是内容历史的地址，
         // 保留无害，删除反而需要额外的 abandon 流程；自用存储换简单性。
         const sameSession = [...existing, manifest]
-          .filter((point) => point.kind === 'turn' && point.sessionId === options.sessionId)
+          .filter((point) => point.kind === 'turn' && point.sessionId === options.sessionId
+            && (point.phase ?? 'start') === phase)
           .sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id))
         for (const stale of sameSession.slice(this.config.maxTurnCheckpointsPerSession)) {
           if (signal.aborted) break
@@ -406,7 +412,7 @@ export class ShadowRewindEngine {
     }
   }
 
-  /** 查找一个回合的检查点（可选校验 turnStartSeq）。 */
+  /** 查找一个回合的轮起检查点（可选校验 turnStartSeq；轮末相位不参与恢复点查找）。 */
   async findTurnCheckpoint(options: {
     readonly cwd: string
     readonly sessionId: string
@@ -417,6 +423,7 @@ export class ShadowRewindEngine {
     const workspace = await canonicalDirectory(options.cwd)
     const manifests = await this.store.listManifests(workspace)
     const found = manifests.find((manifest) => manifest.kind === 'turn'
+      && manifest.phase !== 'end'
       && manifest.sessionId === options.sessionId
       && manifest.turn === options.turn
       && (options.turnStartSeq === undefined || manifest.turnStartSeq === options.turnStartSeq))
@@ -453,7 +460,7 @@ export class ShadowRewindEngine {
     return this.store.readTurnSkip(workspace, options.sessionId, options.turn, options.turnStartSeq)
   }
 
-  /** 列出某会话的所有 turn 检查点（按 turn 升序）。 */
+  /** 列出某会话的所有 turn 检查点（轮起+轮末，按 turn 升序；摘要带 phase）。 */
   async listTurnCheckpoints(options: {
     readonly cwd: string
     readonly sessionId: string
@@ -526,13 +533,14 @@ export class ShadowRewindEngine {
       readonly parentRestorePoint?: string
       readonly turn?: number
       readonly turnStartSeq?: number
+      readonly phase?: 'start' | 'end'
       readonly signal?: AbortSignal
     },
   ): Promise<Manifest> {
     const tree = await this.captureTree(workspace, {
       mode: 'persist',
       message: options.kind === 'turn'
-        ? `turn ${String(options.turn)} checkpoint (session ${options.sessionId ?? '?'})`
+        ? `turn ${String(options.turn)} ${options.phase === 'end' ? 'end' : 'start'} checkpoint (session ${options.sessionId ?? '?'})`
         : options.kind === 'rescue'
           ? `rescue before restoring ${options.parentRestorePoint ?? '?'}`
           : options.label ?? 'user restore point',
@@ -550,6 +558,7 @@ export class ShadowRewindEngine {
       ...(options.parentRestorePoint === undefined ? {} : { parentRestorePoint: options.parentRestorePoint }),
       ...(options.turn === undefined ? {} : { turn: options.turn }),
       ...(options.turnStartSeq === undefined ? {} : { turnStartSeq: options.turnStartSeq }),
+      ...(options.phase === undefined ? {} : { phase: options.phase }),
       createdAt: Date.now(),
       treeHash: tree.treeHash,
       fileCount: tree.fileCount,
@@ -1094,6 +1103,7 @@ function summarize(manifest: Manifest): RestorePointSummary {
     ...(manifest.label === undefined ? {} : { label: manifest.label }),
     ...(manifest.turn === undefined ? {} : { turn: manifest.turn }),
     ...(manifest.turnStartSeq === undefined ? {} : { turnStartSeq: manifest.turnStartSeq }),
+    ...(manifest.phase === undefined ? {} : { phase: manifest.phase }),
     createdAt: manifest.createdAt,
     treeHash: manifest.treeHash,
     fileCount: manifest.fileCount,

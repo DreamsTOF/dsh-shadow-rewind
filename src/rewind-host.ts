@@ -31,6 +31,17 @@ const MAX_CHANGE_PAGE_SIZE = 200
 export interface HostContext {
   readonly logger: { info(message: string): void; warn(message: string): void; error(message: string): void }
   on(event: 'agent/pre-step', listener: (data: PreStepData, next: () => Promise<unknown>, options?: { prepend?: boolean }) => Promise<unknown>, options?: { prepend?: boolean }): void
+  on(event: 'session/event', listener: (session: SessionFace, event: SessionEventFace) => void): void
+}
+
+/** session/event 载荷里的会话面（与 AgentFace.session 同形）。 */
+export type SessionFace = AgentFace['session']
+
+/** session/event 载荷里的事件面：只用到 type 与 data.turn。 */
+export interface SessionEventFace {
+  readonly type: string
+  readonly seq?: number
+  readonly data?: { readonly turn?: number }
 }
 
 export interface PreStepData {
@@ -66,6 +77,8 @@ export class TurnCheckpointCoordinator {
   private readonly pending = new Set<string>()
   private readonly failures = new Map<string, string>()
   private readonly skips = new Map<string, string>()
+  /** sessionId\0turn → 轮末捕获进行中（同回合同相位不重复发起）。 */
+  private readonly endCaptures = new Set<string>()
   /** workspace → 串行化尾队列：同一工作区的快照绝不并发。 */
   private readonly workspaceTails = new Map<string, Promise<void>>()
 
@@ -77,12 +90,56 @@ export class TurnCheckpointCoordinator {
     }
   }
 
-  /** 安装第一步闸门（prepend 保证先于其它监听器）。 */
+  /** 安装第一步闸门（prepend 保证先于其它监听器）与轮末捕获订阅。 */
   install(ctx: HostContext): void {
     ctx.on('agent/pre-step', async (data, next) => {
       if (data.step === 1) await this.capture(ctx, data.agent, data.turn, data.signal)
       return next()
     }, { prepend: true })
+    // 轮末检查点：turn/end 事件时冻结轮末树状态。尽力而为——失败仅退化为
+    // 「下一轮轮起」配对（旧语义），绝不阻塞会话，也不进轮起捕获的状态面。
+    ctx.on('session/event', (session, event) => {
+      if (event.type !== 'turn/end') return
+      void this.captureEnd(ctx, session, event)
+    })
+  }
+
+  /** 轮末捕获（见 install 注释）：与轮起捕获共用工作区串行化尾队列。 */
+  async captureEnd(ctx: HostContext, session: SessionFace, event: SessionEventFace): Promise<void> {
+    if (this.engine.turnCheckpointsDisabled) return
+    const turn = event.data?.turn
+    const cwd = session.header.cwd
+    if (typeof turn !== 'number' || !Number.isSafeInteger(turn) || turn < 0) return
+    if (cwd === undefined || cwd.trim() === '') return
+    const key = checkpointKey(session.id, turn)
+    if (this.endCaptures.has(key)) return
+    const start = findLast(session.events, (e) => e.type === 'turn/start' && e.data.turn === turn)
+    if (start === undefined) {
+      ctx.logger.warn(`[shadow-rewind] 回合 ${String(turn)} 轮末检查点跳过：找不到 turn/start 事件`)
+      return
+    }
+    this.endCaptures.add(key)
+    const timeoutMs = this.engine.config.turnCheckpointTimeoutMs
+    const deadline = createDeadline(timeoutMs)
+    try {
+      await this.serializeWorkspace(cwd, deadline.signal, async () => {
+        await this.engine.createTurnCheckpoint({
+          cwd,
+          sessionId: session.id,
+          turn,
+          turnStartSeq: start.seq,
+          phase: 'end',
+          signal: deadline.signal,
+        })
+        void bumpWorkspaceRevision(cwd)
+      })
+    } catch (error) {
+      const bounded = asCheckpointError(error, timeoutMs, deadline.signal.aborted)
+      ctx.logger.warn(`[shadow-rewind] 回合 ${String(turn)} 轮末检查点失败（归属退化为下一轮轮起配对）：${errorMessage(bounded)}`)
+    } finally {
+      deadline.cancel()
+      this.endCaptures.delete(key)
+    }
   }
 
   /** 无持久检查点时，向 UI 报告当前回合的捕获状态。 */
@@ -426,15 +483,21 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
             cwd: checkpoint.cwd,
             sessionId: sessionIdForLookup,
           })
-          const currentIndex = allCheckpoints.findIndex((cp) => cp.id === checkpoint.id)
-          const nextCheckpoint = currentIndex >= 0 ? allCheckpoints[currentIndex + 1] : undefined
-          if (nextCheckpoint !== undefined) {
-            nextCheckpointId = nextCheckpoint.id
+          // 优先同轮轮末检查点（精确轮末树），回退下一轮轮起（旧语义）。
+          const startCheckpoints = allCheckpoints.filter((cp) => cp.phase !== 'end')
+          const endCheckpoint = checkpoint.turn === undefined
+            ? undefined
+            : allCheckpoints.find((cp) => cp.phase === 'end' && cp.turn === checkpoint.turn)
+          const currentIndex = startCheckpoints.findIndex((cp) => cp.id === checkpoint.id)
+          const nextCheckpoint = currentIndex >= 0 ? startCheckpoints[currentIndex + 1] : undefined
+          const pairEnd = endCheckpoint ?? nextCheckpoint
+          if (pairEnd !== undefined) {
+            nextCheckpointId = pairEnd.id
             try {
               const fsDiff = await engine.diffCheckpoints({
                 cwd: checkpoint.cwd,
                 prevCheckpointId: checkpoint.id,
-                currCheckpointId: nextCheckpoint.id,
+                currCheckpointId: pairEnd.id,
               })
               // 保留 added/modified/deleted/mode-changed（后者映射为 modified，
               // 内容两侧相同）；type-changed 仍过滤。
@@ -1175,6 +1238,14 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
       return
     }
     const checkpoints = await engine.listTurnCheckpoints({ cwd, sessionId })
+    // 相位分离：轮起检查点按轮序配对；轮末检查点（turn/end 捕获）优先作为
+    // 本轮的归属终点——它精确冻结轮末树状态，轮结束后的写盘不再混入本轮。
+    // 无轮末快照的轮（旧数据/捕获失败）回退「下一轮轮起」配对（旧语义）。
+    const starts = checkpoints.filter((point) => point.phase !== 'end')
+    const endByTurn = new Map<number, (typeof checkpoints)[number]>()
+    for (const point of checkpoints) {
+      if (point.phase === 'end' && point.turn !== undefined) endByTurn.set(point.turn, point)
+    }
     const turns: {
       turn: number
       turnStartSeq: number
@@ -1185,24 +1256,26 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
     }[] = []
     // 整个请求共享一份行数统计预算：预算耗尽后剩余变更只回 path/kind。
     const countBudget = { remaining: DIFF_COUNT_BUDGET }
-    for (let index = 0; index < checkpoints.length - 1; index += 1) {
-      const current = checkpoints[index]
-      const next = checkpoints[index + 1]
-      if (current === undefined || next === undefined) continue
+    for (let index = 0; index < starts.length; index += 1) {
+      const current = starts[index]
+      if (current === undefined) continue
+      const next = starts[index + 1]
+      const pairEnd = (current.turn !== undefined ? endByTurn.get(current.turn) : undefined) ?? next
+      if (pairEnd === undefined) continue
       try {
         const fsDiff = await engine.diffCheckpoints({
           cwd,
           prevCheckpointId: current.id,
-          currCheckpointId: next.id,
+          currCheckpointId: pairEnd.id,
         })
         const raw = fsDiff.changes.filter((change) =>
           (change.kind === 'added' || change.kind === 'modified'
             || change.kind === 'deleted' || change.kind === 'mode-changed')
           // 空目录的纯权限位变化没有可撤销语义，直接省略。
           && !(change.kind === 'mode-changed' && change.before?.kind === 'dir'))
-        // 轮间窗口归属过滤：窗口 (current, next] 落盘者未必是本会话（其它会话
-        // 的检查点窗口会插进来）。用窗口内的快照做归属，剔除非本会话独有的
-        // 路径——与 live-tail 同一规则，防止卡片撤销动到别的会话的写入。
+        // 窗口 (current, pairEnd] 落盘者未必是本会话（其它会话的检查点窗口会
+        // 插进来）。用窗口内的快照做归属，剔除非本会话独有的路径——与
+        // live-tail 同一规则，防止卡片撤销动到别的会话的写入。
         // 归属失败保守保留全部路径（宿主 CAS 仍兜底防误删）。
         let kept = raw
         if (raw.length > 0) {
@@ -1212,7 +1285,7 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
               restorePointId: current.id,
               paths: raw.map((change) => change.path),
             })
-            const within = attributed.snapshots.filter((snapshot) => snapshot.createdAt < next.createdAt)
+            const within = attributed.snapshots.filter((snapshot) => snapshot.createdAt < pairEnd.createdAt)
             const ownership = attributePaths({
               targetSessionId: attributed.targetSessionId,
               changes: raw,
@@ -1227,12 +1300,12 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
           }
         }
         if (kept.length > 0 && current.turn !== undefined && current.turnStartSeq !== undefined) {
-          const changes = await Promise.all(kept.map((change) => withLineCounts(engine, cwd, change, current.id, next.id, countBudget)))
+          const changes = await Promise.all(kept.map((change) => withLineCounts(engine, cwd, change, current.id, pairEnd.id, countBudget)))
           turns.push({
             turn: current.turn,
             turnStartSeq: current.turnStartSeq,
             checkpointId: current.id,
-            nextCheckpointId: next.id,
+            nextCheckpointId: pairEnd.id,
             changes,
           })
         }
@@ -1241,10 +1314,12 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
         deps.logger.warn(`[shadow-rewind] 轮 ${String(current.turn ?? '?')} 文件系统差异计算失败：${errorMessage(error)}`)
       }
     }
-    // live-tail：最后一个检查点 vs 当前磁盘——覆盖最新一轮（尚无下一轮检查点）
-    // 的终端写盘。after 内容经 /shadow-rewind/file?checkpointId=live 读当前磁盘。
-    const last = checkpoints[checkpoints.length - 1]
-    if (last !== undefined && last.turn !== undefined && last.turnStartSeq !== undefined) {
+    // live-tail：最新轮起检查点 vs 当前磁盘——只覆盖尚无轮末快照的最新一轮
+    // （进行中的回合，或轮末捕获失败/旧数据的回退）。已有轮末快照的轮不需要
+    // live 条目——否则轮结束后的外部写盘会被误挂到该轮头上。
+    const last = starts[starts.length - 1]
+    if (last !== undefined && last.turn !== undefined && last.turnStartSeq !== undefined
+      && !endByTurn.has(last.turn)) {
       try {
         const live = await engine.inspect({ cwd, restorePointId: last.id })
         // live-tail 归属过滤：最后检查点之后磁盘上的变化未必是本会话写的

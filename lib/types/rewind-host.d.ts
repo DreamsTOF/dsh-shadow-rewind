@@ -15,6 +15,17 @@ export interface HostContext {
     }) => Promise<unknown>, options?: {
         prepend?: boolean;
     }): void;
+    on(event: 'session/event', listener: (session: SessionFace, event: SessionEventFace) => void): void;
+}
+/** session/event 载荷里的会话面（与 AgentFace.session 同形）。 */
+export type SessionFace = AgentFace['session'];
+/** session/event 载荷里的事件面：只用到 type 与 data.turn。 */
+export interface SessionEventFace {
+    readonly type: string;
+    readonly seq?: number;
+    readonly data?: {
+        readonly turn?: number;
+    };
 }
 export interface PreStepData {
     readonly agent: AgentFace;
@@ -49,11 +60,15 @@ export declare class TurnCheckpointCoordinator {
     private readonly pending;
     private readonly failures;
     private readonly skips;
+    /** sessionId\0turn → 轮末捕获进行中（同回合同相位不重复发起）。 */
+    private readonly endCaptures;
     /** workspace → 串行化尾队列：同一工作区的快照绝不并发。 */
     private readonly workspaceTails;
     constructor(engine: ShadowRewindEngine);
-    /** 安装第一步闸门（prepend 保证先于其它监听器）。 */
+    /** 安装第一步闸门（prepend 保证先于其它监听器）与轮末捕获订阅。 */
     install(ctx: HostContext): void;
+    /** 轮末捕获（见 install 注释）：与轮起捕获共用工作区串行化尾队列。 */
+    captureEnd(ctx: HostContext, session: SessionFace, event: SessionEventFace): Promise<void>;
     /** 无持久检查点时，向 UI 报告当前回合的捕获状态。 */
     state(sessionId: string, turn: number): {
         status: 'pending' | 'skipped' | 'failed' | 'missing';

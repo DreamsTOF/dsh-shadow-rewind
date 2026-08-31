@@ -50,15 +50,17 @@ export declare class ShadowRewindEngine {
         readonly parentRestorePoint?: string;
         readonly signal?: AbortSignal;
     }): Promise<RestorePointSummary>;
-    /** 捕获回合检查点（turn）；重复请求同一回合时幂等返回已有检查点。 */
+    /** 捕获回合检查点（turn）；重复请求同一回合同一相位时幂等返回已有检查点。
+     * phase 'start'（缺省）= 轮第一步之前；'end' = turn/end 事件时的轮末快照。 */
     createTurnCheckpoint(options: {
         readonly cwd: string;
         readonly sessionId: string;
         readonly turn: number;
         readonly turnStartSeq: number;
+        readonly phase?: 'start' | 'end';
         readonly signal?: AbortSignal;
     }): Promise<RestorePointSummary>;
-    /** 查找一个回合的检查点（可选校验 turnStartSeq）。 */
+    /** 查找一个回合的轮起检查点（可选校验 turnStartSeq；轮末相位不参与恢复点查找）。 */
     findTurnCheckpoint(options: {
         readonly cwd: string;
         readonly sessionId: string;
@@ -82,7 +84,7 @@ export declare class ShadowRewindEngine {
     }): Promise<{
         reason: string;
     } | undefined>;
-    /** 列出某会话的所有 turn 检查点（按 turn 升序）。 */
+    /** 列出某会话的所有 turn 检查点（轮起+轮末，按 turn 升序；摘要带 phase）。 */
     listTurnCheckpoints(options: {
         readonly cwd: string;
         readonly sessionId: string;
