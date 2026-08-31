@@ -26,13 +26,16 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     }
 }
 /**
- * Required services: the sidebar registry, session snapshots, locale, remote,
- * and the slot registry (turn-tail chain). The conversation Definition
- * registry is deliberately NOT a static inject: its service name moved across
- * dsh releases (<= 0.1.1: root `conversationEvents`; 0.1.2-alpha.1+:
- * `uiConversation.events`), so a hard inject on either name leaves the whole
- * plugin forever "pending" on the other version and fails web boot (issue
- * #6). It is resolved dynamically in apply() instead.
+ * Required services: session snapshots, locale, remote, and the slot registry
+ * (turn-tail chain). Two more services are deliberately NOT static injects and
+ * are resolved dynamically in apply() instead: the conversation Definition
+ * registry's service name moved across dsh releases (<= 0.1.1: root
+ * `conversationEvents`; 0.1.2-alpha.1+: `uiConversation.events`), so a hard
+ * inject on either name leaves the whole plugin forever "pending" on the
+ * other version and fails web boot (issue #6); and `betterSidebar` is only
+ * provided by the OPTIONAL dsh-better-sidebar plugin — a hard inject would
+ * keep this plugin pending forever on a host without it, while the
+ * rewind/live-bar/turn-tail surfaces all work standalone.
  */
 export declare const fileReviewInject: string[];
 /**

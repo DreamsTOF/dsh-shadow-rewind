@@ -22,11 +22,10 @@ import type {} from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type {} from 'dsh-better-sidebar/client/service'
 import type { ConversationSnapshot, ISessions, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
 import type { ChatFileMentions } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { TabDescriptor } from 'dsh-better-sidebar/client/service'
+import type { BetterSidebarService, TabDescriptor } from 'dsh-better-sidebar/client/service'
 import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { FileReviewRequest, FileReviewResult, ProducedFileReview } from '../file-review/change-types.ts'
 import { TYPERT_REMOTE } from '../file-review/remote.ts'
@@ -68,16 +67,18 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 }
 
 /**
- * Required services: the sidebar registry, session snapshots, locale, remote,
- * and the slot registry (turn-tail chain). The conversation Definition
- * registry is deliberately NOT a static inject: its service name moved across
- * dsh releases (<= 0.1.1: root `conversationEvents`; 0.1.2-alpha.1+:
- * `uiConversation.events`), so a hard inject on either name leaves the whole
- * plugin forever "pending" on the other version and fails web boot (issue
- * #6). It is resolved dynamically in apply() instead.
+ * Required services: session snapshots, locale, remote, and the slot registry
+ * (turn-tail chain). Two more services are deliberately NOT static injects and
+ * are resolved dynamically in apply() instead: the conversation Definition
+ * registry's service name moved across dsh releases (<= 0.1.1: root
+ * `conversationEvents`; 0.1.2-alpha.1+: `uiConversation.events`), so a hard
+ * inject on either name leaves the whole plugin forever "pending" on the
+ * other version and fails web boot (issue #6); and `betterSidebar` is only
+ * provided by the OPTIONAL dsh-better-sidebar plugin — a hard inject would
+ * keep this plugin pending forever on a host without it, while the
+ * rewind/live-bar/turn-tail surfaces all work standalone.
  */
 export const fileReviewInject = [
-  'betterSidebar',
   'sessions',
   'locale',
   'remote',
@@ -175,6 +176,25 @@ function resolveConversationEvents(ctx: Context): ConversationDefinitionRegistry
   const conversationEvents = lookup('conversationEvents') as ConversationDefinitionRegistry | undefined
   if (conversationEvents !== undefined && conversationEvents !== null) return conversationEvents
   return undefined
+}
+
+/**
+ * Resolve the better-sidebar registry without statically injecting it:
+ * `betterSidebar` is published only by the OPTIONAL dsh-better-sidebar
+ * plugin, and this plugin must boot without it (rewind / live bar /
+ * turn-tail row all stand alone). Returns undefined when that plugin is
+ * absent — every caller degrades instead of blocking.
+ */
+function resolveBetterSidebar(ctx: Context): BetterSidebarService | undefined {
+  const lookup = (name: string): unknown => {
+    // Same escape hatch as resolveConversationEvents above.
+    const anyCtx = ctx as unknown as { get?: (name: string) => unknown }
+    if (typeof anyCtx.get === 'function') return anyCtx.get(name)
+    return ctx.reflect.get(name)
+  }
+  const sidebar = lookup('betterSidebar') as BetterSidebarService | undefined
+  if (sidebar === undefined || sidebar === null) return undefined
+  return sidebar
 }
 
 /**
@@ -285,7 +305,7 @@ export function applyFileReview(ctx: Context): void {
           // (type-only opens leave collapsed panels alone). The tab itself
           // never reads tab.path.
           openInSidebarTab: (paths: readonly string[], turn?: number) => {
-            const sidebar = ctx.betterSidebar
+            const sidebar = resolveBetterSidebar(ctx)
             const first = paths[0]
             if (sidebar === undefined || first === undefined) return
             // `turn` anchors the deep link to one turn: the tab expands only
@@ -309,7 +329,7 @@ export function applyFileReview(ctx: Context): void {
   // inject face, so the sessions handle (for cwd lookup) is bound once here.
   bindLiveBarSessions((ctx as unknown as { readonly sessions: ISessions }).sessions)
   bindLiveBarOpenSidebar((sessionId, paths, turn) => {
-    const sidebar = ctx.betterSidebar
+    const sidebar = resolveBetterSidebar(ctx)
     const first = paths[0]
     if (sidebar === undefined || first === undefined) return
     const sessions = (ctx as unknown as { readonly sessions: ISessions }).sessions
@@ -350,21 +370,35 @@ export function applyFileReview(ctx: Context): void {
     return ctx.provide('chatFileMentions', mentions)
   }, 'shadow-rewind: chat file mentions')
 
-  ctx.effect(() => ctx.betterSidebar.registerTab({
-    id: 'file-review',
-    title: () => t('tabTitle'),
-    icon: (size: number) => <FileReviewIcon size={size} />,
-    order: 35,
-    single: true,
-    badge: (badgeCtx, scope) => badgeCount(badgeCtx as unknown as Context, scope.sessionId),
-    component: ({ ctx: tabCtx, scope, visible, tab }) => (
-      <FileReviewTab
-        ctx={tabCtx as unknown as Context}
-        sessionId={scope.sessionId}
-        cwd={scope.cwd}
-        visible={visible}
-        tab={tab}
-      />
-    ),
-  } satisfies TabDescriptor), 'shadow-rewind: register tab')
+  // The sidebar tab exists only when the OPTIONAL dsh-better-sidebar plugin
+  // is installed: register against whichever service instance shows up (see
+  // resolveBetterSidebar), re-register when it is (re-)provided later, and
+  // skip entirely on a host without it — every other surface keeps working.
+  let tabRegisteredOn: BetterSidebarService | undefined
+  const registerSidebarTab = (): void => {
+    const sidebar = resolveBetterSidebar(ctx)
+    if (sidebar === undefined || sidebar === tabRegisteredOn) return
+    tabRegisteredOn = sidebar
+    ctx.effect(() => sidebar.registerTab({
+      id: 'file-review',
+      title: () => t('tabTitle'),
+      icon: (size: number) => <FileReviewIcon size={size} />,
+      order: 35,
+      single: true,
+      badge: (badgeCtx, scope) => badgeCount(badgeCtx as unknown as Context, scope.sessionId),
+      component: ({ ctx: tabCtx, scope, visible, tab }) => (
+        <FileReviewTab
+          ctx={tabCtx as unknown as Context}
+          sessionId={scope.sessionId}
+          cwd={scope.cwd}
+          visible={visible}
+          tab={tab}
+        />
+      ),
+    } satisfies TabDescriptor), 'shadow-rewind: register tab')
+  }
+  registerSidebarTab()
+  ctx.on('internal/service', (name: string) => {
+    if (name === 'betterSidebar') registerSidebarTab()
+  })
 }

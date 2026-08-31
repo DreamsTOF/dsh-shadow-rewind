@@ -16,12 +16,14 @@ import { applyFileReview } from './file-review.tsx'
 import { rewindApply } from './rewind.ts'
 
 /**
- * 两个子面的 inject 并集：betterSidebar（侧边栏 tab）、sessions（会话快照）、
- * locale（词典）、remote（Typert）、slots（轮尾链与 header actions）、
- * conversation（草稿注入，用于「恢复并继续」打开新会话）。
+ * 两个子面的 inject 并集：sessions（会话快照）、locale（词典）、remote
+ * （Typert）、slots（轮尾链与 header actions）、conversation（草稿注入，
+ * 用于「恢复并继续」打开新会话）。betterSidebar 不在其中：它只由可选的
+ * dsh-better-sidebar 插件提供，静态声明会让整个插件在未安装该插件的宿主
+ * 上永远 pending——改在 applyFileReview 里动态解析（缺失仅降级掉侧边栏
+ * tab 面，其余全部可用）。
  */
 export const inject = [
-  'betterSidebar',
   'sessions',
   'locale',
   'remote',
