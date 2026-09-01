@@ -160,6 +160,15 @@ HTTP 端点均为同源、仅接受回环请求：
 - 跨机共享存储未设计（锁判活按单机 pid）；
 - Code Mode 录制按结果形状 `{path, before, after}` 识别嵌套修改，返回该形状的非文件工具会被误录。
 
+## 致谢
+
+本插件的功能设计借鉴了两个优秀的同类插件：
+
+- [**dsh-file-review-tab**](https://github.com/Lzh3070/dsh-file-review-tab)（Lzh3070）——「聊天轮尾审查卡片 + 侧边栏文件审查」的产品形态，以及 Code Mode（`run_code`）文件修改录制并回放为 diff 的思路；本插件在此基础上补齐了 hunk 级撤销 / 重做与终端写盘审计。
+- [**dsh-turn-rewind**](https://github.com/Anionex/dsh-turn-rewind)（Anionex）——「按消息锚定恢复工作区、恢复后可从该请求重新出发」的会话回退语义；本插件改用影子 `jj` 仓库实现整树快照，并以检查点窗口归属扩展出终端写盘审计。
+
+感谢原作者们的开源分享。
+
 ## License
 
 MIT
