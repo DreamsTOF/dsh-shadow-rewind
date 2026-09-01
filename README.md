@@ -1,4 +1,40 @@
-# dsh-shadow-rewind
+<p align="center">
+  <img src="assets/logo.svg" alt="dsh-shadow-rewind" width="180">
+</p>
+
+<h1 align="center">dsh-shadow-rewind</h1>
+
+<p align="center">
+  <strong>DeepSeek Harness 的会话级文件快照与回退插件。<br>
+  每一轮自动影子快照 —— diff 审查、块级撤销、终端写盘审计、整树恢复。</strong>
+</p>
+
+<p align="center">
+  <a href="#功能全景">功能全景</a> •
+  <a href="#安装">安装</a> •
+  <a href="#配置cordispatchyml">配置</a> •
+  <a href="#测试">测试</a> •
+  <a href="#边界当前版本">已知边界</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/DreamsTOF/dsh-shadow-rewind/releases"><img src="https://img.shields.io/badge/version-0.9.2-blue.svg" alt="Version"></a>
+  <a href="https://github.com/DreamsTOF/dsh-shadow-rewind/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License"></a>
+  <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DeepSeek_Harness-Plugin-blueviolet.svg" alt="DeepSeek Harness Plugin"></a>
+  <a href="https://www.npmjs.com/package/dsh-shadow-rewind"><img src="https://img.shields.io/npm/v/dsh-shadow-rewind" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/dsh-shadow-rewind"><img src="https://img.shields.io/npm/dm/dsh-shadow-rewind" alt="npm downloads"></a>
+  <a href="https://github.com/DreamsTOF/dsh-shadow-rewind/stargazers"><img src="https://img.shields.io/github/stars/DreamsTOF/dsh-shadow-rewind?style=social" alt="GitHub Stars"></a>
+</p>
+
+<p align="center">
+  <b>⭐ GitHub 仓库：<a href="https://github.com/DreamsTOF/dsh-shadow-rewind">DreamsTOF/dsh-shadow-rewind</a></b> —— 觉得有用就点个 Star；问题与需求请提 <a href="https://github.com/DreamsTOF/dsh-shadow-rewind/issues">Issue</a>
+</p>
+
+<p align="center">
+  <img src="assets/banner.svg" alt="every turn → shadow snapshot → diff · review · restore" width="900">
+</p>
+
+---
 
 针对 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的**会话级文件快照与回退 + AI 改动文件审查 + 终端写盘审计**插件。
 
