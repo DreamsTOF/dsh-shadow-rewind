@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="120" viewBox="0 0 900 120" role="img" aria-label="every turn → shadow snapshot → diff · review · restore">
+  <rect width="900" height="120" rx="16" fill="#0d1117"/>
+  <rect x="1" y="1" width="898" height="118" rx="15" fill="none" stroke="#30363d" stroke-width="2"/>
+  <text x="450" y="52" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" font-size="26" fill="#e6edf3">every turn → shadow snapshot → diff · review · restore</text>
+  <text x="450" y="90" text-anchor="middle" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" font-size="17" fill="#8b949e">write · edit · terminal · external — all visible, all reversible</text>
+  <circle cx="120" cy="46" r="5" fill="#0ea5e9"/>
+  <circle cx="780" cy="46" r="5" fill="#7C3AED"/>
+</svg>

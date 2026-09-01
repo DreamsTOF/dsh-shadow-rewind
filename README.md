@@ -163,3 +163,15 @@ HTTP 端点均为同源、仅接受回环请求：
 ## License
 
 MIT
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=DreamsTOF/dsh-shadow-rewind&type=Date)](https://star-history.com/#DreamsTOF/dsh-shadow-rewind&Date)
+
+---
+
+<p align="center">
+  <strong>⭐ 如果影子快照帮你救回过一次改动，就给它一个 star 吧！</strong>
+</p>

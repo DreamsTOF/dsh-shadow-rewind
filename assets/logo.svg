@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200" role="img" aria-label="dsh-shadow-rewind logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f766e"/>
+      <stop offset="1" stop-color="#1e3a8a"/>
+    </linearGradient>
+    <marker id="ah" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#ffffff"/>
+    </marker>
+  </defs>
+  <rect x="8" y="8" width="184" height="184" rx="42" fill="url(#bg)"/>
+  <!-- shadow layers: every turn is snapshotted -->
+  <rect x="52" y="118" width="96" height="13" rx="6.5" fill="#ffffff" opacity="0.25"/>
+  <rect x="52" y="99" width="96" height="13" rx="6.5" fill="#ffffff" opacity="0.5"/>
+  <rect x="52" y="80" width="96" height="13" rx="6.5" fill="#ffffff" opacity="0.85"/>
+  <!-- rewind arrow -->
+  <path d="M 122 79 A 28 28 0 1 0 78.6 79" fill="none" stroke="#ffffff" stroke-width="10" stroke-linecap="round" marker-end="url(#ah)"/>
+</svg>
