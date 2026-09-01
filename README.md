@@ -122,6 +122,11 @@ dsh plugin --profile web add dsh-shadow-rewind
         turnCheckpointTrust: fast       # fast=stat 缓存增量；strict=全量重读
         writeGate: true                 # true=以当前为准（默认），false=对称；侧边栏可运行时切换
         writeGateAllow: []              # 写入闸在只读白名单外额外放行的工具名
+        # 命令窗口（写盘归因：哪条命令、哪个会话在何时写盘；窗口持久化到存储目录）
+        commandWindowFlushMs: 400           # 落盘防抖（毫秒）
+        commandWindowRetentionMs: 21600000  # 窗口保留期（毫秒，默认 6h）；超长回溯可任意调大，磁盘占用极小
+        commandWindowMaxPerWorkspace: 2000  # 每工作区窗口条数上限（修剪保留最新）
+        commandWindowDetailBytes: 2048      # 每条窗口记录的工具参数（如命令文本）字节上限；0=不记录内容
 ```
 
 HTTP 端点均为同源、仅接受回环请求：

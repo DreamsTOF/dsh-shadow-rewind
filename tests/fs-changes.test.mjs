@@ -268,17 +268,17 @@ test('fs-changes 闸关：归因三态（唯一命令/重叠歧义/外部）与 
     await captureTurn(engine, workspace, 's1', 1, 10)
 
     // cmd.txt：恰 1 条 bash 窗口覆盖 mtime → command。
-    let startedAt = Date.now()
+    let startedAt = Date.now() - 5
     await writeFile(join(workspace, 'cmd.txt'), 'A\n', 'utf8')
-    let endedAt = Date.now()
+    let endedAt = Date.now() + 5
     await registry.record(workspace, { sessionId: 's1', agentId: 's1', tool: 'bash', startedAt, endedAt })
     await pause()
 
     // amb.txt：两条重叠窗口都覆盖 mtime → ambiguous（宁模糊不错）。
-    // 两条窗口都严格围绕本次写入采样，不外扩——避免误覆盖相邻阶段的 mtime。
-    startedAt = Date.now()
+    // 采样带 ±5ms 安全边距（相位间隔 20ms），不会误覆盖相邻阶段的 mtime。
+    startedAt = Date.now() - 5
     await writeFile(join(workspace, 'amb.txt'), 'B\n', 'utf8')
-    endedAt = Date.now()
+    endedAt = Date.now() + 5
     await registry.record(workspace, { sessionId: 's1', agentId: 's1', tool: 'bash', startedAt, endedAt })
     await registry.record(workspace, { sessionId: 's1', agentId: 's1', tool: 'run_code', startedAt, endedAt })
     await pause()
@@ -422,16 +422,16 @@ test('fs-changes 闸关：包围轮内的他会话写入降级 multi（不默认
     await captureTurn(engine, workspace, 's1', 1, 10)
     await pause()
     // 对照组：s1 自己窗口内的写入 + 自己的命令窗口 → 命令级归属不受降级影响。
-    let startedAt = Date.now()
+    let startedAt = Date.now() - 5
     await writeFile(join(workspace, 's1-wrote.txt'), 'A\n', 'utf8')
-    let endedAt = Date.now()
+    let endedAt = Date.now() + 5
     await registry.record(workspace, { sessionId: 's1', agentId: 's1', tool: 'bash', startedAt, endedAt })
     await pause()
     // 包围轮写入：s2 在 s1 窗口内写盘，命令窗口归 s2。网格会误判为本会话，
     // 终值证据（mtime ∈ s2 命令窗口）必须把它降级为 multi、交出勾选权。
-    startedAt = Date.now()
+    startedAt = Date.now() - 5
     await writeFile(join(workspace, 'enclosed.txt'), 'B\n', 'utf8')
-    endedAt = Date.now()
+    endedAt = Date.now() + 5
     await registry.record(workspace, { sessionId: 's2', agentId: 's2', tool: 'bash', startedAt, endedAt })
     await pause()
     await captureTurn(engine, workspace, 's1', 2, 20)
@@ -475,14 +475,14 @@ test('fs-changes 闸开：包围轮内的他会话写入同样被剔除', async 
     await pause()
     await captureTurn(engine, workspace, 's1', 1, 10)
     await pause()
-    let startedAt = Date.now()
+    let startedAt = Date.now() - 5
     await writeFile(join(workspace, 's1-wrote.txt'), 'A\n', 'utf8')
-    let endedAt = Date.now()
+    let endedAt = Date.now() + 5
     await registry.record(workspace, { sessionId: 's1', agentId: 's1', tool: 'bash', startedAt, endedAt })
     await pause()
-    startedAt = Date.now()
+    startedAt = Date.now() - 5
     await writeFile(join(workspace, 'enclosed.txt'), 'B\n', 'utf8')
-    endedAt = Date.now()
+    endedAt = Date.now() + 5
     await registry.record(workspace, { sessionId: 's2', agentId: 's2', tool: 'bash', startedAt, endedAt })
     await pause()
     await captureTurn(engine, workspace, 's1', 2, 20)
@@ -500,6 +500,103 @@ test('fs-changes 闸开：包围轮内的他会话写入同样被剔除', async 
     const paths = turn1.changes.map((change) => change.path)
     assert.ok(paths.includes('s1-wrote.txt'), '本会话写入必须保留')
     assert.ok(!paths.includes('enclosed.txt'), '包围轮内的他会话写入必须被剔除（网格看不见它，靠终值证据降级）')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
+
+test('fs-changes 重启等价：包围轮降级证据随注册表重启存活', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-restart-'))
+  const { engine, storageDir } = await makeEngine()
+  const pause = () => new Promise((resolve) => setTimeout(resolve, 20))
+  try {
+    // 与包围轮例同形状：s2 先开轮，完全包住随后 s1 的轮 1。
+    await writeFile(join(workspace, 'base.txt'), 'v0\n', 'utf8')
+    await captureTurn(engine, workspace, 's2', 1, 5)
+    await pause()
+    await captureTurn(engine, workspace, 's1', 1, 10)
+    await pause()
+    const registry1 = new CommandWindowRegistry({
+      canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
+      storageDir,
+    })
+    let startedAt = Date.now() - 5
+    await writeFile(join(workspace, 's1-wrote.txt'), 'A\n', 'utf8')
+    let endedAt = Date.now() + 5
+    await registry1.record(workspace, { sessionId: 's1', agentId: 's1', tool: 'bash', startedAt, endedAt })
+    await pause()
+    startedAt = Date.now() - 5
+    await writeFile(join(workspace, 'enclosed.txt'), 'B\n', 'utf8')
+    endedAt = Date.now() + 5
+    await registry1.record(workspace, { sessionId: 's2', agentId: 's2', tool: 'bash', startedAt, endedAt })
+    await pause()
+    await captureTurn(engine, workspace, 's1', 2, 20)
+
+    const liveSessions = new Map([
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
+      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, events: [] } }],
+    ])
+
+    // 重启前第一遍归因。
+    const before = await callFsChanges(closedGateHandlers(liveSessions, engine, registry1), 's1')
+
+    // 模拟宿主重启：冲刷落盘，新注册表实例从磁盘加载（同一存储目录）。
+    await registry1.flushPending()
+    const registry2 = new CommandWindowRegistry({
+      canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
+      storageDir,
+    })
+    const after = await callFsChanges(closedGateHandlers(liveSessions, engine, registry2), 's1')
+
+    // 重启等价：归因结果逐字段一致（窗口不再因重启丢失）。
+    assert.deepEqual(after.turns, before.turns, '重启前后归因必须逐字段一致')
+    const turn1 = after.turns.find((turn) => turn.turn === 1 && turn.live !== true)
+    assert.ok(turn1, 's1 轮 1 必须有配对条目')
+    const enclosed = turn1.changes.find((change) => change.path === 'enclosed.txt')
+    assert.deepEqual(
+      { owner: enclosed.owner, autoSelect: enclosed.autoSelect, attribution: enclosed.attribution },
+      { owner: 'multi', autoSelect: false, attribution: 'ambiguous' },
+      '包围轮降级证据在重启后不得丢失',
+    )
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
+
+test('fs-changes 闸关：窗口内容（detail）随命令级归因透出', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-fsdetail-'))
+  const { engine, storageDir } = await makeEngine()
+  const registry = new CommandWindowRegistry({
+    canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
+  })
+  const pause = () => new Promise((resolve) => setTimeout(resolve, 20))
+  try {
+    await writeFile(join(workspace, 'base.txt'), 'v0\n', 'utf8')
+    await captureTurn(engine, workspace, 's1', 1, 10)
+    await pause()
+    // 窗口带内容：终端命令文本（录制器经 captureDetail 采集的形态）。
+    const startedAt = Date.now() - 5
+    await writeFile(join(workspace, 'cmd.txt'), 'A\n', 'utf8')
+    const endedAt = Date.now() + 5
+    await registry.record(workspace, {
+      sessionId: 's1', agentId: 's1', tool: 'bash',
+      detail: '{"command":"echo A"}', startedAt, endedAt,
+    })
+    await pause()
+    await captureTurn(engine, workspace, 's1', 2, 20)
+
+    const liveSessions = new Map([
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
+    ])
+    const handlers = closedGateHandlers(liveSessions, engine, registry)
+    const body = await callFsChanges(handlers, 's1')
+    const turn1 = body.turns.find((turn) => turn.turn === 1 && turn.live !== true)
+    assert.ok(turn1, '轮 1 必须有配对条目')
+    const cmd = turn1.changes.find((change) => change.path === 'cmd.txt')
+    assert.equal(cmd.attribution, 'command')
+    assert.equal(cmd.command?.detail, '{"command":"echo A"}', '窗口内容必须随归因透出到端点')
   } finally {
     await rm(workspace, { recursive: true, force: true })
     await rm(storageDir, { recursive: true, force: true })

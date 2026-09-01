@@ -14,6 +14,7 @@ import { chmod, lstat, mkdir, open, readlink, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { captureSnapshot } from './capture.js'
 import { clearCaptureCache, readCaptureCache, writeCaptureCache } from './capture-cache.js'
+import { COMMAND_WINDOW_DEFAULTS } from './command-windows.js'
 import { createDeadline } from './deadline.js'
 import { ShadowRewindError, errorMessage } from './errors.js'
 import { jjAvailable, ShadowJj } from './jj-backend.js'
@@ -112,12 +113,23 @@ export function resolveConfig(config: ShadowRewindConfig): ResolvedShadowRewindC
     turnCheckpointMaxNewBytes: positiveInteger(config.turnCheckpointMaxNewBytes ?? DEFAULTS.turnCheckpointMaxNewBytes, 'turnCheckpointMaxNewBytes'),
     turnCheckpointTrust: trust,
     excludePatterns: config.excludePatterns ?? DEFAULT_EXCLUDES,
+    commandWindowFlushMs: positiveInteger(config.commandWindowFlushMs ?? COMMAND_WINDOW_DEFAULTS.flushMs, 'commandWindowFlushMs'),
+    commandWindowRetentionMs: positiveInteger(config.commandWindowRetentionMs ?? COMMAND_WINDOW_DEFAULTS.retentionMs, 'commandWindowRetentionMs'),
+    commandWindowMaxPerWorkspace: positiveInteger(config.commandWindowMaxPerWorkspace ?? COMMAND_WINDOW_DEFAULTS.maxPerWorkspace, 'commandWindowMaxPerWorkspace'),
+    commandWindowDetailBytes: nonNegativeInteger(config.commandWindowDetailBytes ?? COMMAND_WINDOW_DEFAULTS.detailBytes, 'commandWindowDetailBytes'),
   }
 }
 
 function positiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new ShadowRewindError('INVALID_CONFIG', `${name} 必须是正整数`)
+  }
+  return value
+}
+
+function nonNegativeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new ShadowRewindError('INVALID_CONFIG', `${name} 必须是非负整数`)
   }
   return value
 }

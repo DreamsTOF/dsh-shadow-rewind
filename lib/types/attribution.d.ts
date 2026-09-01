@@ -45,6 +45,8 @@ export interface FsCommandRef {
     readonly tool: string;
     readonly callId?: string;
     readonly sessionId: string;
+    /** 窗口内容（工具参数的截断序列化，如终端命令文本）；可能不存在。 */
+    readonly detail?: string;
     readonly startedAt: number;
     readonly endedAt: number;
 }
@@ -83,6 +85,7 @@ export declare function attributeFsChanges(options: {
             readonly sessionId: string;
             readonly tool: string;
             readonly callId?: string;
+            readonly detail?: string;
             readonly startedAt: number;
             readonly endedAt: number;
         }[]>;

@@ -221,6 +221,16 @@ export interface ShadowRewindConfig {
     readonly writeGate?: boolean;
     /** 写入闸在只读白名单之外额外放行的工具名（白名单语义见 README）。 */
     readonly writeGateAllow?: readonly string[];
+    /** 命令窗口落盘防抖（毫秒）。缺省 400。 */
+    readonly commandWindowFlushMs?: number;
+    /** 命令窗口保留期（毫秒），超出即修剪。缺省 6 小时；超长回溯（如数月）
+     * 可自行调大——窗口仅是时间戳加少量文本，磁盘占用极小。 */
+    readonly commandWindowRetentionMs?: number;
+    /** 每工作区保留的命令窗口条数上限（修剪保留最新）。缺省 2000。 */
+    readonly commandWindowMaxPerWorkspace?: number;
+    /** 每条窗口记录的工具参数序列化字节上限（如终端命令文本）；0 = 不
+     * 记录内容。缺省 2048。内容仅供回溯展示，归因正确性不依赖它。 */
+    readonly commandWindowDetailBytes?: number;
 }
 /** 解析完成（全部字段有值）的配置。 */
 export interface ResolvedShadowRewindConfig {
@@ -237,4 +247,8 @@ export interface ResolvedShadowRewindConfig {
     readonly turnCheckpointMaxNewBytes: number;
     readonly turnCheckpointTrust: 'fast' | 'strict';
     readonly excludePatterns: readonly string[];
+    readonly commandWindowFlushMs: number;
+    readonly commandWindowRetentionMs: number;
+    readonly commandWindowMaxPerWorkspace: number;
+    readonly commandWindowDetailBytes: number;
 }

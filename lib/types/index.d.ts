@@ -49,7 +49,7 @@ export declare class ShadowRewindService {
     private readonly coordinator;
     /** 写入闸（「以当前为准」）；恒常构造，config.writeGate 只决定初始开关。 */
     readonly writeGate: WorkspaceWriteGate;
-    /** 命令窗口注册表（写盘归因）：纯内存，宿主重启后历史窗口丢失。 */
+    /** 命令窗口注册表（写盘归因）：窗口持久化到存储目录，重启归因不降级。 */
     readonly commandWindows: CommandWindowRegistry;
     constructor(ctx: PluginContext, config?: ShadowRewindConfig);
     /** 等待启动恢复完成。 */
