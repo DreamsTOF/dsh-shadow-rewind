@@ -11,6 +11,9 @@
  */
 import * as React from 'react'
 import type { Context } from '@deepseek-ai/cordis'
+import type { ProducedFileDiff } from '../file-review/change-types.ts'
+import { fetchCheckpointFileContent } from './fs-diff-utils.ts'
+import { UnifiedDiff } from './UnifiedDiff.tsx'
 import { fetchSubsetPlan, pathsTooLong, SubsetPlanError } from './subset-plan.ts'
 
 const PATH = '/shadow-rewind'
@@ -40,6 +43,9 @@ const styles = `
 .srw-summary{display:flex;flex-wrap:wrap;column-gap:16px;row-gap:4px;color:var(--dsw-alias-label-secondary);font-size:13px}
 .srw-files{max-height:220px;overflow:auto;border:1px solid var(--dsw-alias-border-l2);border-radius:10px}
 .srw-file{display:flex;justify-content:space-between;gap:16px;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12px}
+.srw-file[data-expandable="true"]{cursor:pointer}
+.srw-file[data-expandable="true"]:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.srw-file-diff{padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);max-height:300px;overflow:auto;background:var(--dsw-alias-bg-layer-2)}
 .srw-file:last-child{border-bottom:0}
 .srw-file code{min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-secondary)}
 .srw-kind{flex:none;color:var(--dsw-alias-label-tertiary)}
@@ -116,6 +122,8 @@ type RewindPreview =
     readonly messageSeq: number
     readonly turn: number
     readonly checkpointId: string
+    /** 工作区绝对路径（新宿主）：行级预览按需拉全文时的 cwd 参数。 */
+    readonly workspace?: string
     /** 恢复语义模式：current-wins=以当前为准（整树），symmetric=对称（勾选式子集）。 */
     readonly mode?: 'current-wins' | 'symmetric'
     readonly totalChanges: number
@@ -281,6 +289,8 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
   const [stale, setStale] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [completed, setCompleted] = React.useState<string | null>(null)
+  // B1 撤销：恢复完成后提供「撤销本次恢复」（进程内单次 undo）。
+  const [undoing, setUndoing] = React.useState(false)
   // 对称模式的勾选集（null = 非对称模式，整树恢复）。
   const [selected, setSelected] = React.useState<ReadonlySet<string> | null>(null)
 
@@ -356,6 +366,40 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
   const canApply = ready !== null && !loading && !applying && completed === null
     && hasChanges && !sharedBlocked && !planMissing && !stale
     && (!symmetric || selectedCount > 0)
+  const canUndo = completed !== null && ready !== null && ready.workspace !== undefined && !undoing && !applying
+
+  const undoRestore = async () => {
+    if (!canUndo || ready?.workspace === undefined) return
+    setUndoing(true)
+    setError(null)
+    try {
+      const response = await fetch(`${PATH}/restore-undo`, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, cwd: ready.workspace }),
+      })
+      const body: unknown = await responseJson(response)
+      if (!response.ok) {
+        const message = typeof body === 'object' && body !== null && typeof (body as Record<string, unknown>).error === 'string'
+          ? (body as Record<string, unknown>).error as string
+          : `HTTP ${String(response.status)}`
+        throw new Error(message)
+      }
+      const record = body as { undonePaths?: unknown; skippedPaths?: unknown }
+      const undone = Array.isArray(record.undonePaths) ? record.undonePaths.length : 0
+      const skipped = Array.isArray(record.skippedPaths)
+        ? record.skippedPaths.filter((item): item is { path: string; reason: string } =>
+          typeof item === 'object' && item !== null && typeof (item as Record<string, unknown>).path === 'string')
+        : []
+      const lines = [`已撤销本次恢复：${String(undone)} 个路径回到恢复前状态。`]
+      for (const skip of skipped) lines.push(`跳过 ${skip.path}：${skip.reason}`)
+      setCompleted(lines.join('\n'))
+    } catch (undoError) {
+      setError(`撤销失败：${messageOf(undoError)}`)
+    } finally {
+      setUndoing(false)
+    }
+  }
 
   const togglePath = (path: string) => {
     setSelected((current) => {
@@ -502,30 +546,24 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
                 }),
                 '全部选中（整树恢复）',
               ),
-              ...ready.changes.map((change) => {
-                const badge = change.owner === undefined || change.owner === 'target'
-                  ? null
-                  : change.owner === 'multi'
-                    ? '双方都改过'
-                    : change.owner === 'unknown'
-                      ? '来源不明'
-                      : `会话 ${change.owner.length > 12 ? `${change.owner.slice(0, 12)}…` : change.owner}`
-                return React.createElement('div', { className: 'srw-file', key: change.path },
-                  symmetric && React.createElement('input', {
-                    type: 'checkbox',
-                    checked: selected?.has(change.path) ?? false,
-                    onChange: () => { togglePath(change.path) },
-                  }),
-                  React.createElement('code', null, change.path),
-                  badge !== null && React.createElement('span', { className: 'srw-kind' }, badge),
-                  React.createElement('span', { className: 'srw-kind' }, kindLabel(change.kind)),
-                )
-              }),
+              ...ready.changes.map((change) => React.createElement(PreviewFileRow, {
+                key: change.path,
+                change,
+                checkpointId: ready.checkpointId,
+                workspace: ready.workspace,
+                symmetric,
+                checked: selected?.has(change.path) ?? false,
+                onTogglePath: () => { togglePath(change.path) },
+              })),
             ]),
             ready.truncated && React.createElement('button', { type: 'button', className: 'srw-retry', key: 'more', onClick: () => { void loadAll() } },
               `查看全部 ${String(ready.totalChanges)} 个文件`),
           ],
-          completed !== null && React.createElement('p', { className: 'srw-status' }, completed),
+          completed !== null && React.createElement('p', { className: 'srw-status', style: { whiteSpace: 'pre-line' } }, completed),
+          completed !== null && canUndo && React.createElement('button', {
+            type: 'button', className: 'srw-retry', key: 'undo',
+            onClick: () => { void undoRestore() }, disabled: undoing,
+          }, undoing ? '正在撤销…' : '撤销本次恢复'),
           error !== null && React.createElement('p', { className: 'srw-error' }, error),
           !loading && (preview === null || preview.status !== 'ready' || stale || planMissing || sharedBlocked) && completed === null
             && React.createElement('button', { type: 'button', className: 'srw-retry', onClick: () => { void load() } }, '重新检查'),
@@ -537,6 +575,102 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
           applying ? '正在恢复…' : completed === null ? (mode === 'both' ? '恢复并从这里继续' : '恢复文件') : '已完成'),
       ),
     ),
+  )
+}
+
+/**
+ * 恢复预览的文件行（A3）：点击展开「当前 → 快照」方向的行级 diff——
+ * del = 恢复会带走的当前行，add = 恢复会加回来的快照行。
+ * 旧宿主没有 workspace 字段时退化为纯清单行（不展开）。
+ */
+function PreviewFileRow({ change, checkpointId, workspace, symmetric, checked, onTogglePath }: {
+  readonly change: RewindPreviewChange
+  readonly checkpointId: string
+  readonly workspace?: string
+  readonly symmetric: boolean
+  readonly checked: boolean
+  readonly onTogglePath: () => void
+}): React.ReactElement {
+  const [open, setOpen] = React.useState(false)
+  const badge = change.owner === undefined || change.owner === 'target'
+    ? null
+    : change.owner === 'multi'
+      ? '双方都改过'
+      : change.owner === 'unknown'
+        ? '来源不明'
+        : `会话 ${change.owner.length > 12 ? `${change.owner.slice(0, 12)}…` : change.owner}`
+  const expandable = workspace !== undefined && change.kind !== 'type-changed'
+  return React.createElement('div', { key: change.path },
+    React.createElement('div', {
+      className: 'srw-file',
+      'data-expandable': expandable ? 'true' : undefined,
+      onClick: expandable ? () => setOpen((current) => !current) : undefined,
+    },
+      symmetric && React.createElement('input', {
+        type: 'checkbox',
+        checked,
+        onClick: (event: React.MouseEvent) => { event.stopPropagation() },
+        onChange: onTogglePath,
+      }),
+      React.createElement('code', null, change.path),
+      badge !== null && React.createElement('span', { className: 'srw-kind' }, badge),
+      React.createElement('span', { className: 'srw-kind' }, kindLabel(change.kind)),
+      expandable && React.createElement('span', { className: 'srw-kind' }, open ? '收起 ▲' : '对比 ▼'),
+    ),
+    open && expandable && React.createElement(PreviewFileDiff, {
+      path: change.path,
+      kind: change.kind,
+      checkpointId,
+      workspace,
+    }),
+  )
+}
+
+/** 行级预览内容：当前磁盘 vs 快照（方向 当前 → 快照）。 */
+function PreviewFileDiff({ path, kind, checkpointId, workspace }: {
+  readonly path: string
+  readonly kind: string
+  readonly checkpointId: string
+  readonly workspace: string
+}): React.ReactElement {
+  const [diff, setDiff] = React.useState<readonly ProducedFileDiff[] | 'unavailable' | null>(null)
+  React.useEffect(() => {
+    let active = true
+    setDiff(null)
+    // kind 语义来自 inspect（快照 → 当前）：added = 现在才存在（恢复会移除），
+    // deleted = 快照里有、现在没了（恢复会写回）。
+    const isAddedNow = kind === 'added'
+    const isGoneNow = kind === 'deleted'
+    void Promise.all([
+      isGoneNow ? Promise.resolve('') : fetchCheckpointFileContent('live', path, workspace),
+      isAddedNow ? Promise.resolve('') : fetchCheckpointFileContent(checkpointId, path, workspace),
+    ]).then(([current, snapshot]) => {
+      if (!active) return
+      if (current === null && snapshot === null) {
+        setDiff('unavailable')
+        return
+      }
+      // 方向 = 当前 → 快照：del = 恢复会带走的行，add = 恢复会加回来的行。
+      setDiff([{ path, oldText: current ?? '', newText: snapshot ?? '' }])
+    })
+    return () => { active = false }
+  }, [path, kind, checkpointId, workspace])
+  if (diff === null) return React.createElement('div', { className: 'srw-file-diff' }, React.createElement('p', { className: 'srw-status' }, '加载全文…'))
+  if (diff === 'unavailable') return React.createElement('div', { className: 'srw-file-diff' }, React.createElement('p', { className: 'srw-status' }, '内容不可用（二进制文件或读取失败）。'))
+  return React.createElement('div', { className: 'srw-file-diff' },
+    React.createElement(UnifiedDiff, {
+      diffs: diff,
+      contextLines: 3,
+      showCopyButton: true,
+      labels: {
+        copy: '复制差异',
+        copied: '已复制',
+        showUnchanged: (count: number) => `显示 ${String(count)} 行未变更内容`,
+        hideUnchanged: (count: number) => `折叠 ${String(count)} 行未变更内容`,
+        hunkN: (n: number) => `块 ${String(n)}`,
+        hunkInclude: '勾选的块参与撤销/重做',
+      },
+    }),
   )
 }
 
@@ -601,6 +735,7 @@ function decodePreview(value: unknown): RewindPreview {
     ...(typeof record.restoreBlocked === 'boolean' ? { restoreBlocked: record.restoreBlocked } : {}),
     ...(Array.isArray(record.gatedSessionIds) ? { gatedSessionIds: record.gatedSessionIds } : {}),
     skippedPaths,
+    ...(typeof record.workspace === 'string' ? { workspace: record.workspace } : {}),
     ...(typeof record.planId === 'string' ? { planId: record.planId } : {}),
     ...(typeof record.confirmation === 'string' ? { confirmation: record.confirmation } : {}),
     ...(typeof record.offset === 'number' ? { offset: record.offset } : {}),

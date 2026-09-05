@@ -1,6 +1,11 @@
 /** 影子回退（shadow-rewind）的共享类型：持久化格式、插件配置与对外结果。 */
 
-/** 持久化格式版本。读取方拒绝一切其它版本（fail-closed，不做最佳努力兼容）。 */
+/** 持久化格式版本。读取方拒绝一切其它版本（fail-closed，不做最佳努力兼容）。
+ * TODO: 版本演进策略——本插件自产自销该格式，bump 前必须先发布能读旧版本的
+ * 消费方。届时借鉴 dsh-checkpoint-diff 的「容错超集」方案：新 schema 把旧版
+ * 字段全部收为可选（严格性归生产者），open 按 version-mismatch 双版本回退，
+ * 而不是整介质作废。当前全部新增字段（intent 等）都以可选字段无痛演进，
+ * 不需要 bump。 */
 export const FORMAT_VERSION = 1 as const
 
 /** 恢复点 id（形如 rp_<time>_<rand12>）。 */
@@ -61,8 +66,8 @@ export interface SkippedPath {
 export type ContentBackend =
   /** 隐藏影子 jj 仓库（默认）。 */
   | 'jj'
-  /** 独立内容寻址 blob 目录（legacy；也是 jj 缺失时的自动降级目标）。 */
-  | 'blob'
+  /** 内置 SQLite 内容库（node:sqlite；jj 缺失时的自动降级目标）。 */
+  | 'sqlite'
 
 /** 恢复点的用途。 */
 export type RestorePointKind =
@@ -72,6 +77,15 @@ export type RestorePointKind =
   | 'rescue'
   /** 每轮对话开始前自动创建的隐藏检查点。 */
   | 'turn'
+
+/** 一条意图记录：本轮内触发文件变更的内容型工具调用摘要（轮末检查点专用）。
+ * 回答「这一轮是谁改的」——工具名 + 目标路径 + 对应 tool/call 事件 seq。
+ * 借鉴 dsh-checkpoint-diff 的意图标签（labels）思路。 */
+export interface TurnIntent {
+  readonly tool: string
+  readonly path: string
+  readonly seq: number
+}
 
 /** 持久化恢复点清单（磁盘 JSON 的内存形态，读取时全量校验）。 */
 export interface Manifest {
@@ -95,6 +109,8 @@ export interface Manifest {
   /** 轮内相位（turn 专用）：'start' = 轮起捕获（缺省/旧数据），'end' = 轮末
    * （turn/end 事件）捕获——轮末快照冻结轮末树状态，归属不再依赖下一轮轮起。 */
   readonly phase?: 'start' | 'end'
+  /** 本轮的内容型工具调用摘要（turn + 轮末专用；轮起检查点不携带）。 */
+  readonly intent?: readonly TurnIntent[]
   /** 旧式回合边界 seq（保留字段，当前不写入）。 */
   readonly turnEndSeq?: number
   readonly createdAt: number
@@ -136,6 +152,8 @@ export interface RestorePointSummary {
   readonly turn?: number
   readonly turnStartSeq?: number
   readonly phase?: 'start' | 'end'
+  /** 本轮的内容型工具调用摘要（轮末检查点才有；旧数据/轮起缺省）。 */
+  readonly intent?: readonly TurnIntent[]
   readonly createdAt: number
   readonly treeHash: string
   readonly fileCount: number
@@ -191,6 +209,17 @@ export interface RestoreResult {
   readonly restoredPaths: readonly string[]
 }
 
+/** 恢复后单次撤销的结果（借鉴 dsh-checkpoint-diff 的 rollback-undo）。
+ * 被后续修改过的路径跳过并如实报告；before=null（恢复新建的文件）的撤销
+ * 是「绝不删除」的唯一例外——删除的是恢复操作自己刚创建的文件。 */
+export interface RestoreUndoResult {
+  readonly operationId: RestoreOperationId
+  readonly restorePointId: RestorePointId
+  readonly rescuePointId: RestorePointId
+  readonly undonePaths: readonly string[]
+  readonly skippedPaths: readonly { readonly path: string; readonly reason: string }[]
+}
+
 /** 中断操作的恢复摘要。 */
 export interface RecoverySummary {
   readonly operationId: RestoreOperationId
@@ -223,11 +252,11 @@ export interface ShadowRewindConfig {
   readonly staleLockMs?: number
   /**
    * 自动 turn 检查点实现：
-   *  - `jj`（默认）：写入隐藏影子 jj 仓库；宿主机缺 jj CLI 时自动降级 legacy；
-   *  - `legacy`：内容寻址 blob 目录，无需任何外部 CLI；
+   *  - `jj`（默认）：写入隐藏影子 jj 仓库；宿主机缺 jj CLI 时自动降级 sqlite；
+   *  - `sqlite`：内置 SQLite 内容库（node:sqlite），无需任何外部 CLI；
    *  - `off`：关闭自动检查点。
    */
-  readonly turnCheckpointMode?: 'off' | 'legacy' | 'jj'
+  readonly turnCheckpointMode?: 'off' | 'sqlite' | 'jj'
   /** 单次自动检查点允许占用的最长时间（毫秒）。 */
   readonly turnCheckpointTimeoutMs?: number
   /** 单次自动检查点允许新写入镜像的字节上限（增量同步下的最坏写入量）。 */
@@ -270,7 +299,7 @@ export interface ResolvedShadowRewindConfig {
   readonly maxSnapshotBytes: number
   readonly planTtlMs: number
   readonly staleLockMs: number
-  readonly turnCheckpointMode: 'off' | 'legacy' | 'jj'
+  readonly turnCheckpointMode: 'off' | 'sqlite' | 'jj'
   readonly turnCheckpointTimeoutMs: number
   readonly turnCheckpointMaxNewBytes: number
   readonly turnCheckpointTrust: 'fast' | 'strict'

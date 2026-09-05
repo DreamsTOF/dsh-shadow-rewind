@@ -3,7 +3,7 @@
  *
  * 两条铁律贯穿全部路径：
  *  1. 绝不调用工作区自身的任何 VCS——文件枚举只走目录扫描，快照字节只落在
- *     影子 jj 仓库或独立 blob 目录；
+ *     影子 jj 仓库或 SQLite 内容库；
  *  2. 恢复必须「计划限时 + 确认串逐字回显 + 恢复前自动 rescue 备份 +
  *     操作日志 + 事后哈希验证」，任何一步不符立即 fail-closed。
  */
@@ -18,7 +18,7 @@ import { COMMAND_WINDOW_DEFAULTS } from './command-windows.js'
 import { createDeadline } from './deadline.js'
 import { ShadowRewindError, errorMessage } from './errors.js'
 import { jjAvailable, ShadowJj } from './jj-backend.js'
-import { diffTrees, makeId, sha256Hex } from './manifest.js'
+import { diffTrees, entriesEqual, makeId, sha256Hex } from './manifest.js'
 import {
   assertSafeParents,
   canonicalDirectory,
@@ -33,8 +33,8 @@ import {
 } from './path-utils.js'
 import { compileExcludes, scanWorkspace } from './scan.js'
 import type { ExcludeRule, ScannedPath } from './scan.js'
-import { WorkspaceStore } from './store.js'
-import type { RestorePlanId } from './types.js'
+import { sqliteAvailable, WorkspaceStore } from './store.js'
+import type { RestorePlanId, TurnIntent } from './types.js'
 import {
   FORMAT_VERSION,
   type Manifest,
@@ -44,11 +44,22 @@ import {
   type RestorePointKind,
   type RestorePointSummary,
   type RestoreResult,
+  type RestoreUndoResult,
   type ShadowRewindConfig,
   type SkippedPath,
   type SnapshotEntry,
   type WorkspaceChange,
 } from './types.js'
+
+/** 撤销记录的单文件条目：before = 恢复前磁盘条目（null = 当时不存在），
+ * after = 恢复后条目（null = 恢复把它删了）。 */
+interface RestoreUndoRecord {
+  readonly operationId: string
+  readonly restorePointId: string
+  readonly rescuePointId: string
+  readonly time: number
+  readonly files: readonly { readonly rel: string; readonly before: SnapshotEntry | null; readonly after: SnapshotEntry | null }[]
+}
 
 /** 默认排除清单：VCS 目录、依赖、构建产物与常见缓存（自用取向：宁多勿漏）。 */
 export const DEFAULT_EXCLUDES: readonly string[] = [
@@ -88,12 +99,15 @@ const DEFAULTS = {
 
 /** 解析配置：全部字段落定；非法值直接抛错（宁可拒绝启动也不带病运行）。 */
 export function resolveConfig(config: ShadowRewindConfig): ResolvedShadowRewindConfig {
-  const storageDir = config.storageDir?.trim() !== ''
-    ? String(config.storageDir)
+  // 注意：不能用 `config.storageDir?.trim() !== ''` 判空——storageDir 为
+  // undefined 时该表达式为 true，String(undefined) 会把存储根变成字面量
+  // "undefined" 相对路径（挂在宿主进程 cwd 下）。必须显式 typeof 判定。
+  const storageDir = typeof config.storageDir === 'string' && config.storageDir.trim() !== ''
+    ? config.storageDir
     : join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'shadow-rewind', 'v1')
   const mode = config.turnCheckpointMode ?? DEFAULTS.turnCheckpointMode
-  if (mode !== 'off' && mode !== 'legacy' && mode !== 'jj') {
-    throw new ShadowRewindError('INVALID_CONFIG', 'turnCheckpointMode 必须是 off、legacy 或 jj')
+  if (mode !== 'off' && mode !== 'sqlite' && mode !== 'jj') {
+    throw new ShadowRewindError('INVALID_CONFIG', 'turnCheckpointMode 必须是 off、sqlite 或 jj')
   }
   const trust = config.turnCheckpointTrust ?? DEFAULTS.turnCheckpointTrust
   if (trust !== 'fast' && trust !== 'strict') {
@@ -154,10 +168,10 @@ export class ShadowRewindEngine {
   readonly ready: Promise<number>
 
   /**
-   * 实际生效的内容后端：配置为 jj 但宿主机缺 CLI 时自动降级为 blob
-   * （自动检查点不断档）；显式配置 legacy/off 不受影响。
+   * 实际生效的内容后端：配置为 jj 但宿主机缺 CLI 时自动降级为内置
+   * SQLite 内容库（自动检查点不断档）；显式配置 sqlite/off 不受影响。
    */
-  readonly effectiveBackend: 'jj' | 'blob'
+  readonly effectiveBackend: 'jj' | 'sqlite'
   /** 降级原因（未降级时为 undefined）。 */
   readonly downgradeReason?: string
 
@@ -165,14 +179,17 @@ export class ShadowRewindEngine {
   private readonly plans = new Map<RestorePlanId, RestorePlan & { expired?: boolean }>()
   private readonly applying = new Set<RestorePlanId>()
   private readonly shadowRepos = new Map<string, ShadowJj>()
+  /** 恢复后单次撤销（B1）：workspace → 最近一次恢复的逐路径 before/after。
+   * 进程内记录，重启即失效；每次 applyRestore 替换上一次（无 redo）。 */
+  private readonly undoRecords = new Map<string, RestoreUndoRecord>()
 
   constructor(config: ShadowRewindConfig = {}) {
     this.config = resolveConfig(config)
     if (this.config.turnCheckpointMode === 'jj' && !jjAvailable()) {
-      this.effectiveBackend = 'blob'
-      this.downgradeReason = '宿主机没有可用的 jj CLI，自动检查点已降级为内置 blob 存储'
+      this.effectiveBackend = 'sqlite'
+      this.downgradeReason = '宿主机没有可用的 jj CLI，自动检查点已降级为内置 SQLite 存储'
     } else {
-      this.effectiveBackend = this.config.turnCheckpointMode === 'off' ? 'blob' : this.config.turnCheckpointMode === 'jj' ? 'jj' : 'blob'
+      this.effectiveBackend = this.config.turnCheckpointMode === 'jj' ? 'jj' : 'sqlite'
     }
     this.excludes = compileExcludes(this.config.excludePatterns)
     this.store = new WorkspaceStore(this.config)
@@ -217,10 +234,10 @@ export class ShadowRewindEngine {
   // ── 当前树捕获 ──────────────────────────────────────────────────────────
 
   /**
-   * 扫描 + 捕获当前树（共用 stat 缓存增量，blob 与 jj 后端同路径）。
+   * 扫描 + 捕获当前树（共用 stat 缓存增量，sqlite 与 jj 后端同路径）。
    *  - mode = 'inspect'：只构建 entries（供对比/计划）；缓存只读不写回，
    *    避免把对比时刻的 stat 事实污染成下一次持久捕获的增量依据；
-   *  - mode = 'persist'：新读内容写入内容后端（blob putBlob / jj 镜像提交），
+   *  - mode = 'persist'：新读内容写入内容后端（sqlite 批量入库 / jj 镜像提交），
    *    并写回缓存，返回 commitId。
    */
   private async captureTree(
@@ -239,12 +256,14 @@ export class ShadowRewindEngine {
     const workspaceDir = await this.store.workspaceDir(workspace)
     const cachePath = join(workspaceDir, 'stat-cache.json')
     const cache = await readCaptureCache(cachePath)
-    // 缓存命中校验：blob 模式 stat blob 文件、jj 模式 stat 镜像文件——
+    // 缓存命中校验：sqlite 模式 stat 内容库行、jj 模式 stat 镜像文件——
     // 存储被 GC / 影子仓库被清理后，命中项会在这里被识别为失效并重读，
     // 绝不让 manifest 引用「已死亡」的内容。
     const verifyContent = async (path: string, blob: string): Promise<boolean> => {
-      if (this.effectiveBackend === 'blob') return this.store.blobExists(workspace, blob)
-      return pathExists(join(this.shadowRepo(workspace).repoDir, 'checkpoint', ...path.split('/')))
+      if (this.effectiveBackend === 'jj') {
+        return pathExists(join(this.shadowRepo(workspace).repoDir, 'checkpoint', ...path.split('/')))
+      }
+      return this.store.sqliteBlobExists(workspace, blob)
     }
     const captured = await captureSnapshot({
       root: scan.root,
@@ -263,12 +282,14 @@ export class ShadowRewindEngine {
       if (this.effectiveBackend === 'jj') {
         commitId = await this.persistJj(workspace, scan.paths, captured, options.message ?? 'checkpoint', options.signal)
       } else {
-        // blob 后端：把新读内容写入内容寻址存储（命中缓存的路径已在存储里）。
+        // sqlite 后端：把新读内容批量写入内容库（单事务；命中缓存的路径已在库里）。
+        const items: { readonly hash: string; readonly content: Buffer }[] = []
         for (const [path, content] of captured.newContent) {
           const entry = captured.entries[path]
           if (entry === undefined || entry.kind !== 'file') continue
-          await this.store.putBlob(workspace, entry.blob, content)
+          items.push({ hash: entry.blob, content })
         }
+        await this.store.putSqliteBlobs(workspace, items)
       }
       await writeCaptureCache(cachePath, captured.nextCache)
     }
@@ -364,6 +385,8 @@ export class ShadowRewindEngine {
     readonly turn: number
     readonly turnStartSeq: number
     readonly phase?: 'start' | 'end'
+    /** 轮末检查点的本轮内容型工具调用摘要（仅 phase='end' 合法）。 */
+    readonly intent?: readonly TurnIntent[]
     readonly signal?: AbortSignal
   }): Promise<RestorePointSummary> {
     const phase = options.phase ?? 'start'
@@ -397,6 +420,7 @@ export class ShadowRewindEngine {
           turn: options.turn,
           turnStartSeq: options.turnStartSeq,
           phase,
+          ...(phase === 'end' && options.intent !== undefined ? { intent: options.intent } : {}),
           label: `turn ${String(options.turn)} ${phase === 'end' ? '轮末' : '轮起'}检查点`,
           signal,
         })
@@ -535,6 +559,34 @@ export class ShadowRewindEngine {
     return this.readSnapshotContent(manifest, options.path)
   }
 
+  /**
+   * 降级标注（degraded）：检查点的快照内容是否仍可读。抽样「最小的文件条目」
+   * 走真实读取路径探测两个后端（jj 影子仓库 / sqlite blob）；清单不存在或
+   * 抽样读取失败 = 不可读。只读探测，绝不写任何数据。
+   * 借鉴 dsh-checkpoint-diff 的 degraded 标注思路：丢失节点诚实标注，
+   * 而不是等到恢复/读取时才响亮报错。
+   */
+  async checkpointContentReadable(options: {
+    readonly cwd: string
+    readonly restorePointId: string
+  }): Promise<boolean> {
+    await this.assertReady()
+    const workspace = await canonicalDirectory(options.cwd)
+    const manifest = await this.store.readManifest(workspace, options.restorePointId)
+    let smallest: { readonly path: string; readonly size: number } | undefined
+    for (const [path, entry] of Object.entries(manifest.entries)) {
+      if (entry.kind !== 'file') continue
+      if (smallest === undefined || entry.size < smallest.size) smallest = { path, size: entry.size }
+    }
+    if (smallest === undefined) return true
+    try {
+      await this.readSnapshotContent(manifest, smallest.path)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   /** 实际创建 manifest 的内部路径：调用方必须已持有工作区锁。 */
   private async createLocked(
     workspace: string,
@@ -546,6 +598,7 @@ export class ShadowRewindEngine {
       readonly turn?: number
       readonly turnStartSeq?: number
       readonly phase?: 'start' | 'end'
+      readonly intent?: readonly TurnIntent[]
       readonly signal?: AbortSignal
     },
   ): Promise<Manifest> {
@@ -571,6 +624,7 @@ export class ShadowRewindEngine {
       ...(options.turn === undefined ? {} : { turn: options.turn }),
       ...(options.turnStartSeq === undefined ? {} : { turnStartSeq: options.turnStartSeq }),
       ...(options.phase === undefined ? {} : { phase: options.phase }),
+      ...(options.intent === undefined ? {} : { intent: options.intent }),
       createdAt: Date.now(),
       treeHash: tree.treeHash,
       fileCount: tree.fileCount,
@@ -581,7 +635,7 @@ export class ShadowRewindEngine {
     }
     await this.store.writeManifest(workspace, manifest)
     if (options.kind !== 'turn') {
-      // GC 只删未被引用的 blob；一旦真删了内容，就必须同步作废 stat 缓存，
+      // GC 只删未被引用的内容行；一旦真删了内容，就必须同步作废 stat 缓存，
       // 否则下一次命中会把已删除的 blob 引用进新 manifest（死引用）。
       const gc = await this.store.collectGarbage(workspace)
       if (gc.deletedBlobs > 0) {
@@ -826,6 +880,19 @@ export class ShadowRewindEngine {
             lastRestoredAt: Date.now(),
           })
           this.plans.delete(plan.id)
+          // B1 撤销记录：before = 计划复核时的磁盘条目（rescue 同一刻），
+          // after = 快照条目（缺省 = 恢复把它删了）。撤销时逐路径 CAS。
+          this.undoRecords.set(plan.workspace, {
+            operationId: operation.id,
+            restorePointId: manifest.id,
+            rescuePointId: rescue.id,
+            time: Date.now(),
+            files: plan.changes.map((change) => ({
+              rel: change.path,
+              before: current.entries[change.path] ?? null,
+              after: manifest.entries[change.path] ?? null,
+            })),
+          })
           const result: RestoreResult = {
             operationId: operation.id,
             restorePointId: manifest.id,
@@ -872,6 +939,70 @@ export class ShadowRewindEngine {
       }
     } finally {
       this.applying.delete(plan.id)
+    }
+  }
+
+  /**
+   * 撤销最近一次恢复（B1，借鉴 dsh-checkpoint-diff 的 rollback-undo）。
+   *
+   * 语义：
+   *  - 进程内单次 undo，无 redo——记录随 applyRestore 替换、撤销成功即删除、
+   *    重启失效（真正的兜底是 rescue 备份点本身，它有独立配额与持久化）；
+   *  - 逐路径 CAS：当前磁盘条目必须仍等于「恢复后」的状态（内容寻址等价），
+   *    被后续改动过的路径跳过并如实报告，绝不猜着回退；全部跳过 → 409；
+   *  - 撤销动作复用 rescue 清单的 restorePaths（全套安全路径：围栏断言、
+   *    原子写、空目录回收、非空拒删）；before=null 的路径（恢复新建的）撤销
+   *    即删除——「绝不删除」的唯一例外，删的是恢复操作自己刚创建的文件。
+   */
+  async undoLastRestore(options: {
+    readonly cwd: string
+    readonly signal?: AbortSignal
+  }): Promise<RestoreUndoResult> {
+    await this.assertReady(options.signal)
+    const workspace = await canonicalDirectory(options.cwd)
+    const record = this.undoRecords.get(workspace)
+    if (record === undefined) {
+      throw new ShadowRewindError('UNDO_NOT_FOUND',
+        '没有可撤销的恢复（进程内只保留最近一次，重启后失效；可从恢复时自动创建的备份点手工恢复）')
+    }
+    const release = await this.store.acquire(workspace, options.signal)
+    try {
+      const rescue = await this.store.readManifest(workspace, record.rescuePointId)
+      const current = await this.captureTree(workspace, { mode: 'inspect', signal: options.signal })
+      const undonePaths: string[] = []
+      const skippedPaths: { path: string; reason: string }[] = []
+      for (const file of record.files) {
+        const now = current.entries[file.rel] ?? null
+        const matches = file.after === null
+          ? now === null
+          : now !== null && entriesEqual(now, file.after)
+        if (!matches) {
+          skippedPaths.push({ path: file.rel, reason: '恢复后的内容又被修改过，已跳过' })
+          continue
+        }
+        try {
+          await this.restorePaths(workspace, rescue, [file.rel], options.signal)
+          await this.verifyRestored(workspace, rescue, [file.rel], options.signal)
+          undonePaths.push(file.rel)
+        } catch (error) {
+          skippedPaths.push({ path: file.rel, reason: `撤销失败：${errorMessage(error)}` })
+        }
+      }
+      if (undonePaths.length === 0) {
+        throw new ShadowRewindError('UNDO_CONFLICT',
+          `全部路径都已被后续修改，无法撤销；可从备份点 ${record.rescuePointId} 手工恢复`)
+      }
+      // 单次撤销：条目删除即失效。
+      this.undoRecords.delete(workspace)
+      return {
+        operationId: record.operationId,
+        restorePointId: record.restorePointId,
+        rescuePointId: record.rescuePointId,
+        undonePaths,
+        skippedPaths,
+      }
+    } finally {
+      await release()
     }
   }
 
@@ -954,7 +1085,7 @@ export class ShadowRewindEngine {
     if (entry === undefined || entry.kind !== 'file') {
       throw new ShadowRewindError('STATE_CORRUPT', `恢复点 ${manifest.id} 不含文件 ${JSON.stringify(path)}`)
     }
-    return this.store.readBlob(manifest.workspace, entry.blob)
+    return this.store.readSqliteBlob(manifest.workspace, entry.blob)
   }
 
   /** 把一组路径恢复成 manifest 记录的状态（先删后写；目录按需重建/回收）。 */
@@ -1116,6 +1247,7 @@ function summarize(manifest: Manifest): RestorePointSummary {
     ...(manifest.turn === undefined ? {} : { turn: manifest.turn }),
     ...(manifest.turnStartSeq === undefined ? {} : { turnStartSeq: manifest.turnStartSeq }),
     ...(manifest.phase === undefined ? {} : { phase: manifest.phase }),
+    ...(manifest.intent === undefined ? {} : { intent: manifest.intent }),
     createdAt: manifest.createdAt,
     treeHash: manifest.treeHash,
     fileCount: manifest.fileCount,

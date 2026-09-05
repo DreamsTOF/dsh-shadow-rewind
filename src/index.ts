@@ -5,13 +5,14 @@
 import { ShadowRewindEngine } from './engine.js'
 import { installFileReviewHost } from './file-review/host.ts'
 import { CommandWindowRegistry, installCommandWindowRecorder } from './command-windows.js'
-import { installShadowRewindHttp, TurnCheckpointCoordinator } from './rewind-host.js'
+import { installShadowRewindCommands, installShadowRewindHttp, TurnCheckpointCoordinator } from './rewind-host.js'
 import type { AgentFace, HostContext } from './rewind-host.js'
 import type { RestorePointSummary, ShadowRewindConfig } from './types.js'
 import { installWriteGateHost, WorkspaceWriteGate } from './write-gate.js'
 import type { WriteGateDeps } from './write-gate.js'
 import { canonicalDirectory } from './path-utils.js'
 
+export * from './char-highlight.js'
 export * from './engine.js'
 export * from './errors.js'
 export * from './rewind-host.js'
@@ -35,10 +36,11 @@ interface PluginContext {
   webServer?: {
     register(route: { kind: 'exact'; path: string; handler: (request: unknown, response: unknown) => Promise<void> }): () => void
   }
-  sessions?: { get(sessionId: string): AgentFace | undefined }
+  sessions?: { get(sessionId: string): unknown }
   sessionQuery?: unknown
-  apiProxy?: unknown
-  agents?: { list(): readonly AgentFace[] }
+  /** dsh 0.1.2 起会话网关（替代被移除的 apiProxy）。 */
+  sessionController?: import('./rewind-host.js').SessionControllerLike
+  agents?: { get?(sessionId: string): AgentFace | undefined; list(): readonly AgentFace[] }
 }
 
 /**
@@ -66,13 +68,20 @@ export class ShadowRewindService {
     // "cannot get property ... without inject"，闸一开所有工具裁决即报错），
     // 因此 deps 经注入作用域惰性读取（与 HTTP 端点同机制）：inject 回调把
     // scope 上的服务摘进闭包，闸在每次裁决时读取当时的存活面。注入完成前
-    // 两者为 undefined，按 WriteGateDeps 的可选语义降级（agents 缺失 →
-    // 所有者视为存活；sessions 缺失 → 谱系上溯停止）。
-    const gateServices: { sessions?: WriteGateDeps['sessions']; agents?: WriteGateDeps['agents'] } = {}
+    // 两者为空实现，按 WriteGateDeps 的可选语义降级（agents 缺失 → 所有者
+    // 视为存活；谱系上溯停止）。
+    //
+    // 谱系上溯与命令窗口顶层会话解析的「会话查找面」在 0.1.2 以 agents
+    // 注册表承担（AgentRegistry.get → Agent.session.header.parentSession）：
+    // ctx.sessions（SessionStore）返回的是核心 Session，没有 agent 包装层。
+    const gateLookup: WriteGateDeps['sessions'] & WriteGateDeps['agents'] = {
+      get: () => undefined,
+      list: () => [],
+    }
     this.writeGate = new WorkspaceWriteGate({
       canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
-      get sessions() { return gateServices.sessions },
-      get agents() { return gateServices.agents },
+      get sessions() { return gateLookup },
+      get agents() { return gateLookup },
       logger: ctx.logger,
     }, {
       enabled: config.writeGate ?? true,
@@ -103,30 +112,30 @@ export class ShadowRewindService {
     // 命令窗口录制器挂在 tools/execute（around-dispatch，包住工具体本身）：
     // 被闸拒绝的调用在 prepare 阶段（tools/pre-execute）终止、从不进入
     // dispatch，自然不记录（注册表绝不记录未执行的调用）。会话查找面经注入
-    // 闭包惰性读取，与闸的 gateServices 同一机制（注入完成前谱系上溯停在
+    // 闭包惰性读取，与闸的 gateLookup 同一机制（注入完成前谱系上溯停在
     // 最深已声明祖先）。
-    const recorderServices: { sessions?: WriteGateDeps['sessions'] } = {}
     installCommandWindowRecorder(
       ctx as unknown as Parameters<typeof installCommandWindowRecorder>[0],
       this.commandWindows,
-      () => recorderServices.sessions,
+      () => gateLookup,
     )
 
     ctx.inject(['agents'], (scope) => {
-      gateServices.agents = (scope as unknown as WriteGateDeps).agents
+      const agents = (scope as unknown as { readonly agents: { get?(id: string): AgentFace | undefined; list(): readonly AgentFace[] } }).agents
+      gateLookup.get = (id) => agents.get?.(id)
+      gateLookup.list = () => agents.list() as AgentFace[]
       this.coordinator.install(scope as unknown as HostContext)
       // 所有权登记与快照共用 agent/pre-step 瀑布（step 1 抢占）。
       this.writeGate?.install(scope as unknown as HostContext)
     })
-    // 闸的谱系查找与录制器的顶层会话解析都需要 sessions；独立注入，
-    // 避免把它耦合进快照安装的可用面。
-    ctx.inject(['sessions'], (scope) => {
-      gateServices.sessions = (scope as unknown as WriteGateDeps).sessions
-      recorderServices.sessions = (scope as unknown as WriteGateDeps).sessions
-    })
-    ctx.inject(['webServer', 'sessions', 'sessionQuery', 'apiProxy', 'agents'], (scope) => {
+    ctx.inject(['webServer', 'sessions', 'sessionQuery', 'sessionController', 'agents'], (scope) => {
       const s = scope as unknown as Parameters<typeof installShadowRewindHttp>[0]
       installShadowRewindHttp(s, this.engine, this.coordinator, this.writeGate, this.commandWindows)
+    })
+    // headless 命令面（/shadow-diff、/shadow-undo）：commands 服务缺失的宿主
+    // 上该 inject 挂起即可，不影响其余装配（与 webServer 同一降级模型）。
+    ctx.inject(['commands'], (scope) => {
+      installShadowRewindCommands(scope as unknown as Parameters<typeof installShadowRewindCommands>[0], this.engine)
     })
 
     void this.engine.ready.then((reconciled) => {
@@ -178,6 +187,11 @@ export class ShadowRewindService {
   /** 执行已批准的恢复计划。 */
   applyRestore(options: Parameters<ShadowRewindEngine['applyRestore']>[0]): ReturnType<ShadowRewindEngine['applyRestore']> {
     return this.engine.applyRestore(options)
+  }
+
+  /** 撤销该工作区最近一次恢复（进程内单次 undo，重启失效）。 */
+  undoLastRestore(options: Parameters<ShadowRewindEngine['undoLastRestore']>[0]): ReturnType<ShadowRewindEngine['undoLastRestore']> {
+    return this.engine.undoLastRestore(options)
   }
 
   /** 删除恢复点（confirmation 必须逐字等于 `DELETE <id>`）。 */

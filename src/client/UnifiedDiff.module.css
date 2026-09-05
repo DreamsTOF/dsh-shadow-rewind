@@ -30,6 +30,38 @@
   font: var(--dsw-font-xs-13);
 }
 
+/* 修改点跳转导航：↑/↓ + i/n 计数，位于复制按钮左侧。 */
+.unifiedNav {
+  position: absolute;
+  top: 6px;
+  right: 56px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-xs-13);
+  font-variant-numeric: tabular-nums;
+}
+
+.unifiedNav button {
+  padding: 0 6px;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  font: var(--dsw-font-xs-13);
+}
+
+.unifiedNav button:hover:not(:disabled) {
+  color: var(--dsw-alias-label-primary);
+}
+
+.unifiedNav button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .unifiedFile + .unifiedFile {
   border-top: 1px solid var(--dsw-alias-border-l2);
 }
@@ -116,6 +148,13 @@
 
 .unified_context {
   color: var(--dsw-alias-label-primary);
+}
+
+/* 行内字符级高亮：替换行里真正变化的字符段（红绿整行之上的第二层精度）。 */
+.unifiedHighlight {
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .unifiedGap {

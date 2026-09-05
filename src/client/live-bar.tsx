@@ -1,18 +1,21 @@
 /**
- * LiveChangesBar: ambient readout of the IN-PROGRESS turn's file changes,
- * registered into `conversation.input.dock` (the one-line seat above the
- * composer card). Tool-derived changes come straight from the session
- * snapshot (deriveSessionChanges' live turn); terminal/PowerShell writes come
- * from the warmed fs-changes cache (live-tail entry). Renders nothing when
- * the turn is idle or changed nothing — the completed-turn card takes over.
+ * LiveChangesBar —— 轮中 live 条：正在进行的那一轮的文件变更实时读数，
+ * 注册在 `conversation.input.dock`（输入卡上方那一行座位）。
  *
- * Same interaction contract as the turn-tail card: the file list shows up to
- * four rows and scrolls beyond; hovering a row pops the shared DiffPopover
- * aligned to this frame; clicking a row opens the sidebar audit on that file.
+ * 两个数据源在这里合流：工具侧的改动直接来自会话快照（`deriveSessionChanges`
+ * 的 live 轮），终端 / PowerShell 写盘来自 warm 过的 fs-changes 缓存
+ * （live-tail 条目）。回合空闲或没有任何改动时渲染空——轮结束后由轮尾卡片
+ * 接手。
+ *
+ * 交互契约与轮尾卡片完全一致：文件列表最多露四行、超出滚动；悬停某行弹出
+ * 与本框对齐的共用 DiffPopover；点击某行在侧边栏打开该文件的审计。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ConversationSnapshot, ISessions, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ISessions, SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { InputState } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { ChatSnapshot, UseChat } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { NS } from './chat-locales.ts'
 import { basename, type ProducedFileReview } from './turn-deliverables.ts'
 import { deriveSessionChanges } from './session-changes.ts'
@@ -23,50 +26,63 @@ import { DiffPopover, type PopoverAnchorRect } from './diff-popover.tsx'
 import { summarizeDiffs } from './UnifiedDiff.tsx'
 import css from './ProducedFiles.module.css'
 
-/** Owner share of the input-zone slots: point-in-time snapshots, re-rendered by the skeleton. */
+/**
+ * Owner share of the input-zone slot（dsh 0.1.2 `InputZone`：会话生命周期
+ * 快照 + 输入机状态），外加 session 槽位的标准 props——`useChat` 由 ui-chat
+ * 并入 SessionStandardProps，组件用它读取本会话的 Chat 快照（会话变更
+ * 推导的数据源；旧 runtime 的 ConversationSnapshot 随包移除）。
+ */
 interface LiveBarOwner {
-  readonly session: ConversationSnapshot
-  readonly input: unknown
+  readonly session: SessionSnapshot
+  readonly input: InputState
 }
 
-export type LiveChangesBarProps = LiveBarOwner & PropsLocale<typeof NS>
+export type LiveChangesBarProps = LiveBarOwner & {
+  /** 框架解析出的会话标识（session 作用域槽位的标准 props）。 */
+  readonly sessionId: SessionId
+  /** 选取当前 Conversation 绑定之 Chat 目标的 selector hook。 */
+  readonly useChat: UseChat
+} & PropsLocale<typeof NS>
 
-// The input.dock seat has no inject face; the sessions handle and the sidebar
-// opener ride module bindings set once by applyFileReview.
+// input.dock 这个座位没有 inject 面：会话句柄与侧边栏 opener 只能靠模块级
+// 绑定带进来，由 applyFileReview 设置一次。
 let sessionsRef: ISessions | undefined
 let openSidebarRef: ((sessionId: string, paths: readonly string[], turn?: number) => void) | undefined
 
-/** Called once from applyFileReview so the bar can resolve the session cwd. */
+/** 由 applyFileReview 调用一次，让 live 条能解析出会话工作区目录。 */
 export function bindLiveBarSessions(sessions: ISessions): void {
   sessionsRef = sessions
 }
 
-/** Called once from applyFileReview so row clicks open the sidebar audit. */
+/** 由 applyFileReview 调用一次，让点击行能在侧边栏打开审计。 */
 export function bindLiveBarOpenSidebar(
   opener: (sessionId: string, paths: readonly string[], turn?: number) => void,
 ): void {
   openSidebarRef = opener
 }
 
+/** 读会话 cwd；绑定缺席时返回 undefined（调用方一律当作「无法解析」处理）。 */
 function liveBarCwd(sessionId: string): string | undefined {
   return sessionsRef?.list.getSnapshot().byId[sessionId as SessionId]?.cwd
 }
 
-export function LiveChangesBar({ session, t }: LiveChangesBarProps) {
-  const snapshot = session
-  const sessionId = String(snapshot.sessionId)
-  const cwd = liveBarCwd(sessionId)
+export function LiveChangesBar({ session, sessionId, useChat, t }: LiveChangesBarProps) {
+  // 会话变更的数据源是 Chat 目标快照（标准 props 的 useChat hook）；
+  // session（InputZone 的 SessionSnapshot）只提供生命周期刷新信号。
+  const chat: ChatSnapshot = useChat((value) => value)
+  const id = String(sessionId)
+  const cwd = liveBarCwd(id)
   const [cacheTick, setCacheTick] = useState(0)
 
-  // Snapshot changes re-render this component (point-in-time owner share);
-  // piggyback a throttled warm so the fs cache tracks the live turn.
+  // 快照变化会让本组件重渲染（owner share 是时点值）；顺手搭一次 warm，
+  // 让 fs 缓存跟上正在进行的这一轮。
   useEffect(() => {
-    warmFsChanges(sessionId)
-  }, [snapshot, sessionId])
+    warmFsChanges(id)
+  }, [session, chat, id])
 
   useEffect(() => subscribeFsCache(() => { setCacheTick(value => value + 1) }), [])
 
-  const turns = useMemo(() => deriveSessionChanges(snapshot), [snapshot])
+  const turns = useMemo(() => deriveSessionChanges(chat), [chat])
   const liveTurn = turns.find(turn => turn.live)
   const liveTurnNumber = liveTurn?.turn
 
@@ -80,7 +96,7 @@ export function LiveChangesBar({ session, t }: LiveChangesBarProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveTurnNumber, sessionId, cacheTick])
 
-  // Hover popover anchored to THIS frame (same contract as the card).
+  // 悬停浮层锚定在**本框**上（与卡片同一套契约）。
   const [popover, setPopover] = useState<{ review: ProducedFileReview; rect: PopoverAnchorRect } | null>(null)
   const barRef = useRef<HTMLDivElement | null>(null)
   const showTimerRef = useRef<number | null>(null)

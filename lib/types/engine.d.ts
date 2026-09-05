@@ -1,5 +1,6 @@
 import { WorkspaceStore } from './store.js';
-import { type ResolvedShadowRewindConfig, type RestorePlan, type RestorePointKind, type RestorePointSummary, type RestoreResult, type ShadowRewindConfig, type SkippedPath, type SnapshotEntry, type WorkspaceChange } from './types.js';
+import type { TurnIntent } from './types.js';
+import { type ResolvedShadowRewindConfig, type RestorePlan, type RestorePointKind, type RestorePointSummary, type RestoreResult, type RestoreUndoResult, type ShadowRewindConfig, type SkippedPath, type SnapshotEntry, type WorkspaceChange } from './types.js';
 /** 默认排除清单：VCS 目录、依赖、构建产物与常见缓存（自用取向：宁多勿漏）。 */
 export declare const DEFAULT_EXCLUDES: readonly string[];
 /** 解析配置：全部字段落定；非法值直接抛错（宁可拒绝启动也不带病运行）。 */
@@ -11,26 +12,29 @@ export declare class ShadowRewindEngine {
     /** 启动恢复完成后的信号（恢复条数）。 */
     readonly ready: Promise<number>;
     /**
-     * 实际生效的内容后端：配置为 jj 但宿主机缺 CLI 时自动降级为 blob
-     * （自动检查点不断档）；显式配置 legacy/off 不受影响。
+     * 实际生效的内容后端：配置为 jj 但宿主机缺 CLI 时自动降级为内置
+     * SQLite 内容库（自动检查点不断档）；显式配置 sqlite/off 不受影响。
      */
-    readonly effectiveBackend: 'jj' | 'blob';
+    readonly effectiveBackend: 'jj' | 'sqlite';
     /** 降级原因（未降级时为 undefined）。 */
     readonly downgradeReason?: string;
     private readonly excludes;
     private readonly plans;
     private readonly applying;
     private readonly shadowRepos;
+    /** 恢复后单次撤销（B1）：workspace → 最近一次恢复的逐路径 before/after。
+     * 进程内记录，重启即失效；每次 applyRestore 替换上一次（无 redo）。 */
+    private readonly undoRecords;
     constructor(config?: ShadowRewindConfig);
     /** 自动检查点是否被配置关闭（与降级区分）。 */
     get turnCheckpointsDisabled(): boolean;
     private assertReady;
     private shadowRepo;
     /**
-     * 扫描 + 捕获当前树（共用 stat 缓存增量，blob 与 jj 后端同路径）。
+     * 扫描 + 捕获当前树（共用 stat 缓存增量，sqlite 与 jj 后端同路径）。
      *  - mode = 'inspect'：只构建 entries（供对比/计划）；缓存只读不写回，
      *    避免把对比时刻的 stat 事实污染成下一次持久捕获的增量依据；
-     *  - mode = 'persist'：新读内容写入内容后端（blob putBlob / jj 镜像提交），
+     *  - mode = 'persist'：新读内容写入内容后端（sqlite 批量入库 / jj 镜像提交），
      *    并写回缓存，返回 commitId。
      */
     private captureTree;
@@ -58,6 +62,8 @@ export declare class ShadowRewindEngine {
         readonly turn: number;
         readonly turnStartSeq: number;
         readonly phase?: 'start' | 'end';
+        /** 轮末检查点的本轮内容型工具调用摘要（仅 phase='end' 合法）。 */
+        readonly intent?: readonly TurnIntent[];
         readonly signal?: AbortSignal;
     }): Promise<RestorePointSummary>;
     /** 查找一个回合的轮起检查点（可选校验 turnStartSeq；轮末相位不参与恢复点查找）。 */
@@ -111,6 +117,17 @@ export declare class ShadowRewindEngine {
         readonly checkpointId: string;
         readonly path: string;
     }): Promise<Buffer | null>;
+    /**
+     * 降级标注（degraded）：检查点的快照内容是否仍可读。抽样「最小的文件条目」
+     * 走真实读取路径探测两个后端（jj 影子仓库 / sqlite blob）；清单不存在或
+     * 抽样读取失败 = 不可读。只读探测，绝不写任何数据。
+     * 借鉴 dsh-checkpoint-diff 的 degraded 标注思路：丢失节点诚实标注，
+     * 而不是等到恢复/读取时才响亮报错。
+     */
+    checkpointContentReadable(options: {
+        readonly cwd: string;
+        readonly restorePointId: string;
+    }): Promise<boolean>;
     /** 实际创建 manifest 的内部路径：调用方必须已持有工作区锁。 */
     private createLocked;
     /** 列出恢复点（默认不含 turn 与 rescue；调用方按需打开）。 */
@@ -168,6 +185,22 @@ export declare class ShadowRewindEngine {
         readonly sessionId?: string;
         readonly signal?: AbortSignal;
     }): Promise<RestoreResult>;
+    /**
+     * 撤销最近一次恢复（B1，借鉴 dsh-checkpoint-diff 的 rollback-undo）。
+     *
+     * 语义：
+     *  - 进程内单次 undo，无 redo——记录随 applyRestore 替换、撤销成功即删除、
+     *    重启失效（真正的兜底是 rescue 备份点本身，它有独立配额与持久化）；
+     *  - 逐路径 CAS：当前磁盘条目必须仍等于「恢复后」的状态（内容寻址等价），
+     *    被后续改动过的路径跳过并如实报告，绝不猜着回退；全部跳过 → 409；
+     *  - 撤销动作复用 rescue 清单的 restorePaths（全套安全路径：围栏断言、
+     *    原子写、空目录回收、非空拒删）；before=null 的路径（恢复新建的）撤销
+     *    即删除——「绝不删除」的唯一例外，删的是恢复操作自己刚创建的文件。
+     */
+    undoLastRestore(options: {
+        readonly cwd: string;
+        readonly signal?: AbortSignal;
+    }): Promise<RestoreUndoResult>;
     /** 删除一个恢复点（确认串必须逐字等于 `DELETE <id>`）。 */
     delete(options: {
         readonly cwd: string;

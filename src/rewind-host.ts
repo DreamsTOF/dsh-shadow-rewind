@@ -5,7 +5,6 @@
  * 快照失败只记录、绝不阻塞用户回合。HTTP 端点负责消息→检查点解析、
  * 分页预览、计划生成与恢复执行；会话分叉交给 DSH 官方 create/fork。
  */
-import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { isAbsolute, relative, resolve } from 'node:path'
 import { diffLines } from 'diff'
@@ -14,11 +13,12 @@ import { ShadowRewindError, errorMessage } from './errors.js'
 import { canonicalDirectory } from './path-utils.js'
 import { isCheckpointSkipCode } from './engine.js'
 import { attributeFsChanges, attributePaths, serializeOwner } from './attribution.js'
+import { collectTurnIntent, traceNodes, traceRangeDiff, traceSpans, turnBoundaries } from './trace-replay.js'
 import type { FsAttribution, PathAttribution } from './attribution.js'
 import type { WorkspaceWriteGate } from './write-gate.js'
 import type { CommandWindowRegistry } from './command-windows.js'
 import type { ShadowRewindEngine } from './engine.js'
-import type { RestoreResult, WorkspaceChange } from './types.js'
+import type { RestorePointSummary, RestoreResult, TurnIntent, WorkspaceChange } from './types.js'
 
 export const REWIND_HTTP_PATH = '/shadow-rewind'
 /** 写入闸运行时开关的查询/翻转端点（仅回环；不持久化，重启回到配置初值）。 */
@@ -52,22 +52,45 @@ export interface PreStepData {
   readonly signal: AbortSignal
 }
 
+/**
+ * 宿主 session 面的单条事件（结构类型）。dsh 0.1.2 的 `Session.snapshotEvents()`
+ * 返回的是冻结的核心事件记录（字段更丰富），此处只消费 type/seq/data，结构兼容。
+ */
+export interface SessionLogEvent {
+  readonly type: string
+  readonly seq: number
+  readonly data: {
+    readonly turn?: number
+    readonly source?: unknown
+  }
+}
+
 /** 引擎用到的 agent/会话最小面。 */
 export interface AgentFace {
   readonly id: string
   readonly status: string
   readonly session: {
     readonly id: string
-    readonly header: { readonly cwd?: string }
-    readonly events: readonly {
-      readonly type: string
-      readonly seq: number
-      readonly data: {
-        readonly turn?: number
-        readonly source?: unknown
-      }
-    }[]
+    readonly header: { readonly cwd?: string; readonly parentSession?: string }
+    /**
+     * dsh ≤0.1.1 的 runtime 会话面把事件暴露为数组 `events`；0.1.2 起核心
+     * `Session` 改为 `snapshotEvents()` 方法（无 `events` 字段）。两态并存，
+     * 读取统一走 {@link sessionEvents}。
+     */
+    readonly events?: readonly SessionLogEvent[]
+    readonly snapshotEvents?: () => readonly SessionLogEvent[]
   }
+}
+
+/**
+ * 读会话事件：兼容 0.1.2 `Session.snapshotEvents()` 与旧 runtime 的 `events`
+ * 数组两种形态（事件面缺失返回空，不抛错）。
+ */
+export function sessionEvents(session: { readonly events?: readonly SessionLogEvent[]; readonly snapshotEvents?: () => readonly SessionLogEvent[] } | undefined | null): readonly SessionLogEvent[] {
+  if (session === undefined || session === null) return []
+  if (Array.isArray(session.events)) return session.events
+  const via = session.snapshotEvents?.()
+  return via ?? []
 }
 
 /** 每回合第一步之前抢占快照（失败可跳过、可重试，绝不阻塞回合）。 */
@@ -114,7 +137,7 @@ export class TurnCheckpointCoordinator {
     if (cwd === undefined || cwd.trim() === '') return
     const key = checkpointKey(session.id, turn)
     if (this.endCaptures.has(key)) return
-    const start = findLast(session.events, (e) => e.type === 'turn/start' && e.data.turn === turn)
+    const start = findLast(sessionEvents(session), (e) => e.type === 'turn/start' && e.data.turn === turn)
     if (start === undefined) {
       ctx.logger.warn(`[shadow-rewind] 回合 ${String(turn)} 轮末检查点跳过：找不到 turn/start 事件`)
       return
@@ -122,6 +145,9 @@ export class TurnCheckpointCoordinator {
     this.endCaptures.add(key)
     const timeoutMs = this.engine.config.turnCheckpointTimeoutMs
     const deadline = createDeadline(timeoutMs)
+    // 意图标签（A2）：轮窗口内的内容型工具调用摘要——回答「这一轮是谁改的」。
+    // 从会话事件读取，尽力而为：解析失败只少标签，不影响检查点本身。
+    const intent = collectTurnIntent(sessionEvents(session), start.seq)
     try {
       await this.serializeWorkspace(cwd, deadline.signal, async () => {
         await this.engine.createTurnCheckpoint({
@@ -130,6 +156,7 @@ export class TurnCheckpointCoordinator {
           turn,
           turnStartSeq: start.seq,
           phase: 'end',
+          ...(intent.length > 0 ? { intent } : {}),
           signal: deadline.signal,
         })
         void bumpWorkspaceRevision(cwd)
@@ -163,7 +190,7 @@ export class TurnCheckpointCoordinator {
     }
     const cwd = agent.session.header.cwd
     if (cwd === undefined) return
-    const start = findLast(agent.session.events, (event) => event.type === 'turn/start' && event.data.turn === turn)
+    const start = findLast(sessionEvents(agent.session), (event) => event.type === 'turn/start' && event.data.turn === turn)
     if (start === undefined) {
       this.failures.set(key, '第一步之前找不到 turn/start 事件')
       return
@@ -323,23 +350,97 @@ interface Response {
   on(event: 'error', listener: (error: unknown) => void): void
 }
 
+/** 宿主 session 持久化快照的冷读返回（session-query `readSession` 的 0.1.2 形状）。 */
+export interface SessionLogSnapshotLike {
+  readonly session: {
+    readonly id: string
+    readonly cwd?: string
+    readonly parentSession?: string
+    /** dsh ≤0.1.1 头部字段；0.1.2 起被 `isSeeded` + `inheritedEventCount` 取代。 */
+    readonly seedLength?: number
+  }
+  /** dsh 0.1.2 起：fork 继承事件前缀长度（seedLength 的替代）。 */
+  readonly inheritedEventCount?: number
+  readonly events?: readonly unknown[]
+}
+
+/** 宿主会话对象最小面：兼容核心 `Session` 与旧 runtime agent 包装两态。 */
+export interface HostSessionCore {
+  readonly id?: string
+  readonly header?: { readonly cwd?: string; readonly parentSession?: string; readonly seedLength?: number }
+  /** dsh 0.1.2 起 `Session` 的核心面：fork 继承事件前缀长度。 */
+  readonly inheritedEventCount?: number
+  readonly events?: readonly SessionLogEvent[]
+  readonly snapshotEvents?: () => readonly SessionLogEvent[]
+}
+/** agents/sessions 服务 get() 的返回面（容忍 agent 包装 `.session`）。 */
+export type HostSessionLike = HostSessionCore & {
+  readonly session?: HostSessionCore
+  readonly status?: string
+}
+
+/** dsh 0.1.2 的 SessionController 服务最小面（apiProxy 被移除后的替代入口）。 */
+export interface SessionControllerLike {
+  create(payload: { readonly cwd?: string; readonly sessionId?: string; readonly workspaceId?: string }): Promise<{ readonly sessionId: string; readonly agentPreset?: string }>
+  fork(payload: { readonly sessionId: string; readonly atSeq?: number }): Promise<{ readonly sessionId: string }>
+}
+
 /** 宿主给 HTTP 层的服务面（会话读取 / 分叉 / 活跃 agent 列表）。 */
 export interface RewindHttpDeps {
   readonly logger: { warn(message: string): void }
   readonly sessions: {
-    get(sessionId: string): AgentFace | undefined
+    get(sessionId: string): HostSessionLike | undefined
   }
   readonly sessionQuery: {
-    readSession(sessionId: string): Promise<{ session: { id: string; cwd?: string; parentSession?: string; seedLength?: number }; events: readonly unknown[] }>
+    readSession(sessionId: string): Promise<SessionLogSnapshotLike>
   }
-  readonly apiProxy: {
-    readonly sessions: {
-      create(payload: { rpcId: string; payload: { cwd: string } }): Promise<{ result: { ok: boolean; value?: { sessionId?: string }; error?: { message: string } } }>
-      fork(payload: { rpcId: string; payload: { sessionId: string; atSeq: number } }): Promise<{ result: { ok: boolean; value?: { sessionId?: string }; error?: { message: string } } }>
-    }
-  }
+  /**
+   * 会话 create/fork（会话「恢复并继续」的分叉落点）。dsh 0.1.1 及更早由
+   * `ctx.apiProxy` 提供（RPC 信封形状）；0.1.2 起 apiProxy 移除，会话网关
+   * 收敛为 `ctx.sessionController`（直连方法，错误以 throw 表达）。
+   */
+  readonly sessionController: SessionControllerLike
   readonly agents: {
     list(): readonly AgentFace[]
+  }
+}
+
+/**
+ * 归一化宿主会话读取：把 live（ctx.sessions.get）与冷读（sessionQuery
+ * readSession）两种来源统一成 `{ id, header{...,seedLength}, events }`，
+ * 并把 0.1.2 的 `inheritedEventCount` 映射回插件内部使用的 `seedLength`
+ * 语义（fork 继承边界 = 继承事件前缀长度），下游逻辑零改动。
+ */
+async function readSession(
+  deps: Pick<RewindHttpDeps, 'sessions' | 'sessionQuery'>,
+  sessionId: string,
+): Promise<{ id: string; header: { cwd?: string; parentSession?: string; seedLength?: number }; events: readonly SessionEvent[] }> {
+  const live = deps.sessions.get(sessionId)
+  if (live !== undefined) {
+    const core: HostSessionCore | undefined = live.session ?? live
+    const header = core?.header
+    const inherited = core?.inheritedEventCount ?? header?.seedLength
+    return {
+      id: core?.id ?? live.id ?? sessionId,
+      header: {
+        ...(header?.cwd === undefined ? {} : { cwd: header.cwd }),
+        ...(header?.parentSession === undefined ? {} : { parentSession: header.parentSession }),
+        ...(inherited === undefined ? {} : { seedLength: inherited }),
+      },
+      events: sessionEvents(core ?? live) as readonly SessionEvent[],
+    }
+  }
+  const stored = await deps.sessionQuery.readSession(sessionId)
+  const header = stored.session
+  const inherited = stored.inheritedEventCount ?? header.seedLength
+  return {
+    id: header.id ?? sessionId,
+    header: {
+      ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
+      ...(header.parentSession === undefined ? {} : { parentSession: header.parentSession }),
+      ...(inherited === undefined ? {} : { seedLength: inherited }),
+    },
+    events: (stored.events ?? []) as readonly SessionEvent[],
   }
 }
 
@@ -367,6 +468,52 @@ export function installShadowRewindHttp(ctx: RewindHttpDeps & { webServer?: { re
     path: `${REWIND_HTTP_PATH}/fs-changes`,
     handler: (request, response) => handleFsChangesHttp(ctx, engine, request, response, writeGate, commandWindows),
   })
+  // 新增：轨迹时间线 + 区间 diff（轨迹重放 / 快照对比二选一）。
+  ctx.webServer?.register({
+    kind: 'exact',
+    path: `${REWIND_HTTP_PATH}/trace`,
+    handler: (request, response) => handleTraceHttp(ctx, engine, request, response),
+  })
+  // 新增：撤销最近一次恢复（B1，进程内单次 undo）。
+  ctx.webServer?.register({
+    kind: 'exact',
+    path: `${REWIND_HTTP_PATH}/restore-undo`,
+    handler: (request, response) => handleRestoreUndoHttp(ctx, engine, request, response),
+  })
+}
+
+/** POST /shadow-rewind/restore-undo：撤销该会话工作区最近一次恢复。 */
+async function handleRestoreUndoHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, request: Request, response: Response): Promise<void> {
+  try {
+    if (!isLoopback(request.socket.remoteAddress)) {
+      json(response, 403, { error: 'forbidden', code: 'FORBIDDEN' })
+      return
+    }
+    if (request.method !== 'POST') {
+      json(response, 405, { error: 'method not allowed', code: 'METHOD_NOT_ALLOWED' })
+      return
+    }
+    const body = await readJsonBody(request) as { sessionId?: unknown; cwd?: unknown }
+    let cwd = typeof body.cwd === 'string' && body.cwd.trim() !== '' ? body.cwd : undefined
+    if (cwd === undefined) {
+      const sessionId = typeof body.sessionId === 'string' && body.sessionId !== '' ? body.sessionId : null
+      if (sessionId === null) {
+        throw new ShadowRewindError('INVALID_ARGUMENTS', 'sessionId 与 cwd 必须提供其一')
+      }
+      const session = await readSession(deps, sessionId)
+      cwd = session.header.cwd
+    }
+    if (cwd === undefined || cwd.trim() === '') {
+      throw new ShadowRewindError('INVALID_ARGUMENTS', '无法定位工作区（会话没有 cwd）')
+    }
+    const result = await engine.undoLastRestore({ cwd })
+    json(response, 200, result)
+  } catch (error) {
+    json(response, 409, {
+      error: errorMessage(error),
+      code: error instanceof ShadowRewindError ? error.code : 'RESTORE_UNDO_FAILED',
+    })
+  }
 }
 
 async function handleGateHttp(deps: RewindHttpDeps, writeGate: WorkspaceWriteGate, request: Request, response: Response): Promise<void> {
@@ -568,6 +715,9 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
           // 跳过项逐条透传 {path, reason}——用户必须能看到具体哪些文件
           // 不在快照内、为什么，而不是只给一个数字。
           skippedPaths: inspection.skippedPaths.map((skip) => ({ path: skip.path, reason: skip.reason })),
+          // 工作区绝对路径：恢复预览的行级 diff（当前 → 快照）按需拉两侧
+          // 全文时要用（/shadow-rewind/file 端点的 cwd 参数）。只增字段，旧客户端忽略。
+          workspace: checkpoint.cwd,
         }
       if (inspection.changes.length === 0 || detailsOnly || restoreBlocked) {
         json(response, 200, common)
@@ -652,23 +802,6 @@ interface MessageTarget {
   readonly turn: number
   readonly turnStartSeq: number
   readonly previousTurnEndSeq?: number
-}
-
-async function readSession(deps: RewindHttpDeps, sessionId: string): Promise<{ id: string; header: { cwd?: string; parentSession?: string; seedLength?: number }; events: readonly SessionEvent[] }> {
-  const live = deps.sessions.get(sessionId)
-  if (live !== undefined) {
-    return {
-      id: live.id,
-      header: live.session.header,
-      events: live.session.events as readonly SessionEvent[],
-    }
-  }
-  const stored = await deps.sessionQuery.readSession(sessionId)
-  return {
-    id: stored.session.id,
-    header: { cwd: stored.session.cwd, parentSession: stored.session.parentSession, seedLength: stored.session.seedLength },
-    events: stored.events as readonly SessionEvent[],
-  }
 }
 
 interface SessionEvent {
@@ -904,13 +1037,16 @@ async function createConversationRestart(deps: RewindHttpDeps, sourceId: string,
     || current.previousTurnEndSeq !== checkpoint.previousTurnEndSeq) {
     throw new ShadowRewindError('PLAN_STALE', '会话中已找不到所选消息的回合边界')
   }
-  const response = checkpoint.previousTurnEndSeq === undefined
-    ? await deps.apiProxy.sessions.create({ rpcId: randomUUID(), payload: { cwd: checkpoint.cwd } })
-    : await deps.apiProxy.sessions.fork({ rpcId: randomUUID(), payload: { sessionId: sourceId, atSeq: checkpoint.previousTurnEndSeq } })
-  if (!response.result.ok) {
-    throw new ShadowRewindError('CONVERSATION_REWIND_FAILED', response.result.error?.message ?? '未知错误')
+  try {
+    // dsh 0.1.2 起 apiProxy 移除：会话网关收敛为 `ctx.sessionController`
+    // （方法直连、错误以 throw 表达），不再包 RPC 信封。
+    const sessionId = checkpoint.previousTurnEndSeq === undefined
+      ? (await deps.sessionController.create({ cwd: checkpoint.cwd })).sessionId
+      : (await deps.sessionController.fork({ sessionId: sourceId, atSeq: checkpoint.previousTurnEndSeq })).sessionId
+    return { sessionId }
+  } catch (error) {
+    throw new ShadowRewindError('CONVERSATION_REWIND_FAILED', errorMessage(error), { cause: error })
   }
-  return { sessionId: requiredText(response.result.value?.sessionId, 'fork sessionId') }
 }
 
 function messageTarget(session: { id: string; header: { cwd?: string }; events: readonly SessionEvent[] }, messageSeq: number): MessageTarget {
@@ -1241,6 +1377,10 @@ interface TurnFsChange {
   readonly checkpointId: string
   readonly nextCheckpointId: string
   readonly live?: true
+  /** 本轮内容型工具调用摘要（轮末检查点的 intent；live 轮从会话事件即时采集）。 */
+  readonly intent?: readonly TurnIntent[]
+  /** 检查点快照内容抽样不可读（影子仓库丢失 / sqlite 受损等）：诚实标注。 */
+  readonly degraded?: true
   readonly changes: readonly FsChangeItem[]
 }
 
@@ -1271,6 +1411,8 @@ async function computeTurnFsChanges(
     }
     /** 归属终点：优先同轮轮末检查点（精确轮末树），回退下一轮轮起（旧语义）。 */
     readonly pairEnd?: { readonly id: string; readonly createdAt: number }
+    /** 本轮意图摘要（配对轮取轮末检查点 manifest；live 轮由调用方从会话事件采集）。 */
+    readonly intent?: readonly TurnIntent[]
     /** live-tail：无配对终点，对比源是当前磁盘。 */
     readonly live?: boolean
     readonly gateEnabled: boolean
@@ -1295,7 +1437,7 @@ async function computeTurnFsChanges(
       // 空目录的纯权限位变化没有可撤销语义，直接省略。
       && !(change.kind === 'mode-changed' && change.before?.kind === 'dir'))
     if (raw.length === 0) {
-      return finishTurnFsChange(current, live, pairEnd, [])
+      return finishTurnFsChange(current, live, pairEnd, [], options.intent)
     }
     // 窗口 (current, pairEnd] 落盘者未必是本会话（其它会话的检查点窗口会
     // 插进来）。先用窗口内快照做网格归属，再用终值证据（净值内容 mtime ×
@@ -1354,7 +1496,7 @@ async function computeTurnFsChanges(
         ...(attr.writtenAt === undefined ? {} : { writtenAt: attr.writtenAt }),
       }
     }))
-    return finishTurnFsChange(current, live, pairEnd, changes)
+    return finishTurnFsChange(current, live, pairEnd, changes, options.intent)
   } catch (error) {
     // 单轮对比失败只跳过该轮；对比失败不影响整体响应。
     deps.logger.warn(`[shadow-rewind] 轮 ${String(current.turn)} ${live ? 'live ' : ''}文件系统差异计算失败：${errorMessage(error)}`)
@@ -1367,6 +1509,7 @@ function finishTurnFsChange(
   live: boolean,
   pairEnd: { readonly id: string },
   changes: readonly FsChangeItem[],
+  intent?: readonly TurnIntent[],
 ): TurnFsChange {
   return {
     turn: current.turn,
@@ -1374,7 +1517,127 @@ function finishTurnFsChange(
     checkpointId: current.id,
     nextCheckpointId: pairEnd.id,
     ...(live ? { live: true as const } : {}),
+    ...(intent !== undefined && intent.length > 0 ? { intent } : {}),
     changes,
+  }
+}
+
+/** 并行只读探测检查点内容可读性；返回「不可读」的 id 集合（探测失败也算不可读）。 */
+async function probeUnreadableCheckpoints(engine: ShadowRewindEngine, cwd: string, ids: ReadonlySet<string>): Promise<Set<string>> {
+  const unreadable = new Set<string>()
+  await Promise.all([...ids].map(async (id) => {
+    try {
+      if (!(await engine.checkpointContentReadable({ cwd, restorePointId: id }))) unreadable.add(id)
+    } catch {
+      unreadable.add(id)
+    }
+  }))
+  return unreadable
+}
+
+/**
+ * GET /shadow-rewind/trace：轨迹时间线（A1 轨迹重放 + B2 降级标注的统一入口）。
+ *
+ * 不带 from/to：返回时间线数据——tool/call 边界节点（trace:<seq>）与全部
+ * turn 检查点摘要（含 intent 与 degraded 标注）。
+ * 带 from/to：两种寻址（不可混用）——
+ *  - `trace:<seq>` / 裸 seq：轨迹重放区间 diff（只覆盖内容型工具，附盲区 notes）；
+ *  - `rp_...` 检查点 id：两个快照的逐文件对比 + 行数（内容经 /file 端点懒取）。
+ */
+async function handleTraceHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, request: Request, response: Response): Promise<void> {
+  try {
+    if (!isLoopback(request.socket.remoteAddress)) {
+      json(response, 403, { error: 'forbidden', code: 'FORBIDDEN' })
+      return
+    }
+    if (request.method !== 'GET') {
+      json(response, 405, { error: 'method not allowed', code: 'METHOD_NOT_ALLOWED' })
+      return
+    }
+    const url = new URL(request.url ?? REWIND_HTTP_PATH, 'http://dsh.local')
+    const sessionId = requiredText(url.searchParams.get('sessionId'), 'sessionId')
+    const session = await readSession(deps, sessionId)
+    const cwd = session.header.cwd
+    const nodes = traceNodes(session.events)
+    const from = url.searchParams.get('from')
+    const to = url.searchParams.get('to')
+    if (from === null && to === null) {
+      // 时间线面：轨迹节点 + 检查点摘要（degraded 并行探测，尽力而为）
+      // + 三泳道 spans/turn 刻度（拖选时间线渲染用）。
+      let checkpoints: readonly (RestorePointSummary & { readonly degraded?: true })[] = []
+      if (cwd !== undefined && cwd.trim() !== '') {
+        checkpoints = await engine.listTurnCheckpoints({ cwd, sessionId })
+        const unreadable = await probeUnreadableCheckpoints(engine, cwd, new Set(checkpoints.map((point) => point.id)))
+        checkpoints = checkpoints.map((point) => unreadable.has(point.id) ? { ...point, degraded: true as const } : point)
+      }
+      json(response, 200, {
+        sessionId,
+        ...(cwd === undefined ? {} : { cwd }),
+        nodes,
+        checkpoints,
+        spans: traceSpans(session.events),
+        turnBoundaries: turnBoundaries(session.events),
+      })
+      return
+    }
+    if (from === null || to === null) {
+      throw new ShadowRewindError('INVALID_ARGUMENTS', 'from 与 to 必须成对提供')
+    }
+    if (cwd === undefined || cwd.trim() === '') {
+      throw new ShadowRewindError('INVALID_ARGUMENTS', '会话没有工作区，无法对比')
+    }
+    if (from.startsWith('rp_') !== to.startsWith('rp_')) {
+      throw new ShadowRewindError('INVALID_ARGUMENTS', '快照检查点与轨迹节点不可混用（两种寻址二选一）')
+    }
+    if (from.startsWith('rp_')) {
+      // 快照 vs 快照：diffCheckpoints + 共享行数预算（内容懒取走 /file）。
+      const fromId = requiredText(from, 'from')
+      const toId = requiredText(to, 'to')
+      const fsDiff = await engine.diffCheckpoints({ cwd, prevCheckpointId: fromId, currCheckpointId: toId })
+      const countBudget = { remaining: DIFF_COUNT_BUDGET }
+      const changes = await Promise.all(fsDiff.changes
+        .filter((change) => change.kind !== 'type-changed')
+        .map(async (change) => {
+          const [beforeBuf, afterBuf] = await Promise.all([
+            change.before === undefined ? Promise.resolve(null) : readChangeSide(engine, cwd, fromId, change.path),
+            change.after === undefined ? Promise.resolve(null) : readChangeSide(engine, cwd, toId, change.path),
+          ])
+          const beforeText = beforeBuf === null ? null : decodeUtf8(beforeBuf)
+          const afterText = afterBuf === null ? null : decodeUtf8(afterBuf)
+          let counts: { added: number; removed: number } | undefined
+          if (countBudget.remaining > 0 && (beforeText !== null || afterText !== null)) {
+            countBudget.remaining -= 1
+            // 单侧缺失 = added/deleted：行数按现存一侧计（与 fs-changes 语义一致）。
+            counts = beforeText === null
+              ? { added: countLines(afterText ?? ''), removed: 0 }
+              : afterText === null
+                ? { added: 0, removed: countLines(beforeText) }
+                : lineCounts(beforeText, afterText)
+          }
+          return {
+            path: change.path,
+            kind: change.kind === 'mode-changed' ? 'modified' as const : change.kind,
+            ...(change.before?.kind === 'file' ? { oldMode: change.before.mode } : {}),
+            ...(change.after?.kind === 'file' ? { newMode: change.after.mode } : {}),
+            ...(counts === undefined ? {} : { added: counts.added, removed: counts.removed }),
+          }
+        }))
+      json(response, 200, { sessionId, cwd, mode: 'checkpoint', from: fromId, to: toId, changes })
+      return
+    }
+    // 轨迹 vs 轨迹：内容重放区间 diff。
+    const fromSeq = nonNegativeInteger(from.replace(/^trace:/, ''), 'from')
+    const toSeq = nonNegativeInteger(to.replace(/^trace:/, ''), 'to')
+    if (fromSeq >= toSeq) {
+      throw new ShadowRewindError('INVALID_ARGUMENTS', 'from 必须小于 to（区间语义 (from, to]）')
+    }
+    const result = traceRangeDiff(session.events, fromSeq, toSeq)
+    json(response, 200, { sessionId, cwd, mode: 'trace', from: fromSeq, to: toSeq, changes: result.changes, notes: result.notes })
+  } catch (error) {
+    json(response, 409, {
+      error: errorMessage(error),
+      code: error instanceof ShadowRewindError ? error.code : 'TRACE_FAILED',
+    })
   }
 }
 
@@ -1434,6 +1697,8 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
           turnStartSeq: current.turnStartSeq,
         },
         pairEnd,
+        // 意图摘要来自轮末检查点（旧数据无轮末快照则无标签）。
+        ...(pairEnd?.intent !== undefined ? { intent: pairEnd.intent } : {}),
         gateEnabled: writeGate.isEnabled,
         commandWindows,
         countBudget,
@@ -1459,17 +1724,200 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
           turnStartSeq: last.turnStartSeq,
         },
         live: true,
+        // live 轮的意图摘要从会话事件即时采集（轮末检查点尚未产生）。
+        ...(last.turnStartSeq !== undefined ? { intent: collectTurnIntent(session.events, last.turnStartSeq) } : {}),
         gateEnabled: writeGate.isEnabled,
         commandWindows,
         countBudget,
       })
       if (computed !== undefined && computed.changes.length > 0) turns.push(computed)
     }
-    json(response, 200, { sessionId, rev: await workspaceRevision(cwd), turns })
+    // 降级标注（B2）：并行只读探测本请求涉及的检查点内容可读性，丢失的
+    // 诚实标 degraded——不静默、也不阻断清单（恢复时仍会 fail-closed）。
+    const checkpointIds = new Set<string>()
+    for (const turn of turns) {
+      checkpointIds.add(turn.checkpointId)
+      if (turn.nextCheckpointId !== 'live') checkpointIds.add(turn.nextCheckpointId)
+    }
+    const unreadable = await probeUnreadableCheckpoints(engine, cwd, checkpointIds)
+    const marked = turns.map((turn) => {
+      const degraded = unreadable.has(turn.checkpointId) || unreadable.has(turn.nextCheckpointId)
+      return degraded ? { ...turn, degraded: true as const } : turn
+    })
+    json(response, 200, { sessionId, rev: await workspaceRevision(cwd), turns: marked })
   } catch (error) {
     json(response, 409, {
       error: errorMessage(error),
       code: error instanceof ShadowRewindError ? error.code : 'FS_CHANGES_FAILED',
     })
+  }
+}
+
+// ── headless 命令面（A4，借鉴 dsh-checkpoint-diff 的 /diff、/rollback）──────
+// dsh 0.1.2 的命令系统是 cordis 服务 `commands`（CommandRuntime.register），
+// 命令不产生模型消息，结果由 UI 直接渲染——脚本与 CLI 也能消费。
+
+/** 命令注册面（结构类型；`commands` 服务缺失时注册静默跳过，不 pending）。 */
+export interface ShadowRewindCommandsHost {
+  readonly commands?: {
+    register(definition: {
+      readonly name: string
+      readonly description: string
+      readonly input?: { readonly hint: string }
+      readonly handler: (invocation: ShadowRewindCommandInvocation) => Promise<ShadowRewindCommandResult> | ShadowRewindCommandResult
+    }): () => void
+  }
+}
+
+export interface ShadowRewindCommandInvocation {
+  readonly agent: AgentFace
+  readonly rawInput: string
+  readonly signal?: AbortSignal
+}
+
+export interface ShadowRewindCommandResult {
+  readonly kind: 'success' | 'error'
+  readonly text: string
+}
+
+const COMMAND_DIFF_USAGE = '用法：/shadow-diff [起] [终]\n起/终可以是：轮号（如 3）、检查点 id（rp_…）、轨迹节点（trace:序号）。\n省略「终」时对比「该轮轮起 → 该轮轮末（或下一轮轮起）」。'
+/** 命令输出的行数上限（聊天输出不是导出工具，防刷屏）。 */
+const COMMAND_MAX_ROWS = 40
+
+/** 注册 headless 命令：/shadow-diff（区间 diff 摘要）与 /shadow-undo（撤销最近一次恢复）。 */
+export function installShadowRewindCommands(ctx: ShadowRewindCommandsHost, engine: ShadowRewindEngine): void {
+  ctx.commands?.register({
+    name: 'shadow-diff',
+    description: 'shadow-rewind：两个时间节点之间的文件变更摘要（轮号 / 检查点 id / trace 序号）',
+    input: { hint: '[起] [终]' },
+    handler: (invocation) => runShadowDiffCommand(engine, invocation),
+  })
+  ctx.commands?.register({
+    name: 'shadow-undo',
+    description: 'shadow-rewind：撤销这个工作区最近一次文件恢复',
+    handler: (invocation) => runShadowUndoCommand(engine, invocation),
+  })
+}
+
+type DiffTarget =
+  | { readonly kind: 'turn'; readonly turn: number }
+  | { readonly kind: 'checkpoint'; readonly id: string }
+  | { readonly kind: 'trace'; readonly seq: number }
+
+function parseDiffTarget(token: string): DiffTarget | null {
+  if (/^rp_[0-9a-z]+_[0-9a-f]{12}$/.test(token)) return { kind: 'checkpoint', id: token }
+  if (/^trace:[0-9]+$/.test(token)) return { kind: 'trace', seq: Number(token.slice('trace:'.length)) }
+  if (/^[0-9]+$/.test(token) && token.length <= 9) return { kind: 'turn', turn: Number(token) }
+  return null
+}
+
+async function runShadowDiffCommand(engine: ShadowRewindEngine, invocation: ShadowRewindCommandInvocation): Promise<ShadowRewindCommandResult> {
+  const cwd = invocation.agent.session.header.cwd
+  if (cwd === undefined || cwd.trim() === '') {
+    return { kind: 'error', text: '当前会话没有工作区，无法对比。' }
+  }
+  const tokens = invocation.rawInput.trim().split(/\s+/).filter((token) => token !== '')
+  if (tokens.length === 0 || tokens.length > 2) return { kind: 'error', text: COMMAND_DIFF_USAGE }
+  const targets: DiffTarget[] = []
+  for (const token of tokens) {
+    const target = parseDiffTarget(token)
+    if (target === null) return { kind: 'error', text: `无法识别「${token}」。\n${COMMAND_DIFF_USAGE}` }
+    targets.push(target)
+  }
+  try {
+    if (targets.every((target) => target.kind === 'trace')) {
+      const [from, to] = targets as [{ kind: 'trace'; seq: number }, { kind: 'trace'; seq: number }]
+      if (from.seq >= to.seq) return { kind: 'error', text: 'trace 区间语义是 (from, to]，from 必须小于 to。' }
+      const result = traceRangeDiff(sessionEvents(invocation.agent.session), from.seq, to.seq)
+      const header = `轨迹区间 #${String(from.seq)} → #${String(to.seq)}：${String(result.changes.length)} 个文件变更`
+      return { kind: 'success', text: formatCommandDiff(header, result.changes, result.notes) }
+    }
+    if (targets.some((target) => target.kind === 'trace')) {
+      return { kind: 'error', text: `快照检查点与轨迹节点不可混用。\n${COMMAND_DIFF_USAGE}` }
+    }
+    const sessionId = invocation.agent.session.id
+    const checkpoints = await engine.listTurnCheckpoints({ cwd, sessionId })
+    const startByTurn = new Map<number, string>()
+    for (const point of checkpoints) {
+      if (point.phase !== 'end' && point.turn !== undefined) startByTurn.set(point.turn, point.id)
+    }
+    const resolveCheckpoint = async (target: DiffTarget): Promise<string | null> => {
+      if (target.kind === 'checkpoint') return target.id
+      if (target.kind === 'turn') return startByTurn.get(target.turn) ?? null
+      return null
+    }
+    let fromId: string | null
+    let toId: string | null
+    if (targets.length === 1 && targets[0]!.kind === 'turn') {
+      // 单轮：轮起 → 轮末（无轮末则下一轮轮起，与 fs-changes 配对语义一致）。
+      const turn = targets[0]!.turn
+      fromId = startByTurn.get(turn) ?? null
+      if (fromId === null) return { kind: 'error', text: `没有找到轮 ${String(turn)} 的轮起检查点（可能未开启自动检查点，或已超出保留上限）。` }
+      const end = checkpoints.find((point) => point.phase === 'end' && point.turn === turn)
+      toId = end?.id ?? startByTurn.get(turn + 1) ?? null
+      if (toId === null) return { kind: 'error', text: `轮 ${String(turn)} 没有轮末检查点，也没有下一轮轮起可配对；可稍后重试或显式指定两个节点。` }
+    } else if (targets.length === 2) {
+      fromId = await resolveCheckpoint(targets[0]!)
+      toId = await resolveCheckpoint(targets[1]!)
+    } else {
+      return { kind: 'error', text: COMMAND_DIFF_USAGE }
+    }
+    if (fromId === null || toId === null) {
+      return { kind: 'error', text: '没有找到对应的检查点（可能已超出保留上限或被清理）。' }
+    }
+    const diff = await engine.diffCheckpoints({ cwd, prevCheckpointId: fromId, currCheckpointId: toId })
+    const countBudget = { remaining: COMMAND_MAX_ROWS }
+    const rows = await Promise.all(diff.changes.map(async (change) => {
+      const [before, after] = await Promise.all([
+        change.before === undefined ? Promise.resolve(null) : readChangeSide(engine, cwd, fromId!, change.path),
+        change.after === undefined ? Promise.resolve(null) : readChangeSide(engine, cwd, toId!, change.path),
+      ])
+      const beforeText = before === null ? null : decodeUtf8(before)
+      const afterText = after === null ? null : decodeUtf8(after)
+      let counts: { added: number; removed: number } | undefined
+      if (countBudget.remaining > 0 && (beforeText !== null || afterText !== null)) {
+        countBudget.remaining -= 1
+        counts = beforeText === null
+          ? { added: countLines(afterText ?? ''), removed: 0 }
+          : afterText === null
+            ? { added: 0, removed: countLines(beforeText) }
+            : lineCounts(beforeText, afterText)
+      }
+      return { path: change.path, kind: change.kind === 'mode-changed' ? 'modified' as const : change.kind, counts }
+    }))
+    return { kind: 'success', text: formatCommandDiff(`检查点 ${fromId} → ${toId}：${String(rows.length)} 个文件变更`, rows, undefined) }
+  } catch (error) {
+    return { kind: 'error', text: `对比失败：${errorMessage(error)}` }
+  }
+}
+
+function formatCommandDiff(header: string, rows: readonly { readonly path: string; readonly kind: string; readonly counts?: { readonly added: number; readonly removed: number }; readonly added?: number; readonly removed?: number }[], notes: readonly string[] | undefined): string {
+  const glyph: Record<string, string> = { added: 'A', deleted: 'D', modified: 'M' }
+  const shown = rows.slice(0, COMMAND_MAX_ROWS)
+  const lines = shown.map((row) => {
+    // 两种行形状：快照模式行数在 counts，轨迹模式行数直接在 added/removed。
+    const added = row.counts?.added ?? row.added
+    const removed = row.counts?.removed ?? row.removed
+    const counts = added === undefined && removed === undefined ? '' : `  +${String(added ?? 0)} −${String(removed ?? 0)}`
+    return `${glyph[row.kind] ?? 'M'} ${row.path}${counts}`
+  })
+  if (rows.length > shown.length) lines.push(`…还有 ${String(rows.length - shown.length)} 个文件（完整清单见时间线面板）`)
+  if (notes !== undefined && notes.length > 0) lines.push('', ...notes.map((note) => `注：${note}`))
+  return [header, '', ...lines].join('\n')
+}
+
+async function runShadowUndoCommand(engine: ShadowRewindEngine, invocation: ShadowRewindCommandInvocation): Promise<ShadowRewindCommandResult> {
+  const cwd = invocation.agent.session.header.cwd
+  if (cwd === undefined || cwd.trim() === '') {
+    return { kind: 'error', text: '当前会话没有工作区，无从撤销。' }
+  }
+  try {
+    const result = await engine.undoLastRestore({ cwd, signal: invocation.signal })
+    const lines = [`已撤销最近一次恢复：${String(result.undonePaths.length)} 个路径回到恢复前状态（备份点 ${result.rescuePointId} 保留）。`]
+    for (const path of result.undonePaths) lines.push(`已还原 ${path}`)
+    for (const skip of result.skippedPaths) lines.push(`跳过 ${skip.path}：${skip.reason}`)
+    return { kind: 'success', text: lines.join('\n') }
+  } catch (error) {
+    return { kind: 'error', text: errorMessage(error) }
   }
 }

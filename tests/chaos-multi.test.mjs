@@ -129,20 +129,21 @@ function makeHandlers(liveSessions, engine, coordinator, writeGate) {
   }
   installShadowRewindHttp({
     logger: { warn: () => {} },
+    // dsh 0.1.2 宿主形状：sessions.get 返回核心 Session（header +
+    // inheritedEventCount + snapshotEvents()）。
     sessions: { get: (id) => liveSessions.get(id) },
     sessionQuery: {
       readSession: async (id) => {
         const live = liveSessions.get(id)
         return live === undefined
-          ? { session: { id }, events: [] }
-          : { session: { id: live.id, cwd: live.session.header.cwd }, events: [] }
+          ? { session: { id }, inheritedEventCount: 0, events: [] }
+          : { session: { id: live.id, cwd: live.session.header.cwd }, inheritedEventCount: 0, events: [] }
       },
     },
-    apiProxy: {
-      sessions: {
-        create: async () => ({ result: { ok: true, value: { sessionId: 'x' } } }),
-        fork: async () => ({ result: { ok: true, value: { sessionId: 'x' } } }),
-      },
+    // dsh 0.1.2：apiProxy 移除，会话网关收敛为 sessionController。
+    sessionController: {
+      create: async () => ({ sessionId: 'x' }),
+      fork: async () => ({ sessionId: 'x' }),
     },
     agents: { list: () => [] },
     webServer,
@@ -172,7 +173,7 @@ async function callFsChanges(handlers, sessionId) {
 async function runMultiScenario(bias, seed) {
   const workspace = await mkdtemp(join(tmpdir(), `chaos7-${bias}-`))
   const storageDir = await mkdtemp(join(tmpdir(), `chaos7-${bias}-store-`))
-  const engine = new ShadowRewindEngine({ storageDir, turnCheckpointMode: 'legacy' })
+  const engine = new ShadowRewindEngine({ storageDir, turnCheckpointMode: 'sqlite' })
   await engine.ready
   const rand = mulberry32(seed)
 
@@ -287,7 +288,7 @@ async function runMultiScenario(bias, seed) {
     // 端点核对：每个会话每一轮的识别结果与期望精确相等。
     const liveSessions = new Map(SESSIONS.map((session) => [
       session.id,
-      { id: session.id, status: 'idle', session: { id: session.id, header: { cwd: workspace }, events: [] } },
+      { id: session.id, status: 'idle', session: { id: session.id, header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } },
     ]))
     const coordinator = new TurnCheckpointCoordinator(engine)
     const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
@@ -354,6 +355,7 @@ async function runMultiScenario(bias, seed) {
     return completionProfile(schedule)
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 }

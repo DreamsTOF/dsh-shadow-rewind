@@ -1,14 +1,17 @@
 /**
- * Session-wide produced-file derivation from a finalized ConversationSnapshot.
- * Client-only and model-free: the vocabulary is the mutation tools' own
- * follow-along `locations` and diff views, never the closing prose. This is
- * the sidebar-tab analogue of dsh-file-review's turn-deliverables.ts: instead
- * of a ConversationNodeDefinition accumulating one turn's data for the
- * turn-tail slot, it derives EVERY in-window turn's changes from the session
- * snapshot's finalized nodes, attributing each tool result to its owning
- * turn through `turnEnds` (completed turns) or the live turn counters.
+ * 会话级的产出文件推导：从一个已定稿的 Chat 快照里算出每一轮改了什么。
+ *
+ * 纯客户端、与模型无关：词汇来源是变更工具自己的**结果**，绝不是收尾文风
+ * 的文本。这是 turn-deliverables.ts 的侧边栏版本——那边用
+ * ConversationNodeDefinition 为轮尾槽累加单轮数据，这里则是从会话快照的
+ * 已定稿节点推导出**窗口内每一轮**的变更，并借 `turnEnds`（已完结轮）或
+ * live 轮计数器把每个工具结果归到它所属的轮。
+ *
+ * dsh 0.1.2 迁移：快照换成 ChatSnapshot（Chat 目标的视图快照），节点数据从
+ * `legacy` 兼容切片读取；工具路径与 hunks 来自节点的 `call`（原始参数）与
+ * `meta`（dsh-tool-fs 落地的 presentationMeta.diffs）。
  */
-import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ChatSnapshot } from '@deepseek-ai/dsh-client-ui-chat/client';
 import type { ProducedFileDiff, RecordedMutation } from '../file-review/change-types.ts';
 /** 写盘归因关联到的命令执行窗口（闸关归因命令级时附带）。 */
 export interface FsCommandRef {
@@ -31,11 +34,11 @@ export interface FsAttributionFields {
     /** 当前内容的写入时间（快照 mtime，ms epoch；旧清单无此字段则缺省）。 */
     readonly writtenAt?: number;
 }
-/** One changed file inside one turn, hunks appended in settlement order. */
+/** 一轮里被改过的一个文件，hunks 按结算顺序追加。 */
 export interface SessionFileChange extends FsAttributionFields {
     readonly path: string;
     readonly diffs: readonly ProducedFileDiff[];
-    /** Terminal commands deleted this path in this turn (display-only). */
+    /** 本轮的终端命令删掉了这个路径（仅展示用，不能撤销）。 */
     readonly deleted?: true;
     /** 条目来源：'fs' = 检查点对比派生（终端写盘）；缺省 = 工具结果视图。 */
     readonly origin?: 'fs';
@@ -47,49 +50,41 @@ export interface SessionFileChange extends FsAttributionFields {
         readonly removed: number;
     };
 }
-/** One turn's produced files, in first-seen order. */
+/** 一轮的产出文件，按首次出现顺序。 */
 export interface TurnFileChanges {
     readonly turn: number;
-    /** Whether the owning turn is still running (its change set may grow). */
+    /** 所属轮是否仍在运行（它的变更集还可能增长）。 */
     readonly live: boolean;
     readonly files: readonly SessionFileChange[];
 }
+/** 校验跨宿主/浏览器传输进来的 diff hunks（未知即拒绝，绝不猜）。 */
+export declare function producedDiffs(meta: unknown): readonly ProducedFileDiff[];
+/** 对某个会话快照推导逐轮产出文件变更（带缓存入口）。 */
+export declare function deriveSessionChanges(snapshot: ChatSnapshot | null | undefined): TurnFileChanges[];
 /**
- * Paths a call view reports having created or changed, by render intent
- * rather than tool name: a diff card, or a generic card whose kind is `edit`.
- * Mirrors dsh-file-review's producedPaths exactly (unknown-safe).
- */
-export declare function producedPaths(view: unknown): readonly string[];
-/** Validate diff hunks crossing the Host/browser transport (unknown-safe). */
-export declare function producedDiffs(view: unknown): readonly ProducedFileDiff[];
-/** Derive per-turn produced-file changes for one session snapshot. */
-export declare function deriveSessionChanges(snapshot: ConversationSnapshot | null): TurnFileChanges[];
-/**
- * One Code Mode (`run_code`) root visible in the snapshot, with the turn it
- * settles into. Children (`subCalls`) carry no reusable views, so the reset of
- * their review data arrives asynchronously from the Host recorder; these roots
- * are the join keys (the `run_code` `callId` is the dispatch `rootCallId`).
+ * 快照里可见的一个 Code Mode（`run_code`）根调用，连同它结算进的那一轮。
+ * 子调用（`subCalls`）没有可复用的视图，它们的审查数据以异步方式从宿主
+ * 录制器补充回来；这些根调用就是联接键——`run_code` 的 `callId` 正是派发的
+ * `rootCallId`。
  */
 export interface SessionRoot {
     readonly turn: number;
     readonly live: boolean;
     readonly rootCallId: string;
 }
-/** Every `run_code` tool-result node in the window, in node order. */
-export declare function deriveSessionRoots(snapshot: ConversationSnapshot): SessionRoot[];
+/** 窗口内的全部 `run_code` 工具结果节点，按节点顺序。 */
+export declare function deriveSessionRoots(snapshot: ChatSnapshot): SessionRoot[];
 /**
- * Merge Host-recorded Code Mode mutations into the snapshot-derived turns:
- * hunks rebuilt from the full before/after are appended to the owning turn's
- * file groups (same-path entries stay one row, hunks appended in dispatch
- * order), so the tab's diff rendering, status inspection and undo all work on
- * programmatic edits exactly like model-direct ones. All inputs are immutable;
- * the result is a fresh array only when a recorded mutation matched a visible
- * root.
+ * 把宿主录制到的 Code Mode 变更合并进快照推导出的各轮：由完整 before / after
+ * 重建的 hunks 追加到所属轮的文件组里（同路径条目保持一行，hunks 按派发顺序
+ * 追加），于是 tab 的 diff 渲染、状态巡检与撤销对程序化改动与模型直发完全
+ * 同路。所有入参都不可变；只有某条录制变更匹配上了可见根调用时，结果才是
+ * 新数组（否则原样返回，避免无谓重渲染）。
  */
 export declare function mergeRecordedTurns(turns: readonly TurnFileChanges[], roots: readonly SessionRoot[], recorded: readonly RecordedMutation[]): readonly TurnFileChanges[];
-/** Count distinct changed paths across every turn (the sidebar badge count). */
+/** 统计跨所有轮的被改路径去重数（侧边栏徽标就是这个数）。 */
 export declare function countChangedFiles(turns: readonly TurnFileChanges[]): number;
-/** Trailing path segment, the part that identifies the file at a glance. */
+/** 路径末段——一眼就能认出文件的那一部分。 */
 export declare function basename(path: string): string;
-/** Resolve a (possibly relative) tool path against the session cwd. */
+/** 把（可能相对的）工具路径按会话工作区目录解析成展示路径。 */
 export declare function resolveSessionPath(cwd: string | undefined, path: string): string;

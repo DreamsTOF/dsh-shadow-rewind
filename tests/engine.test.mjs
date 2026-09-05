@@ -1,5 +1,5 @@
 /**
- * 引擎端到端测试：真实临时目录 + 真实后端（blob 恒测；jj 可用时加测）。
+ * 引擎端到端测试：真实临时目录 + 真实后端（sqlite 恒测；jj 可用时加测）。
  * 覆盖：捕获/对比/计划/恢复全链路、新增/删除/修改/权限变化、排除规则、
  * 超限显式跳过、计划过期（PLAN_STALE）、rescue 备份与删除确认闸。
  */
@@ -7,7 +7,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, mkdir, rm, rmdir, writeFile, readFile, chmod, symlink, lstat, realpath } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, rm, rmdir, writeFile, readFile, chmod, symlink, lstat, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ShadowRewindEngine } from '../lib/index.js'
@@ -34,7 +34,7 @@ async function makeEngine(overrides = {}) {
   const storageDir = await mkdtemp(join(tmpdir(), 'shadow-rewind-store-'))
   const engine = new ShadowRewindEngine({
     storageDir,
-    turnCheckpointMode: overrides.mode ?? 'legacy',
+    turnCheckpointMode: overrides.mode ?? 'sqlite',
     ...overrides,
   })
   await engine.ready
@@ -85,20 +85,20 @@ async function assertRoundtrip(mode) {
     const after = await engine.list({ cwd: workspace, includeRescue: true, includeTurnCheckpoints: true })
     const rescue = after.find((point) => point.kind === 'rescue')
     assert.ok(rescue, '恢复后必须存在 rescue 备份点')
-    assert.equal(rescue.storage, mode === 'jj' && jjOnPath() ? 'jj' : 'blob')
+    assert.equal(rescue.storage, mode === 'jj' && jjOnPath() ? 'jj' : 'sqlite')
   } finally {
     await rm(workspace, { recursive: true, force: true })
   }
 }
 
-test('legacy 后端：完整回退链路', () => assertRoundtrip('legacy'))
+test('sqlite 后端：完整回退链路', () => assertRoundtrip('sqlite'))
 
 if (jjOnPath()) {
   test('jj 影子后端：完整回退链路', () => assertRoundtrip('jj'))
 } else {
-  test('jj 不可用时自动降级 blob', async () => {
+  test('jj 不可用时自动降级 sqlite', async () => {
     const { engine } = await makeEngine({ mode: 'jj' })
-    assert.equal(engine.effectiveBackend, 'blob')
+    assert.equal(engine.effectiveBackend, 'sqlite')
     assert.ok(engine.downgradeReason !== undefined)
   })
 }
@@ -107,7 +107,7 @@ test('排除规则：命中目录整棵不入快照', async () => {
   const workspace = await makeWorkspace()
   await mkdir(join(workspace, 'node_modules', 'pkg'), { recursive: true })
   await writeFile(join(workspace, 'node_modules', 'pkg', 'index.js'), 'dep\n', 'utf8')
-  const { engine } = await makeEngine({ mode: 'legacy' })
+  const { engine } = await makeEngine({ mode: 'sqlite' })
   try {
     const checkpoint = await captureTurn(engine, workspace)
     // node_modules 不在恢复点里：修改它不会产生 diff，恢复也不会碰它。
@@ -122,7 +122,7 @@ test('排除规则：命中目录整棵不入快照', async () => {
 test('超大文件被显式跳过且恢复不动它', async () => {
   const workspace = await makeWorkspace()
   await writeFile(join(workspace, 'big.bin'), Buffer.alloc(64, 7))
-  const { engine } = await makeEngine({ mode: 'legacy', maxFileBytes: 32 })
+  const { engine } = await makeEngine({ mode: 'sqlite', maxFileBytes: 32 })
   try {
     const checkpoint = await captureTurn(engine, workspace)
     assert.equal(checkpoint.skippedPathCount, 1)
@@ -182,15 +182,15 @@ async function assertLadder(mode) {
   }
 }
 
-test('多轮阶梯：回退到中间检查点（legacy）', () => assertLadder('legacy'))
+test('多轮阶梯：回退到中间检查点（sqlite）', () => assertLadder('sqlite'))
 
 if (jjOnPath()) {
   test('多轮阶梯：回退到中间检查点（jj 影子）', () => assertLadder('jj'))
 }
 
-test('共享 stat 缓存：指纹未变时零内容重读（blob 后端同样增量）', async () => {
+test('共享 stat 缓存：指纹未变时零内容重读（sqlite 后端同样增量）', async () => {
   const workspace = await makeWorkspace()
-  const { engine } = await makeEngine({ mode: 'legacy' })
+  const { engine } = await makeEngine({ mode: 'sqlite' })
   try {
     await captureTurn(engine, workspace, 1)
     const cachePath = join(engine.config.storageDir, 'workspaces')
@@ -231,7 +231,7 @@ test('共享 stat 缓存：指纹未变时零内容重读（blob 后端同样增
 
 test('计划过期：计划后文件再变 → PLAN_STALE 拒绝执行', async () => {
   const workspace = await makeWorkspace()
-  const { engine } = await makeEngine({ mode: 'legacy' })
+  const { engine } = await makeEngine({ mode: 'sqlite' })
   try {
     const checkpoint = await captureTurn(engine, workspace)
     await writeFile(join(workspace, 'a.txt'), 'v2\n', 'utf8')
@@ -254,7 +254,7 @@ test('计划过期：计划后文件再变 → PLAN_STALE 拒绝执行', async (
 
 test('删除需要逐字确认串', async () => {
   const workspace = await makeWorkspace()
-  const { engine } = await makeEngine({ mode: 'legacy' })
+  const { engine } = await makeEngine({ mode: 'sqlite' })
   try {
     const checkpoint = await captureTurn(engine, workspace)
     await assert.rejects(
@@ -273,7 +273,7 @@ test('删除需要逐字确认串', async () => {
 
 test('无变更时恢复报 NO_CHANGES', async () => {
   const workspace = await makeWorkspace()
-  const { engine } = await makeEngine({ mode: 'legacy' })
+  const { engine } = await makeEngine({ mode: 'sqlite' })
   try {
     const checkpoint = await captureTurn(engine, workspace)
     await assert.rejects(
@@ -292,7 +292,7 @@ test('可执行位被保留', posixOnly, async () => {
   const workspace = await makeWorkspace()
   await writeFile(join(workspace, 'run.sh'), '#!/bin/sh\necho hi\n', 'utf8')
   await chmod(join(workspace, 'run.sh'), 0o755)
-  const { engine } = await makeEngine({ mode: 'legacy' })
+  const { engine } = await makeEngine({ mode: 'sqlite' })
   try {
     const checkpoint = await captureTurn(engine, workspace)
     await writeFile(join(workspace, 'run.sh'), 'noop\n', 'utf8')
@@ -305,12 +305,12 @@ test('可执行位被保留', posixOnly, async () => {
   }
 })
 
-test('死缓存自愈（blob）：删除触发 GC 后，缓存不再引用已删 blob', async () => {
+test('死缓存自愈（sqlite）：删除触发 GC 后，缓存不再引用已删内容行', async () => {
   const workspace = await makeWorkspace()
-  const { engine } = await makeEngine({ mode: 'legacy' })
+  const { engine } = await makeEngine({ mode: 'sqlite' })
   try {
     const t1 = await captureTurn(engine, workspace, 1)
-    // 删除 t1 → GC 把 a.txt/sub b.txt 的 blob 从磁盘清掉（无其它引用）。
+    // 删除 t1 → GC 把 a.txt/sub b.txt 的内容行从库里清掉（无其它引用）。
     const deleted = await engine.delete({ cwd: workspace, restorePointId: t1.id, confirmation: `DELETE ${t1.id}` })
     assert.ok((deleted.deletedBlobs ?? 0) > 0, '删除唯一恢复点后 GC 应清掉全部 blob')
     // 修复点：GC 后 stat 缓存必须被作废；否则下一次捕获会命中死缓存，
@@ -352,7 +352,7 @@ test('死缓存自愈（jj）：影子仓库被外部删除后自动重建', { s
 
 test('rescue 点不挤占 maxRestorePoints 配额', async () => {
   const workspace = await makeWorkspace()
-  const { engine } = await makeEngine({ mode: 'legacy', maxRestorePoints: 1 })
+  const { engine } = await makeEngine({ mode: 'sqlite', maxRestorePoints: 1 })
   try {
     const t1 = await captureTurn(engine, workspace, 1)
     // 触发一次恢复 → 自动生成 rescue 点。
@@ -390,7 +390,7 @@ async function assertSymlinkMirror(mode) {
 
 const posix = process.platform === 'win32' ? { skip: 'POSIX only' } : {}
 
-test('符号链接被恢复（legacy）', posix, () => assertSymlinkMirror('legacy'))
+test('符号链接被恢复（sqlite）', posix, () => assertSymlinkMirror('sqlite'))
 
 if (jjOnPath()) {
   // 验证 newLinks 真正写进镜像：旧实现的 jj 镜像从不落链接（死代码），
@@ -531,5 +531,27 @@ test('mtime 落盘：检查点记录写入时间，旧清单兼容且树哈希�
     assert.throws(() => parseManifest(bad), /mtimeNs/)
   } finally {
     await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('storageDir 未配置时回退 $DSH_HOME（undefined 不得成为路径字面量）', async () => {
+  const fakeHome = await mkdtemp(join(tmpdir(), 'shadow-rewind-home-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = fakeHome
+  try {
+    const engine = new ShadowRewindEngine({ turnCheckpointMode: 'off' })
+    await engine.ready
+    assert.equal(engine.config.storageDir, join(fakeHome, 'shadow-rewind', 'v1'))
+    // initialize() 必须把 workspaces 根建在解析后的存储根下（回归：旧行为
+    // 会把它建成宿主 cwd 下的字面量 undefined/ 目录）。
+    assert.equal(
+      await readdir(join(fakeHome, 'shadow-rewind', 'v1')).then((names) => names.includes('workspaces')),
+      true,
+    )
+    await engine.store.closeAll()
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    await rm(fakeHome, { recursive: true, force: true })
   }
 })

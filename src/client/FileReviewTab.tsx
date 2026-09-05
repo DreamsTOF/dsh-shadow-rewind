@@ -1,16 +1,19 @@
-// FileReviewTab: the better-sidebar tab body. It lists every file the agent
-// changed in THIS session (grouped by turn), renders line-level red/green
-// diffs inline, and offers per-turn / per-file undo+reapply through the
-// package's Host file-review Typert remote. All derivation rides the client
-// runtime's finalized conversation snapshot — nothing is injected into the
-// chat flow (that was the style-conflict source this port removes).
+/**
+ * FileReviewTab —— better-sidebar tab 的本体：列出 agent 在**本会话**改过的
+ * 每一个文件（按轮分组），行内渲染行级红/绿 diff，并经本包的宿主
+ * file-review Typert remote 提供按轮 / 按文件的撤销 + 重新应用。全部推导都
+ * 挂在客户端 runtime 的已定稿会话快照上——什么都不会注入聊天流（那正是本
+ * 移植要消除的样式冲突源）。
+ */
 
 import {
   useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore,
 } from 'react'
 import type { ReactNode } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
-import type { ISessions, SessionFace, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { ChatSnapshot } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type {
   FileReviewAction, FileReviewFileState, FileReviewRequest, FileReviewResult,
@@ -29,39 +32,41 @@ import css from './FileReviewTab.module.css'
 const SUCCESS_NOTICE_DURATION = 3000
 const ERROR_NOTICE_DURATION = 8000
 
-/** Tab component props (a narrowing of better-sidebar's TabComponentProps). */
+/** Tab 组件入参（better-sidebar 的 TabComponentProps 的收窄版）。 */
 export interface FileReviewTabProps {
   readonly ctx: Context
   readonly sessionId: string
   readonly cwd: string | undefined
-  /** Active tab + open panel; live status inspection pauses while false. */
+  /** 活跃 tab + 面板已打开；为 false 时暂停实时状态巡检。 */
   readonly visible: boolean
   /**
-   * The sidebar tab handle. `meta.expandPaths` (string[]) is the deep link
-   * the chat turn-tail row writes via updateTab/openTab: a fresh meta
-   * reference replays as "expand those files' diffs and scroll to the first".
+   * 侧边栏 tab 句柄。`meta.expandPaths`（string[]）就是聊天轮尾行经
+   * updateTab / openTab 写入的深链：一份**新的** meta 引用会被重放成「展开
+   * 这些文件的 diff 并滚到第一个」。
    */
   readonly tab: { readonly meta?: unknown }
 }
 
+/** 本 tab 用到的 fileReview 远端方法面。 */
 interface FileReviewRemote {
   status(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>
   apply(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>
   recorded(request: RecordedRequest): Promise<RemoteResult<RecordedResult>>
 }
 
+/** 页内通知气泡（成功/失败短暂停留后自动消失）。 */
 interface Notice {
   readonly seq: number
   readonly tone: 'success' | 'error'
   readonly text: string
 }
 
-/** One flattened (turn, file) change unit used for status requests. */
+/** 摊平后的 (轮, 文件) 变更单元，用于状态巡检与开关请求。 */
 interface FlatChange extends FsAttributionFields {
   readonly turn: number
   readonly path: string
   readonly diffs: SessionFileChange['diffs']
-  /** Deleted paths stay listed but never reach the Host inspector. */
+  /** 终端删除的路径仍列出，但绝不送到宿主巡检器。 */
   readonly deleted?: true
   /** 条目来源：'fs' = 检查点对比派生（终端写盘）；缺省 = 工具结果视图。 */
   readonly origin?: 'fs'
@@ -71,7 +76,7 @@ interface FlatChange extends FsAttributionFields {
   readonly counts?: { readonly added: number; readonly removed: number }
 }
 
-/** State map key for one (turn, file) change group. */
+/** 一个 (轮, 文件) 变更组的状态映射键。 */
 function stateKey(turn: number, path: string): string {
   return `${turn}|${path}`
 }
@@ -102,11 +107,11 @@ function fsOwnerBadge(file: SessionFileChange, sessionTitle: (id: string) => str
   return null
 }
 
-/** Deep-link scroll target: the turn group for whole-turn links, else the row. */
+/** 深链的滚动目标：整轮链接滚到轮组，否则滚到文件行。 */
 interface PendingScroll {
-  /** File-row stateKey: the precise target and the section fallback. */
+  /** 文件行的 stateKey：既是精确目标，也是所在节的回退目标。 */
   readonly rowKey: string
-  /** Turn number whose group tops the viewport for multi-file links. */
+  /** 多文件链接时，其轮组的轮号——该轮组顶到视口顶部。 */
   readonly turn: number | null
 }
 
@@ -126,11 +131,10 @@ interface PathWindowStats {
   readonly latestTurn: number
 }
 
-/** A change group is reversible only with complete contextual hunks. */
+/** 一组变更只有在 hunks 完整可逆时才判定为可撤销。 */
 function isReversible(file: SessionFileChange): boolean {
-  // Whole-file fs-change shapes (checkpoint comparison): a single diff that is
-  // either an addition (no before side) or a deletion (empty after side). The
-  // host reverses them via file presence, not hunk replay.
+  // 整文件 fs 变更形状（检查点对比）：单条 diff，要么是新增（无旧侧），要么
+  // 是删除（新侧为空）。宿主按文件存在性翻转它们，不靠 hunk 回放。
   if (file.diffs.length === 1) {
     const only = file.diffs[0]
     if (only !== undefined && only.path === file.path) {
@@ -189,7 +193,7 @@ function Chevron({ open }: { readonly open: boolean }) {
   )
 }
 
-/** Per-(turn,file) host-inspected state badge; nothing renders for 'applied'. */
+/** 每个 (轮, 文件) 的宿主巡检状态徽标；'applied' 时不渲染任何东西。 */
 function StateBadge({ state }: { readonly state: FileReviewFileState | undefined }) {
   if (state === undefined || state === 'applied') return null
   const label = state === 'undone'
@@ -207,7 +211,7 @@ function StateBadge({ state }: { readonly state: FileReviewFileState | undefined
   return <span className={`${css.stateBadge} ${tone}`}>{label}</span>
 }
 
-/** Mounts the heavy diff renderer only when the row nears the viewport. */
+/** 懒渲染：只有行接近视口时才挂载重的 diff 渲染器（200px 预读余量）。 */
 function LazyDiff({ children }: { children: ReactNode }) {
   const holderRef = useRef<HTMLDivElement | null>(null)
   const [inView, setInView] = useState(false)
@@ -777,7 +781,7 @@ function FileTimelineDialog({ path, entries, onPick, onClose }: FileTimelineDial
   )
 }
 
-/** The sidebar tab body: per-turn change groups with inline diffs and undo. */
+/** 侧边栏 tab 本体：逐轮变更组 + 行内 diff + 撤销。 */
 export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewTabProps) {
   const sessions = (ctx as unknown as { readonly sessions: ISessions }).sessions
   const [states, setStates] = useState<ReadonlyMap<string, FileReviewFileState>>(() => new Map())
@@ -801,13 +805,27 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   const noticeSeqRef = useRef(0)
   const noticeTimerRef = useRef<number | null>(null)
 
-  // Live conversation snapshot for THIS session (uSES over the Session face).
-  const session: SessionFace | undefined = sessions.binding(sessionId as SessionId)?.session
-  const subscribe = useCallback(
-    (listener: () => void) => session?.subscribe(listener) ?? (() => {}),
-    [session],
+  // 本会话的 Live Chat 快照（dsh 0.1.2：会话变更推导的数据源从
+  // runtime 会话快照换成 uiConversation 会话绑定的 `chat` 目标快照）。
+  const uiConversation = (ctx as unknown as {
+    readonly uiConversation?: {
+      binding(source: string): {
+        target(target: 'chat'): { subscribe(listener: () => void): () => void; getSnapshot(): ChatSnapshot | undefined }
+      }
+    }
+  }).uiConversation
+  const chatSource = useMemo(
+    () => uiConversation?.binding(sessionId).target('chat'),
+    [uiConversation, sessionId],
   )
-  const snapshot = useSyncExternalStore(subscribe, () => session?.getSnapshot() ?? null)
+  const subscribe = useCallback(
+    (listener: () => void) => chatSource?.subscribe(listener) ?? (() => {}),
+    [chatSource],
+  )
+  const snapshot: ChatSnapshot | null = useSyncExternalStore(
+    subscribe,
+    () => chatSource?.getSnapshot() ?? null,
+  )
 
   // 会话标题查询（归因徽标把「他会话 id」升级成可读标题；缺省回落 id 截断）。
   const sessionList = useSyncExternalStore(
@@ -819,10 +837,9 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     [sessionList],
   )
 
-  // Code Mode (run_code) roots and their Host-recorded mutations: nested
-  // dispatches carry no reuseable views, so each root's file changes are
-  // fetched async and merged into the snapshot-derived turns below. The
-  // fetch re-arms on the root set (a new run_code turn) or a manual refresh.
+  // Code Mode（run_code）根调用及其宿主录制的变更：嵌套派发没有可复用的视图，
+  // 所以每个根的变更要异步拉取，再并入下面快照推导出的各轮。拉取在根集合
+  // 变化（新一轮 run_code）或手动刷新时重新触发。
   const roots = useMemo(
     () => (snapshot === null ? [] : deriveSessionRoots(snapshot)),
     [snapshot],
@@ -832,11 +849,11 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     [roots],
   )
   const [recorded, setRecorded] = useState<readonly RecordedMutation[]>(() => [])
-  // File-system changes detected via checkpoint comparison (PowerShell etc.):
-  // the host's /shadow-rewind/fs-changes endpoint pairs each turn's start
-  // checkpoint with the NEXT turn's start checkpoint (= end-of-turn tree) and
-  // precomputes per-file added/removed line counts. 全文（整文件 diff）按需
-  // 懒加载：展开 diff、撤销提交、恢复窗口统计时才拉，且按 (turn, path) 记忆。
+  // 经检查点对比发现的文件系统级变更（PowerShell 等终端写盘）：宿主的
+  // /shadow-rewind/fs-changes 端点把每一轮的轮起检查点与**下一轮**的轮起
+  // 检查点配对（= 轮末树状态），并预算好每文件的增/删行数。全文（整文件
+  // diff）按需懒加载：展开 diff、撤销提交、恢复窗口统计时才拉，且按
+  // (turn, path) 记忆。
   const [fsRaw, setFsRaw] = useState<readonly FsChangeTurn[]>([])
   const [ensuredFs, setEnsuredFs] = useState<ReadonlyMap<string, SessionFileChange>>(() => new Map())
   const fsRawRef = useRef(fsRaw)
@@ -929,7 +946,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     let active = true
     const timer = window.setTimeout(() => {
       const scope = sessions.scope(sessionId as SessionId)
-      const remote = scope?.get('remote.fileReview') as FileReviewRemote | undefined
+      const remote = scope?.remote.fileReview as FileReviewRemote | undefined
       if (scope === undefined || remote === undefined) { active = false; return }
       remote.recorded({ rootCallIds: roots.map(root => root.rootCallId) })
         .then((result) => {
@@ -937,8 +954,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           setRecorded(result.value.mutations)
         })
         .catch(() => {
-          // Transient fetch failure: keep the previous record; the next
-          // snapshot / refresh round retries.
+          // 瞬时拉取失败：保留上一次的记录；下一轮快照 / 手动刷新会重试。
         })
     }, 200)
     return () => {
@@ -951,8 +967,8 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   const turns = useMemo(
     () => {
       const base = mergeRecordedTurns(deriveSessionChanges(snapshot), roots, recorded)
-      // Merge file-system changes (PowerShell etc.) into the turn list:
-      // same-turn groups are merged file-by-file so one turn never renders twice.
+      // 把文件系统级变更（PowerShell 等）并入轮列表：同轮的组按文件逐个合并，
+      // 保证同一轮绝不被渲染两遍。
       if (fsTurns.length === 0) return base
       const byTurn = new Map<number, TurnFileChanges>()
       for (const turn of base) byTurn.set(turn.turn, turn)
@@ -966,7 +982,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         for (const fsFile of fsTurn.files) {
           const index = files.findIndex(f => f.path === fsFile.path)
           if (index === -1) files.push(fsFile)
-          // Same-path entries from tool views already carry hunks; keep them.
+          // 同路径的工具视图条目已经带着 hunks，保留它们。
         }
         byTurn.set(fsTurn.turn, { turn: existing.turn, live: existing.live, files })
       }
@@ -984,16 +1000,16 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     }))),
     [turns],
   )
-  // Deleted entries WITHOUT diffs (rm-command records) have nothing to inspect
-  // or toggle; fs-level deletions carry a whole-file diff and ARE toggleable.
+  // 没有 diffs 的删除条目（rm 命令记录）没东西可巡检或开关；fs 级删除带着
+  // 整文件 diff，**可以**开关。
   // fs 占位条目（全文未补齐）同样不参与巡检——补齐后经 flatKey 自动加入。
   const inspectable = useMemo(
     () => flat.filter(item => (item.deleted !== true || item.diffs.length > 0)
       && !(item.origin === 'fs' && item.diffs.length === 0)),
     [flat],
   )
-  // Stable content key: the inspect effect re-fires only when the change SET
-  // changes, not on every token-flush snapshot identity bump.
+  // 稳定的内容键：巡检 effect 只在变更**集合**变化时才重触发，而不是每次
+  // token 刷新的快照身份变化都重触发。
   const flatKey = useMemo(
     () => flat.map(item => `${item.turn}|${item.path}|${item.diffs.length}`).join(';'),
     [flat],
@@ -1001,21 +1017,19 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   const flatRef = useRef(flat)
   flatRef.current = flat
 
-  // Deep-link plumbing: file-row elements by stateKey and turn-group sections
-  // by turn number for scrollIntoView, the last replayed meta reference, and a
-  // pending scroll target.
+  // 深链管道：按 stateKey 收集文件行元素、按轮号收集轮组元素供
+  // scrollIntoView，另记上一次重放过的 meta 引用与待滚动的目标。
   const rowRefs = useRef(new Map<string, HTMLLIElement>())
   const turnRefs = useRef(new Map<number, HTMLElement>())
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const lastMetaRef = useRef<unknown>(undefined)
   const pendingScrollRef = useRef<PendingScroll | null>(null)
 
-  // Sidebar-tab deep link: the chat row's 审查 button (and per-file chips)
-  // land here as `tab.meta.expandPaths`. A NEW meta reference replays the
-  // expansion — merging into the user's own expanded set, never replacing it
-  // — and queues a scroll that lands the link's target at the top of the tab
-  // body. An unchanged reference (re-renders from unrelated sidebar state)
-  // never re-grabs the user's manual expand/collapse state.
+  // 侧边栏 tab 的深链：聊天行的「审查」按钮（与单文件 chip）以
+  // `tab.meta.expandPaths` 落到这里。一份**新的** meta 引用会重放展开——
+  // 并入用户自己的展开集，绝不替换它——并排一个把链接目标滚到 tab 体顶部
+  // 的滚动。引用未变（由无关侧栏状态引起的重渲染）时绝不会重夺用户手工的
+  // 展开 / 折叠状态。
   useEffect(() => {
     const meta = tab.meta
     if (meta === lastMetaRef.current) return
@@ -1027,9 +1041,8 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     if (paths.length === 0) return
     const turnNo = (meta as { turn?: unknown }).turn
     const targetTurn = typeof turnNo === 'number' && Number.isInteger(turnNo) ? turnNo : undefined
-    // With a turn anchor only THAT turn's rows expand — a path that recurs in
-    // other turns stays collapsed there; without one, every occurrence expands
-    // (legacy meta shape).
+    // 带轮锚点时只有**那一轮**的行展开——在其它轮反复出现的路径保持折叠；
+    // 不带锚点则每一处出现都展开（旧版 meta 形状）。
     const matches = (item: FlatChange): boolean =>
       paths.includes(item.path) && (targetTurn === undefined || item.turn === targetTurn)
     setExpanded((current) => {
@@ -1040,31 +1053,25 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
       return next
     })
     const first = flatRef.current.find(item => matches(item))
-    // Multi-path links (the 审查 button) target the turn group so the whole
-    // review leads the viewport; single-path links (a file chip) target that
-    // file's row. An unmatched link leaves nothing pending.
+    // 多路径链接（「审查」按钮）以轮组为目标，让整段审查领先视口；单路径
+    // 链接（文件 chip）以该文件行为目标。匹配不到的链接不留下任何待办。
     pendingScrollRef.current = first === undefined ? null : {
       rowKey: stateKey(first.turn, first.path),
       turn: paths.length > 1 ? first.turn : null,
     }
   }, [tab.meta])
 
-  // Scroll the deep-linked target to the TOP of the tab body — aligning to
-  // the center left long reviews straddling the viewport, reading like a
-  // miss. Whole-turn links resolve to the turn group (its header first);
-  // single-file links to that file's row, which is also the fallback when
-  // the section is not mounted. The target stays pending while its element
-  // cannot be found (the session snapshot may still be streaming in), so
-  // `flatKey` re-arms the scroll once the rows mount, and `visible` defers
-  // it while the panel is still opening. The delayed second call covers the
-  // diff bodies mounting one layout pass after the expansion commit.
+  // 把深链目标滚到 tab 体**顶部**——居中会让长审查横跨视口、读起来像没滚
+  // 到位。整轮链接解析到轮组（其头部领先），单文件链接到该文件行；当所在
+  // 节还没挂载时后者也是回退目标。元素一时找不到（会话快照可能还在流式
+  // 进来）目标就保持 pending，于是 `flatKey` 在行挂载后重新触发滚动，
+  // `visible` 在面板还在打开时推迟它。延迟的第二跳覆盖「diff 体在展开提交
+  // 后一个布局周期才挂载」的情况。
   //
-  // The scroll is computed and dispatched on the tab's OWN body only:
-  // element.scrollIntoView({ block: 'start' }) scrolls EVERY scrollable
-  // ancestor by specification, and in the sidebar panel that drags outer
-  // containers along — the panel's tab-strip header rides above the body
-  // inside one of them and gets scrolled out of view (issue #4). Manual
-  // container math can never move anything but this body.
+  // 滚动只算在 tab **自己的** body 上：按规范 `element.scrollIntoView(
+  // { block: 'start' })` 会滚动**每一个**可滚动的祖先——在侧栏面板里这会
+  // 拖走外层容器，面板的 tab 条头部就骑在其中一个里面、会被滚出视野
+  // （issue #4）。手工容器数学绝不会挪动这个 body 之外的东西。
   useEffect(() => {
     if (!visible) return
     const pending = pendingScrollRef.current
@@ -1136,30 +1143,29 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     })
   }, [gateOn, showNotice])
 
-  // The Remote invocation path mirrors dsh-file-review: session scopes are
-  // minted by the client runtime and cannot statically inject namespaces
-  // contributed later, so the namespace rides ctx.get on the session scope.
+  // Remote 调用路径沿用 dsh-file-review。dsh 0.1.2 起 scope 的 Remote 是
+  // 网关客户端面（agent 标签路由），fileReview 命名空间直接可调。
   const invoke = useCallback(async (
     method: 'status' | 'apply',
     request: FileReviewRequest,
   ): Promise<FileReviewResult> => {
     const scope = sessions.scope(sessionId as SessionId)
     if (scope === undefined) throw new Error(t('sessionUnavailable'))
-    const remote = scope.get('remote.fileReview') as FileReviewRemote | undefined
+    const remote = scope.remote.fileReview as FileReviewRemote | undefined
     if (remote === undefined) throw new Error(t('remoteUnavailable'))
     const result = await remote[method](request)
     if (!result.ok) throw new Error(result.error.message)
     return result.value
   }, [sessions, sessionId])
 
-  // Host-side state inspection: which recorded changes are still applied,
-  // already undone, or in conflict. Paused while the tab is not visible.
+  // 宿主侧状态巡检：哪些录制变更仍 applied、已 undone、或冲突。tab 不可见
+  // 时暂停。
   useEffect(() => {
     if (!visible || flat.length === 0) return
     let active = true
     setStatusPending(true)
-    // Debounce trailing-edge: streaming turns keep bumping flatKey per hunk;
-    // only one host round-trip survives a 300ms quiet window.
+    // 尾沿防抖：流式回合会随每个 hunk 不断顶高 flatKey；300ms 静默窗口里只
+    // 让一次宿主往返存活下来。
     const timer = window.setTimeout(() => {
       const request: FileReviewRequest = {
         action: 'undo',
@@ -1176,8 +1182,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           return next
         })
       }).catch(() => {
-        // Transient inspection failure: the buttons stay usable — apply runs
-        // the same Host-side checks again before touching disk.
+        // 巡检瞬时失败：按钮保持可用——apply 在碰磁盘前会再跑同样的宿主校验。
       }).finally(() => {
         if (active) setStatusPending(false)
       })
@@ -1375,7 +1380,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     pendingScrollRef.current = { rowKey: key, turn: null }
   }, [])
 
-  /** Render one turn group (latest turn first). */
+  /** 渲染一个轮组（最新轮在前）。 */
   const renderTurn = (turn: TurnFileChanges) => {
     const turnStats = turn.files.reduce<UnifiedDiffStats>(
       (total, file) => addStats(total, file.counts ?? summarizeDiffs(file.diffs)),
@@ -1454,7 +1459,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     )
   }
 
-  /** Render one changed file row plus its inline diff when expanded. */
+  /** 渲染一个被改文件的行；展开时追加其行内 diff。 */
   const renderFile = (turn: TurnFileChanges, file: SessionFileChange) => {
     const key = stateKey(turn.turn, file.path)
     const isOpen = expanded.has(key)
@@ -1466,9 +1471,9 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     const fileBusy = busyKey === key
     const stats = file.counts ?? summarizeDiffs(file.diffs)
     const selectedCount = selectedHunkCount(file, key)
-    // rm-command records: display-only badge. Fs-level deletions carry a
-    // whole-file diff and behave like any other toggleable change.
-    // 目录删除同理（补齐后走 dirKind 语义）——不算「无 diff 的删除」。
+    // rm 命令记录：只展示徽标。fs 级删除带着整文件 diff，与其它可开关变更
+    // 行为一致。目录删除同理（补齐后走 dirKind 语义）——不算「无 diff 的
+    // 删除」。
     const deletedNoDiff = file.deleted === true && file.diffs.length === 0 && file.dir !== true
     // fs 条目的归因徽标（开闸/旧宿主无归因 → 无徽标）。
     const fsBadge = file.origin === 'fs' ? fsOwnerBadge(file, sessionTitle) : null
@@ -1570,6 +1575,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
                     showCopyButton
                     showFileHeaders={false}
                     selectable
+                    navigation
                     selectedHunks={hunkSelection.get(key)}
                     onSelectedHunksChange={(next) => { changeHunkSelection(key, file.diffs.length, next) }}
                     labels={{

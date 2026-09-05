@@ -14,6 +14,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { applyFileReview } from './file-review.tsx'
 import { rewindApply } from './rewind.ts'
+import { timelineApply } from './timeline-panel.tsx'
 
 /**
  * 两个子面的 inject 并集：sessions（会话快照）、locale（词典）、remote
@@ -31,8 +32,9 @@ export const inject = [
   'conversation',
 ]
 
-/** Client plugin body: mount the rewind surface and the file-review surface. */
+/** 客户端插件主体：挂载 rewind 面、时间线面板与文件审查面。 */
 export function apply(ctx: Context): void {
   rewindApply(ctx)
+  timelineApply(ctx)
   applyFileReview(ctx)
 }

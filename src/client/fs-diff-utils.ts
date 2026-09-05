@@ -1,17 +1,16 @@
 /**
- * Utilities for generating diffs from file-system-level changes
- * (PowerShell-created/modified/deleted files detected via checkpoint comparison).
+ * 文件系统级变更（由检查点对比发现的 PowerShell / 终端写盘）的 diff 工具层。
  *
- * Attribution: turn N's changes = diff(turn N's start checkpoint, turn N+1's
- * start checkpoint) — the capture before turn N+1's first step IS turn N's
- * end-of-turn tree state. The host's /shadow-rewind/fs-changes endpoint
- * already applies this pairing (plus a live-tail entry comparing the newest
- * checkpoint against the current disk), and — same build — precomputes each
- * change's added/removed line counts so the client can render rows and stats
- * WITHOUT fetching any content. Full texts ride a lazy per-(turn, path) layer:
- * they are fetched only when a diff body or an undo actually needs them
- * (hover popover, expanded row, undo submit), memoized until the underlying
- * cache entry changes (warm replacement invalidates the turn's memo).
+ * **归属语义**：第 N 轮的文件系统变更 = diff(第 N 轮的轮起检查点, 第 N+1 轮
+ * 的轮起检查点)——第 N+1 轮第一步之前的捕获，就是第 N 轮轮末的树状态。宿主
+ * 的 `/shadow-rewind/fs-changes` 端点已经做好了这层配对（外加一条把最新检查
+ * 点与当前磁盘相比的 live-tail 条目）。
+ *
+ * **计数先行、全文按需**：同一次构建里宿主任顺便把每条变更的增/删行数算好，
+ * 客户端因此能**零全文请求**渲染文件行与统计条；完整内容挂在按
+ * (轮 × 路径) 的懒加载层上——只有真正要展示 diff 或执行撤销时才去拉
+ * （悬停浮层、展开行、撤销提交），并记忆化到该轮缓存条目变化为止（warm
+ * 替换会让该轮记忆失效）。
  */
 import type { ProducedFileDiff, ProducedFileReview } from '../file-review/change-types.ts'
 import type { FsAttributionFields, TurnFileChanges, SessionFileChange } from './session-changes.ts'
@@ -46,16 +45,16 @@ export function fsAttributionOf(source: FsAttributionFields): FsAttributionField
   }
 }
 
-/** One turn's file-system changes as returned by /shadow-rewind/fs-changes. */
+/** `/shadow-rewind/fs-changes` 返回的一轮文件系统变更。 */
 export interface FsChangeTurn {
   readonly turn: number
-  /** turn/start event seq — unique per session per turn; the cache key. */
+  /** turn/start 事件 seq——每会话每轮唯一，正是缓存键。 */
   readonly turnStartSeq: number
   readonly checkpointId: string
-  /** Next turn's checkpoint id, or 'live' (= compare against current disk). */
+  /** 下一轮的检查点 id，或 'live'（= 与当前磁盘相比）。 */
   readonly nextCheckpointId: string
   readonly live?: boolean
-  /** Attached when the entry lives in the module cache (warm knows the session). */
+  /** 条目进入模块缓存时才带上（warm 知道会话）。 */
   readonly sessionId?: string
   readonly changes: readonly FsChange[]
 }
@@ -67,8 +66,11 @@ export interface FsChangesPayload {
   readonly rev?: number
 }
 
-/** Fetch file content from a checkpoint via HTTP. Returns null if not found. */
-async function fetchCheckpointFileContent(
+/**
+ * 经 HTTP 按检查点读取文件内容。找不到或判定为二进制（NUL 字节守卫）时返回
+ * null——调用方一律把 null 当作「全文不可得」，而不是空文件。
+ */
+export async function fetchCheckpointFileContent(
   checkpointId: string,
   path: string,
   cwd: string,
@@ -88,11 +90,13 @@ async function fetchCheckpointFileContent(
     if (typeof data !== 'object' || data === null || Array.isArray(data)) return null
     const record = data as Record<string, unknown>
     if (typeof record.content !== 'string' || record.encoding !== 'base64') return null
-    // Decode base64 to UTF-8 text. atob alone yields a binary string that
-    // splits multi-byte UTF-8 sequences into garbage characters.
+    // base64 → UTF-8 文本：光靠 atob 得到的是二进制字符串，会把多字节
+    // UTF-8 序列拆成乱码字符，必须再过一遍 TextDecoder。
     const binary = atob(record.content)
     const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0))
-    return new TextDecoder('utf-8').decode(bytes)
+    const text = new TextDecoder('utf-8').decode(bytes)
+    // 二进制内容不强行按 UTF-8 渲染：NUL 字节几乎必然是二进制。
+    return text.includes('\u0000') ? null : text
   } catch {
     return null
   }
@@ -115,8 +119,9 @@ function parseFsCommand(raw: unknown): FsChange['command'] | null {
 }
 
 /**
- * Fetch every turn's file-system changes from the batch endpoint
- * (lenient parse: unknown/missing fields degrade to an empty list).
+ * 从批量端点拉取所有轮次的文件系统变更。
+ * 宽松解析：未知 / 缺失字段一律降级（条目丢了就丢了），绝不因一个坏字段
+ * 让整个审查面白屏。
  */
 export async function fetchAllFsChanges(sessionId: string): Promise<FsChangesPayload> {
   try {
@@ -195,24 +200,25 @@ const warmInFlight = new Set<string>()
 const warmLastRev = new Map<string, number>()
 const cacheListeners = new Set<() => void>()
 
-/** Subscribe to cache refreshes (cards re-derive their fs reviews). */
+/** 订阅缓存刷新（卡片据此重新推导自己的 fs 条目）。 */
 export function subscribeFsCache(listener: () => void): () => void {
   cacheListeners.add(listener)
   return () => { cacheListeners.delete(listener) }
 }
 
+/** 广播缓存变化。 */
 function notifyFsCache(): void {
   for (const listener of cacheListeners) listener()
 }
 
-/** Synchronous read for the turn-tail select(): does this turn have fs changes? */
+/** 供轮尾 select() 同步读取的入口：这一轮有 fs 变更吗？ */
 export function cachedFsTurnFor(turnStartSeq: number): FsChangeTurn | undefined {
   return fsCache.get(turnStartSeq)
 }
 
 /**
- * Throttled fire-and-forget warm of one session's fs-changes into the cache.
- * Safe to call from hot paths (badge renders, snapshot subscriptions).
+ * 把某个会话的 fs-changes 预热进缓存（节流 + 发后不理）。
+ * 热路径调用是安全的：徽标渲染、快照订阅都可以随手调一次。
  * rev 未变时（同构建宿主必带）直接跳过解析、缓存写入与通知——warm 的正确性
  * 不再依赖 JSON 深比较；rev 缺省（旧宿主）回退到逐条 JSON 比较。
  */
@@ -246,7 +252,7 @@ export function warmFsChanges(sessionId: string): void {
   })
 }
 
-/** Synchronous read by session + turn (the live bar's lookup; cache entries carry sessionId). */
+/** 按「会话 + 轮」同步读取（live 条的查找键；缓存条目都带 sessionId）。 */
 export function cachedFsTurnForSessionTurn(sessionId: string, turn: number): FsChangeTurn | undefined {
   for (const entry of fsCache.values()) {
     if (entry.sessionId === sessionId && entry.turn === turn) return entry
@@ -274,13 +280,15 @@ function invalidateLazyTurn(turnStartSeq: number): void {
   }
 }
 
-/** Generate ProducedFileDiffs for a file-system change by fetching before/after
- * checkpoint contents. For added files oldText = null (the host's fs undo
- * removes the file); for deleted files newText = '' (the host's fs undo writes
- * the old content back) — both keep the single whole-file shape that carries
- * host file-presence semantics. Modified files are split into real line-level
- * hunks (same basis as the host's hunk math: LF-normalized) so multi-hunk
- * subset undo works like tool writes. nextCheckpointId may be 'live' (current disk). */
+/**
+ * 拉取前后检查点内容，为一个文件系统级变更生成 ProducedFileDiff。
+ *
+ * 形状契约与宿主对齐：新增文件的 `oldText = null`（宿主的 fs 撤销 = 删文件），
+ * 删除文件的 `newText = ''`（宿主的 fs 撤销 = 写回旧内容）——两者都保持承载
+ * 宿主文件存在性语义的单条整文件形状。**修改**文件则切出真正的行级 hunks
+ * （与宿主 hunk 数学同一 LF 归一基准），多 hunk 的子集撤销因此与工具写入
+ * 同路。`nextCheckpointId` 可能是 'live'（= 当前磁盘）。
+ */
 async function generateFsDiff(
   fsChange: FsChange,
   checkpointId: string,
@@ -295,18 +303,18 @@ async function generateFsDiff(
   }
 
   if (kind === 'added') {
-    // New file: only the end-of-turn content exists.
+    // 新文件：只有轮末内容存在。
     const content = await fetchCheckpointFileContent(nextCheckpointId, path, cwd)
     if (content === null) return null
     return [{ path, oldText: null, newText: content, ...modes }]
   }
   if (kind === 'deleted') {
-    // Deleted file: only the start-of-turn content exists.
+    // 删除的文件：只有轮起内容存在。
     const content = await fetchCheckpointFileContent(checkpointId, path, cwd)
     if (content === null) return null
     return [{ path, oldText: content, newText: '', ...modes }]
   }
-  // Modified file: fetch both sides.
+  // 修改的文件：两侧都要拉。
   const [oldContent, newContent] = await Promise.all([
     fetchCheckpointFileContent(checkpointId, path, cwd),
     fetchCheckpointFileContent(nextCheckpointId, path, cwd),
@@ -388,7 +396,7 @@ export function ensureFsFileDiff(
 }
 
 /**
- * Convert one turn's file-system changes into full-diff TurnFileChanges.
+ * 把一轮的文件系统变更转成带完整 diff 的 TurnFileChanges。
  * 保留给「确知需要整轮全文」的调用方（如恢复对话框窗口统计）；常规渲染
  * 走 fsTurnReviews + ensureFsFileDiff，避免无谓的全文 HTTP。
  */

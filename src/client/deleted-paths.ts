@@ -1,43 +1,41 @@
 /**
- * Literal deletion-path extraction from terminal call views (unknown-safe).
+ * 从终端调用里抽取出**字面**删除路径（未知即保守，绝不猜）。
  *
- * dsh has no dedicated delete-file tool: agents delete through the Bash/Pwsh
- * terminals, whose call views carry the raw command line in `title`. There is
- * no filesystem snapshot to consult, so this parser is deliberately
- * conservative — it only reports paths that appear VERBATIM as arguments of a
- * known deletion command:
+ * dsh 没有专门的「删除文件」工具：Agent 只能走 Bash / Pwsh 终端删，原始
+ * 命令行就躺在调用参数里。这里没有文件系统快照可比对，所以解析器刻意保守
+ * ——只认那些**逐字**出现在已知删除命令参数位上的路径：
  *
- * - command substitution (`$(…)`, backticks) or process substitution anywhere
- *   in a segment disqualifies that whole segment;
- * - glob characters (`* ? [`) or variable expansion (`$`) in an argument
- *   disqualify that argument (the affected set cannot be enumerated post
- *   hoc);
- * - shell separators (`&&`, `||`, `|`, `;`, newline) split the line so
- *   `rm a && rm b` reports both while `echo rm x` reports nothing.
+ *  - 段里任何位置出现命令/进程替换（`$(…)`、反引号、`<(…)`），整段作废；
+ *  - 参数里出现通配符（`* ? [`）或变量展开（`$`），该参数作废（事后无法
+ *    枚举受影响集合）；
+ *  - 按 shell 分隔符（`&&`、`||`、`|`、`;`、换行）切段，于是 `rm a && rm b`
+ *    两个都报，而 `echo rm x` 一个都不报。
  *
- * A reported path is display-only vocabulary: the file is gone, so it carries
- * no diff hunks and no undo. Directories deleted with `rm -r` surface as the
- * directory path itself.
+ * 报出来的路径只是**展示用词汇**：文件已经不在了，既没有 hunk 也不能撤销。
+ * `rm -r` 删掉的目录以其自身路径呈现。
  */
 
-/** Commands whose literal arguments name deleted paths (POSIX + PowerShell aliases). */
+/** 参数位上逐字给出被删路径的命令（POSIX + PowerShell 别名）。 */
 const DELETERS = new Set([
   'rm', 'rmdir', 'unlink', 'shred', 'trash',
   'remove-item', 'ri', 'del', 'rd', 'erase',
 ])
 
-/** PowerShell parameters whose NEXT argument is the path, not an option value. */
+/** Terminal tools whose arguments carry the raw command line (dsh 0.1.2 工具名）。 */
+const TERMINAL_TOOLS = new Set(['bash', 'pwsh', 'terminal_send', 'terminal_open'])
+
+/** PowerShell 里「下一个参数才是路径」的参数名（`-Path` / `-LiteralPath`）。 */
 const PATH_PARAMETERS = /^-(path|literalpath)$/i
 
-/** Arguments never treated as paths: glob/expansion-bearing or self/parent refs. */
+/** 这个 token 能否当作路径：含通配符 / 展开符，或只是 `.` / `..`，一律不算。 */
 function isPathlike(token: string): boolean {
   if (token === '' || token === '.' || token === '..') return false
   return !/[*?\[\]$]/.test(token)
 }
 
 /**
- * Split one command line on shell separators, honoring quotes so a `;` inside
- * a quoted argument does not split.
+ * 按 shell 分隔符把一条命令行切成若干段，同时尊重引号——引号里的 `;`
+ * 不会把参数切开。
  */
 function splitSegments(command: string): readonly string[] {
   const segments: string[] = []
@@ -48,8 +46,7 @@ function splitSegments(command: string): readonly string[] {
     if (quote !== null) {
       if (char === '\\') {
         const next = command[at + 1]
-        // Only a double-quoted escaped quote matters for segmentation; every
-        // other backslash (Windows paths) is literal.
+        // 只有双引号内的转义引号才影响切段；其余反斜杠（Windows 路径）按字面处理。
         if (quote === '"' && next === '"') {
           current += char + '"'
           at += 1
@@ -86,12 +83,12 @@ function splitSegments(command: string): readonly string[] {
 }
 
 /**
- * Shell-like tokenization of one segment, quotes joined into the token.
- * Backslash semantics follow the Windows-relevant reading: inside SINGLE
- * quotes (bash/PowerShell alike) everything is literal, and unquoted
- * backslashes stay literal too (PowerShell paths); only inside DOUBLE quotes
- * does a backslash escape the closing quote or itself (bash). A trailing open
- * quote still yields the tokens gathered so far.
+ * 对一段命令行做类 shell 分词，引号并入 token 内部。
+ *
+ * 反斜杠语义取与 Windows 相关的那种读法：单引号内（bash / PowerShell 皆然）
+ * 一切皆字面，未加引号的反斜杠同样是字面（PowerShell 路径）；只有在双引号
+ * 内，反斜杠才转义闭合引号或它自己（bash）。末尾引号未闭合时，已收集到的
+ * token 照常产出——宁可少认，不要崩。
  */
 function tokenize(segment: string): readonly string[] {
   const tokens: string[] = []
@@ -137,16 +134,14 @@ function tokenize(segment: string): readonly string[] {
 }
 
 /**
- * Deletion paths named literally by one terminal command line, in argument
- * order, deduplicated. `undefined`/non-string titles and non-terminal views
- * report nothing.
+ * 一条终端命令行**逐字**点名的删除路径，按参数顺序、去重后返回。
+ * 非字符串输入与非终端视图一律返回空——认不出来就不报。
  */
 export function deletedPathsFromCommand(command: string): readonly string[] {
   const paths: string[] = []
   const seen = new Set<string>()
-  // PowerShell passes comma-separated lists as separate arguments
-  // (`rm 'a.txt','b.txt'`); a comma may also just live in a filename, so each
-  // part still passes the same pathlike filter.
+  // PowerShell 的逗号分隔列表会作为独立参数传进来（`rm 'a.txt','b.txt'`）；
+  // 逗号本身也可能就是文件名的一部分，所以每一截仍要过同一道 pathlike 过滤。
   const accept = (raw: string): void => {
     for (const part of raw.split(',')) {
       if (!isPathlike(part) || seen.has(part)) continue
@@ -155,10 +150,10 @@ export function deletedPathsFromCommand(command: string): readonly string[] {
     }
   }
   for (const segment of splitSegments(command)) {
-    // Command/process substitution: the affected paths are unknowable.
+    // 命令/进程替换：受影响路径不可知，整段跳过。
     if (segment.includes('$(') || segment.includes('`') || segment.includes('<(')) continue
     const tokens = tokenize(segment)
-    // Leading environment assignments (`FOO=1 rm x`) precede the command.
+    // 跳过命令行首的环境变量赋值（`FOO=1 rm x`），它们排在命令词之前。
     let at = 0
     while (at < tokens.length) {
       const head = tokens[at]
@@ -187,13 +182,20 @@ export function deletedPathsFromCommand(command: string): readonly string[] {
 }
 
 /**
- * Deleted paths reported by one tool call view: terminal cards carry the
- * command in `title`. Every other card shape (diff/generic/…) declares no
- * deletions.
+ * 一次工具调用报出的删除路径：只有终端工具在 `arguments.command` 里带原始
+ * 命令行（dsh 0.1.2 起调用视图被移除，命令行直接从会话事件的 `tool/call`
+ * 参数解析）。其它工具一律声明「没有删除」。
  */
-export function deletedPaths(view: unknown): readonly string[] {
-  if (typeof view !== 'object' || view === null || Array.isArray(view)) return []
-  const record = view as Record<string, unknown>
-  if (record.card !== 'terminal' || typeof record.title !== 'string') return []
-  return deletedPathsFromCommand(record.title)
+export function deletedPathsFromCall(name: string, argsRaw: string): readonly string[] {
+  if (!TERMINAL_TOOLS.has(name)) return []
+  let args: unknown
+  try {
+    args = JSON.parse(argsRaw) as unknown
+  } catch {
+    return []
+  }
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return []
+  const command = (args as Record<string, unknown>).command
+  if (typeof command !== 'string') return []
+  return deletedPathsFromCommand(command)
 }

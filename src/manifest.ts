@@ -4,7 +4,7 @@ import { isAbsolute } from 'node:path'
 import { ShadowRewindError } from './errors.js'
 import { validateRelativePath } from './path-utils.js'
 import { FORMAT_VERSION } from './types.js'
-import type { FileEntry, Manifest, RestoreOperation, SkippedPath, SnapshotEntry, WorkspaceChange } from './types.js'
+import type { FileEntry, Manifest, RestoreOperation, SkippedPath, SnapshotEntry, TurnIntent, WorkspaceChange } from './types.js'
 
 /** 生成形如 `rp_<timeBase36>_<rand12>` 的持久化 id。 */
 export function makeId(prefix: 'rp' | 'op' | 'plan'): string {
@@ -21,7 +21,7 @@ export function sha256Hex(content: Buffer): string {
 /**
  * 全树确定性哈希：路径逐条目序列化后统一 SHA-256。
  * 快照条目只含 kind/blob/size/mode/target——与字节存放在哪个后端无关，
- * 因此同一棵树在 jj 与 blob 两种后端下 treeHash 一致。
+ * 因此同一棵树在 jj 与 sqlite 两种后端下 treeHash 一致。
  * 刻意不含 mtimeNs：树哈希是内容寻址，恢复写回不保留时间戳——若时间戳进哈希，
  * 恢复后树哈希必变，会击穿 planRestore 的树哈希 CAS（旧清单也因而判「损坏」）。
  */
@@ -111,12 +111,12 @@ export function parseManifest(value: unknown): Manifest {
   const restoreKind = kind
   const workspace = absoluteString(record, 'workspace')
   const storage = record.storage
-  if (storage !== 'jj' && storage !== 'blob') corrupt('storage 必须是 "jj" 或 "blob"')
+  if (storage !== 'jj' && storage !== 'sqlite') corrupt('storage 必须是 "jj" 或 "sqlite"')
   const commitId = optionalString(record, 'commitId')
   if (storage === 'jj') {
     if (commitId === undefined || !/^[0-9a-f]{40}$/.test(commitId)) corrupt('jj 后端的恢复点必须携带 40 位 commitId')
   } else if (commitId !== undefined) {
-    corrupt('blob 后端的恢复点不应携带 commitId')
+    corrupt('sqlite 后端的恢复点不应携带 commitId')
   }
   const entriesRecord = objectRecord(record.entries, '恢复点条目')
   const entries: Record<string, SnapshotEntry> = Object.create(null)
@@ -157,6 +157,10 @@ export function parseManifest(value: unknown): Manifest {
     }
     if (phase !== undefined) corrupt('只有 turn 恢复点可以携带 phase')
   }
+  if (record.intent !== undefined) {
+    if (restoreKind !== 'turn' || phase !== 'end') corrupt('只有 turn 轮末恢复点可以携带 intent')
+  }
+  const intent = parseIntent(record.intent)
   const lastRestoredAt = optionalNonNegativeInteger(record, 'lastRestoredAt')
   return {
     version: FORMAT_VERSION,
@@ -171,6 +175,7 @@ export function parseManifest(value: unknown): Manifest {
     ...(turn === undefined ? {} : { turn }),
     ...(turnStartSeq === undefined ? {} : { turnStartSeq }),
     ...(phase === undefined ? {} : { phase }),
+    ...(intent === undefined ? {} : { intent }),
     ...(turnEndSeq === undefined ? {} : { turnEndSeq }),
     createdAt,
     treeHash,
@@ -223,6 +228,22 @@ export function parseOperation(value: unknown): RestoreOperation {
     ...(error === undefined ? {} : { error }),
     ...(rollbackError === undefined ? {} : { rollbackError }),
   }
+}
+
+/** 解析 intent 字段（轮末检查点的本轮工具调用摘要）。形状非法 fail-closed：
+ * 这是本插件自产自销的字段，生产侧从不写坏数据。 */
+function parseIntent(value: unknown): TurnIntent[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) corrupt('intent 必须是数组')
+  const intent: TurnIntent[] = []
+  for (const item of value) {
+    const record = objectRecord(item, 'intent 条目')
+    const tool = stringField(record, 'tool')
+    const path = stringField(record, 'path')
+    const seq = nonNegativeInteger(record, 'seq')
+    intent.push({ tool, path, seq })
+  }
+  return intent
 }
 
 function parseSkipped(value: unknown): SkippedPath[] {

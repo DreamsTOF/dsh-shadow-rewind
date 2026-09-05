@@ -21,5 +21,5 @@ import type { Context } from '@deepseek-ai/cordis';
  * tab 面，其余全部可用）。
  */
 export declare const inject: string[];
-/** Client plugin body: mount the rewind surface and the file-review surface. */
+/** 客户端插件主体：挂载 rewind 面、时间线面板与文件审查面。 */
 export declare function apply(ctx: Context): void;

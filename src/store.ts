@@ -1,14 +1,16 @@
 /**
  * 持久化存储层：工作区目录映射、互斥锁、恢复点清单、操作日志、
- * 自动检查点跳过记录与 legacy 内容寻址 blob。
+ * 自动检查点跳过记录与 SQLite 内容寻址库（jj 缺失时的降级目标）。
  *
  * 工作区 key = SHA-256(规范化绝对路径)。工作区改名/移动后得到全新 key，
  * 旧数据原样保留（不迁移、不删除）——全新插件没有历史包袱，隔离即正确。
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { hostname, platform, arch } from 'node:os'
-import { link, mkdir, open, readFile, readdir, realpath, rmdir, unlink } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { mkdir, open, realpath, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import type { DatabaseSync } from 'node:sqlite'
 import { ShadowRewindError, errorMessage } from './errors.js'
 import {
   isNodeError,
@@ -246,94 +248,111 @@ export class WorkspaceStore {
     }
   }
 
-  // ── legacy 内容寻址 blob ────────────────────────────────────────────────
+  // ── SQLite 内容寻址库 ───────────────────────────────────────────────────
 
-  /** 写入并校验一个 blob；已存在时读回比对（内容寻址下等价即安全）。 */
-  async putBlob(workspace: string, hash: string, content: Buffer): Promise<void> {
-    if (!/^[0-9a-f]{64}$/.test(hash)) throw new ShadowRewindError('STATE_CORRUPT', `非法 blob 哈希 ${JSON.stringify(hash)}`)
-    if (sha256Hex(content) !== hash) {
-      throw new ShadowRewindError('BLOB_HASH_MISMATCH', '内容与声明哈希不一致，拒绝写入')
-    }
+  private readonly sqliteDbs = new Map<string, DatabaseSync>()
+
+  /** 打开（或复用）工作区的快照内容库：单文件 SQLite（WAL + FULL），内容寻址。 */
+  private async sqliteDb(workspace: string): Promise<DatabaseSync> {
     const dir = await this.workspaceDir(workspace)
-    const prefixDir = join(dir, 'blobs', hash.slice(0, 2))
-    await mkdir(prefixDir, { recursive: true, mode: 0o700 })
-    const target = join(prefixDir, hash)
-    if (await pathExists(target)) {
-      const existing = await readFile(target)
-      if (sha256Hex(existing) !== hash) {
-        throw new ShadowRewindError('BLOB_COLLISION', `已存在的 blob ${hash} 与内容不符`)
+    let db = this.sqliteDbs.get(dir)
+    if (db === undefined) {
+      // 构造器经惰性 require 获取：node:sqlite 缺失时本模块仍可加载，
+      // 由 sqliteAvailable() 在启动期给出明确的降级信号。
+      db = new (sqliteConstructor())(join(dir, 'content.db'))
+      db.exec('PRAGMA journal_mode = WAL')
+      // FULL：每次提交都 fsync，与旧 blob 存储逐文件 fsync 的持久性同级。
+      db.exec('PRAGMA synchronous = FULL')
+      db.exec('CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, size INTEGER NOT NULL, content BLOB NOT NULL)')
+      this.sqliteDbs.set(dir, db)
+    }
+    return db
+  }
+
+  /**
+   * 批量写入内容寻址 blob（单事务）。
+   * ponytail: 整库单文件 + 内容寻址表；天花板是「跨工作区全局去重」与
+   * 「增量压缩」，需要时再加全局库或 VACUUM 策略，当前单工作区去重已够。
+   */
+  async putSqliteBlobs(workspace: string, items: readonly {
+    readonly hash: string
+    readonly content: Buffer
+  }[]): Promise<void> {
+    if (items.length === 0) return
+    const db = await this.sqliteDb(workspace)
+    const insert = db.prepare('INSERT INTO blobs (hash, size, content) VALUES (?, ?, ?) ON CONFLICT (hash) DO NOTHING')
+    const select = db.prepare('SELECT content FROM blobs WHERE hash = ?')
+    db.exec('BEGIN IMMEDIATE')
+    let committed = false
+    try {
+      for (const item of items) {
+        if (!/^[0-9a-f]{64}$/.test(item.hash)) throw new ShadowRewindError('STATE_CORRUPT', `非法 blob 哈希 ${JSON.stringify(item.hash)}`)
+        if (sha256Hex(item.content) !== item.hash) {
+          throw new ShadowRewindError('BLOB_HASH_MISMATCH', '内容与声明哈希不一致，拒绝写入')
+        }
+        // 已存在时读回比对（内容寻址下等价即安全）。
+        if (insert.run(item.hash, item.content.length, item.content).changes === 0) {
+          const row = select.get(item.hash) as { content: Uint8Array } | undefined
+          if (row === undefined || sha256Hex(Buffer.from(row.content)) !== item.hash) {
+            throw new ShadowRewindError('BLOB_COLLISION', `已存在的 blob ${item.hash} 与内容不符`)
+          }
+        }
       }
-      return
-    }
-    const temporary = join(prefixDir, `.${randomUUID()}.tmp`)
-    const handle = await open(temporary, 'wx', 0o600)
-    try {
-      await handle.writeFile(content)
-      await handle.sync()
+      db.exec('COMMIT')
+      committed = true
     } finally {
-      await handle.close()
-    }
-    try {
-      await link(temporary, target)
-      await syncDirectory(prefixDir)
-    } catch (error) {
-      if (!isNodeError(error, 'EEXIST')) throw error
-    } finally {
-      await unlink(temporary).catch(() => undefined)
+      if (!committed) {
+        try {
+          db.exec('ROLLBACK')
+        } catch {
+          // 事务已自动回滚（如 BEGIN 后连接异常）：忽略。
+        }
+      }
     }
   }
 
-  /** 缓存命中校验用：blob 是否确实存在于存储（不读内容，仅 stat）。 */
-  async blobExists(workspace: string, hash: string): Promise<boolean> {
+  /** 缓存命中校验用：内容行是否确实存在于库（不读内容）。 */
+  async sqliteBlobExists(workspace: string, hash: string): Promise<boolean> {
     if (!/^[0-9a-f]{64}$/.test(hash)) return false
-    const dir = await this.workspaceDir(workspace)
-    return pathExists(join(dir, 'blobs', hash.slice(0, 2), hash))
+    const db = await this.sqliteDb(workspace)
+    return db.prepare('SELECT 1 AS x FROM blobs WHERE hash = ?').get(hash) !== undefined
   }
 
   /** 读取并校验一个 blob。 */
-  async readBlob(workspace: string, hash: string): Promise<Buffer> {
+  async readSqliteBlob(workspace: string, hash: string): Promise<Buffer> {
     if (!/^[0-9a-f]{64}$/.test(hash)) throw new ShadowRewindError('STATE_CORRUPT', `非法 blob 哈希 ${JSON.stringify(hash)}`)
-    const dir = await this.workspaceDir(workspace)
-    const content = await readFile(join(dir, 'blobs', hash.slice(0, 2), hash))
+    const db = await this.sqliteDb(workspace)
+    const row = db.prepare('SELECT content FROM blobs WHERE hash = ?').get(hash) as { content: Uint8Array } | undefined
+    if (row === undefined) {
+      throw new ShadowRewindError('BLOB_CORRUPT', `blob ${hash} 不存在于内容库`)
+    }
+    const content = Buffer.from(row.content)
     if (sha256Hex(content) !== hash) {
       throw new ShadowRewindError('BLOB_CORRUPT', `blob ${hash} 校验失败`)
     }
     return content
   }
 
-  /** 删除未被任何 manifest 引用的 blob（只统计 blob 后端的引用）。 */
+  /** 删除未被任何 manifest 引用的内容行（只统计 sqlite 后端的引用）。 */
   async collectGarbage(workspace: string): Promise<{ deletedBlobs: number; retainedBlobs: number }> {
     const referenced = new Set<string>()
     for (const manifest of await this.listManifests(workspace)) {
       for (const entry of Object.values(manifest.entries)) {
-        if (entry.kind === 'file' && manifest.storage === 'blob') referenced.add(entry.blob)
+        if (entry.kind === 'file' && manifest.storage === 'sqlite') referenced.add(entry.blob)
       }
     }
-    const dir = await this.workspaceDir(workspace)
-    const blobsRoot = join(dir, 'blobs')
+    const db = await this.sqliteDb(workspace)
+    const rows = db.prepare('SELECT hash FROM blobs').all() as unknown as readonly { hash: string }[]
+    const remove = db.prepare('DELETE FROM blobs WHERE hash = ?')
     let deletedBlobs = 0
     let retainedBlobs = 0
-    for (const prefix of await safeDirectoryNames(blobsRoot)) {
-      const prefixPath = join(blobsRoot, prefix)
-      for (const filename of await safeFileNames(prefixPath)) {
-        if (filename.startsWith('.') && filename.endsWith('.tmp')) {
-          await unlink(join(prefixPath, filename))
-          deletedBlobs += 1
-          continue
-        }
-        if (referenced.has(filename) && filename.slice(0, 2) === prefix) {
-          retainedBlobs += 1
-          continue
-        }
-        await unlink(join(prefixPath, filename))
-        deletedBlobs += 1
+    for (const row of rows) {
+      if (referenced.has(row.hash)) {
+        retainedBlobs += 1
+        continue
       }
-      // 前缀目录空了就顺手收掉。
-      try {
-        await rmdir(prefixPath)
-      } catch (error) {
-        if (!isNodeError(error, 'ENOTEMPTY') && !isNodeError(error, 'EEXIST')) throw error
-      }
+      remove.run(row.hash)
+      deletedBlobs += 1
     }
     return { deletedBlobs, retainedBlobs }
   }
@@ -341,6 +360,18 @@ export class WorkspaceStore {
   /** 启动恢复用：列出全部工作区状态目录（key 形式）。 */
   async listWorkspaceKeys(): Promise<readonly string[]> {
     return safeDirectoryNames(join(this.config.storageDir, 'workspaces'))
+  }
+
+  /** 关闭全部打开的 SQLite 句柄（受控关闭/测试清理用；幂等）。 */
+  async closeAll(): Promise<void> {
+    for (const [dir, db] of this.sqliteDbs) {
+      this.sqliteDbs.delete(dir)
+      try {
+        db.close()
+      } catch {
+        // 已关闭或连接异常：句柄回收尽力而为。
+      }
+    }
   }
 
   /** 状态根必须不在被管理工作区内（防自吞）。 */
@@ -406,4 +437,27 @@ function hostIdentity(): string {
   }
   hostId = sha256Hex(Buffer.from(JSON.stringify({ host: hostname(), platform: platform(), arch: arch() })))
   return hostId
+}
+
+let sqliteModule: typeof import('node:sqlite') | 'missing' | undefined
+
+/** 探测宿主机 `node:sqlite` 是否可用（一次性开销；Node ≥22.19 自带）。 */
+export function sqliteAvailable(): boolean {
+  if (sqliteModule === undefined) {
+    try {
+      sqliteModule = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite')
+    } catch {
+      sqliteModule = 'missing'
+    }
+  }
+  return sqliteModule !== 'missing'
+}
+
+/** 取 DatabaseSync 构造器；仅在 sqliteAvailable() 为真后调用。 */
+function sqliteConstructor(): typeof import('node:sqlite').DatabaseSync {
+  if (sqliteModule === undefined) sqliteAvailable()
+  if (sqliteModule === undefined || sqliteModule === 'missing') {
+    throw new ShadowRewindError('STATE_CORRUPT', 'node:sqlite 不可用，无法打开 SQLite 内容库')
+  }
+  return sqliteModule.DatabaseSync
 }

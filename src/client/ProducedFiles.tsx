@@ -1,16 +1,19 @@
-// ProducedFiles: the review card a finished turn ends with. Paths and hunks
-// come from mutation-tool results, never from the closing prose.
-//
-// Sidebar-tab port: the original Review DRAWER (a host-grid details-column
-// hijack) is removed — it fought the better-sidebar panel for the same screen
-// edge. The 审查 button and the per-file chips now open the plugin's
-// better-sidebar 'file-review' tab instead, carrying the turn's paths (or the
-// one clicked path) as `meta.expandPaths` so the tab expands exactly those
-// diffs. The Undo/Reapply toggle is unchanged.
+/**
+ * ProducedFiles —— 一轮结束后收尾的审查卡片。路径与 hunks 一律来自变更工具
+ * 的**结果**，绝不是收尾文风。
+ *
+ * 侧边栏 tab 移植：原先的 Review DRAWER（劫持宿主网格的细节列）已移除——它
+ * 跟 better-sidebar 面板争同一块屏幕边缘。现在「审查」按钮与单文件 chip 改
+ * 打开本插件的 better-sidebar `file-review` tab，把整轮路径（或点中的那一个
+ * 路径）作为 `meta.expandPaths` 带上，tab 据此精确展开那些 diff。
+ * 撤销/重新应用开关保持不变。
+ */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
-import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { ReactNode } from 'react'
+import type { InjectFace, PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
+import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type {
   FileReviewAction, FileReviewChange, FileReviewFileState, FileReviewRequest, FileReviewResult,
 } from '../file-review/change-types.ts'
@@ -20,6 +23,7 @@ import { cachedFsTurnFor, fsTurnReviews, ensureFsFileDiff, subscribeFsCache } fr
 import type { FsChangeTurn } from './fs-diff-utils.ts'
 import { DiffPopover, type PopoverAnchorRect } from './diff-popover.tsx'
 import { summarizeDiffs, type UnifiedDiffStats } from './UnifiedDiff.tsx'
+import { buildDirTree, countLeafFiles, type DirTreeNode } from './dir-tree.ts'
 import css from './ProducedFiles.module.css'
 
 const SUCCESS_NOTICE_DURATION = 2000
@@ -37,22 +41,32 @@ interface ToggleNotice {
   readonly files: readonly NoticeFile[]
 }
 
-/** Matched file reviews plus the opener and locale supplied by the turn-tail slot. */
+/**
+ * Registration-side helpers (dsh 0.1.2 起轮尾链槽位的 inject 为零参工厂，不
+ * 再携带 sessionId——会话身份由组件的标准 props `sessionId` 提供，这里的
+ * 回调都以 sessionId 为首参在调用点绑定）。
+ */
+export interface ProducedFilesInjected {
+  /** 会话工作区根（预留字段；聊天卡片按工具原样展示路径）。 */
+  projectRootFor: (sessionId: string) => string | undefined
+  inspectChanges: (sessionId: string, request: FileReviewRequest) => Promise<FileReviewResult>
+  applyChanges: (sessionId: string, request: FileReviewRequest) => Promise<FileReviewResult>
+  /**
+   * 用给定路径预展开地打开本插件的侧边栏 tab（「审查」按钮传全部产出路径，
+   * 单个文件 chip 传它自己的）。所属轮号随行，让 tab 只展开这一轮的行——在
+   * 其它轮反复出现的路径在那里保持折叠。
+   */
+  openInSidebarTab: (sessionId: string, paths: readonly string[], turn?: number) => void
+}
+
+/** 匹配到的文件审查，加上轮尾槽供给的 opener 与 locale。 */
 export type ProducedFilesProps = Pick<TurnTailOwnerProps, 'openFile' | 'turn'> & {
   matched: readonly ProducedFileReview[]
-  /** Session workspace root (reserved; the chat card shows tool paths verbatim). */
-  projectRoot?: string | undefined
-  inspectChanges?: (request: FileReviewRequest) => Promise<FileReviewResult>
-  applyChanges?: (request: FileReviewRequest) => Promise<FileReviewResult>
-  /**
-   * Open the plugin's sidebar tab with the given paths pre-expanded
-   * (the 审查 button passes every produced path; a file chip passes its own).
-   * The owning turn number rides along so the tab expands only this turn's
-   * rows — a path that recurs in other turns stays collapsed there.
-   */
-  openInSidebarTab?: (paths: readonly string[], turn?: number) => void
-} & PropsLocale<typeof NS>
+  /** 框架解析出的会话标识（session 作用域槽位的标准 props）。 */
+  sessionId: SessionId
+} & InjectFace<ProducedFilesInjected> & PropsLocale<typeof NS>
 
+/** 注入缺席时的占位巡检/操作：如实报告「宿主不可用」，绝不假装成功。 */
 const unavailableChanges = async (request: FileReviewRequest): Promise<FileReviewResult> => ({
   files: request.files.map(file => ({
     path: file.path,
@@ -61,6 +75,11 @@ const unavailableChanges = async (request: FileReviewRequest): Promise<FileRevie
     reason: 'Host file toggle is unavailable',
   })),
 })
+
+const unavailableSessionChanges = async (
+  _sessionId: string,
+  request: FileReviewRequest,
+): Promise<FileReviewResult> => unavailableChanges(request)
 
 function FileIcon() {
   return (
@@ -205,15 +224,44 @@ function Stats({ stats, label }: { readonly stats: UnifiedDiffStats; readonly la
   )
 }
 
-/** Render one turn's produced files as a summary card opening the sidebar tab. */
+/** 增/删比例色条（GitHub 式红绿两段条）：数字之外的即时视觉印象。 */
+function StatBar({ stats }: { readonly stats: UnifiedDiffStats }) {
+  const total = stats.added + stats.removed
+  if (total <= 0) return null
+  const addedPct = Math.round((stats.added / total) * 100)
+  return (
+    <span className={css.statBar} aria-hidden="true">
+      {stats.added > 0 && <span className={css.statBarAdded} style={{ width: `${String(addedPct)}%` }} />}
+      {stats.removed > 0 && <span className={css.statBarRemoved} style={{ width: `${String(100 - addedPct)}%` }} />}
+    </span>
+  )
+}
+
+/** 把一轮的产出文件渲染成摘要卡片，并提供打开侧边栏 tab 的入口。 */
 export function ProducedFiles({
   matched: matchedReviews, openFile, turn: turnLocation,
-  projectRoot,
-  inspectChanges = unavailableChanges, applyChanges = unavailableChanges,
-  openInSidebarTab, t,
+  sessionId,
+  projectRootFor,
+  inspectChanges: inspectChangesFor = unavailableSessionChanges, applyChanges: applyChangesFor = unavailableSessionChanges,
+  openInSidebarTab: openInSidebarTabFor, t,
 }: ProducedFilesProps) {
-  // The owning turn number (TurnLocation.turn) rides every deep link so the
-  // sidebar tab expands this turn's rows only.
+  // dsh 0.1.2：注入的回调以 sessionId 为首参；在组件内绑定本卡会话后沿用
+  // 原有变量名，正文零改动。
+  const projectRoot = projectRootFor(sessionId)
+  const inspectChanges = useCallback(
+    (request: FileReviewRequest) => inspectChangesFor(sessionId, request),
+    [inspectChangesFor, sessionId],
+  )
+  const applyChanges = useCallback(
+    (request: FileReviewRequest) => applyChangesFor(sessionId, request),
+    [applyChangesFor, sessionId],
+  )
+  const openInSidebarTab = useCallback(
+    (paths: readonly string[], turn?: number) => openInSidebarTabFor(sessionId, paths, turn),
+    [openInSidebarTabFor, sessionId],
+  )
+  // 所属轮号（TurnLocation.turn）随每个深链同行，让侧边栏 tab 只展开这一轮的
+  // 行。
   const turnNumber = turnLocation.turn
   const [toggleAction, setToggleAction] = useState<FileReviewAction>('undo')
   const [statusPending, setStatusPending] = useState(true)
@@ -339,9 +387,9 @@ export function ProducedFiles({
     ),
     [reviewsWithStats],
   )
-  // Deleted paths carry no hunks and cannot be inspected or toggled; they are
-  // display vocabulary on the chips only. Fs-level deletions DO carry a
-  // whole-file diff and are toggleable (host fs semantics restore the file).
+  // 终端删除的路径没有 hunks、不能巡检也不能开关——它们只是 chip 上的展示
+  // 词汇。**文件系统级**的删除则带着整文件 diff、可以开关（宿主 fs 语义会把
+  // 文件还原回来）。
   // 已补齐全文的条目才参与巡检与整轮提交；fs 占位条目在操作时按需补齐。
   const inspectFiles = useMemo(() => reviews
     .filter(review => review.diffs.length > 0)
@@ -362,7 +410,7 @@ export function ProducedFiles({
       && review.diffs[0].oldMode !== undefined && review.diffs[0].newMode !== undefined
       && review.diffs[0].oldMode !== review.diffs[0].newMode)
     || (review.diffs.length > 0 && (
-      // fs shapes: single whole-file diff (added: no before; deleted: empty after).
+      // fs 形状：单条整文件 diff（added：无旧侧；deleted：新侧为空）。
       (review.diffs.length === 1
         && review.diffs[0] !== undefined
         && review.diffs[0].path === review.path
@@ -380,7 +428,7 @@ export function ProducedFiles({
   const hasToggleableFiles = useMemo(() => reviews.some(review =>
     review.diffs.length > 0 || review.origin === 'fs'), [reviews])
   const allPaths = useMemo(() => reviews.map(review => review.path), [reviews])
-  // A turn that only deleted files reads as a deletion summary, not an edit.
+  // 只删了文件的一轮读作「删除摘要」而不是「编辑摘要」。
   const allDeleted = reviews.length > 0 && reviews.every(review => review.deleted === true)
   const statsMatter = totalStats.added > 0 || totalStats.removed > 0
 
@@ -425,8 +473,7 @@ export function ProducedFiles({
           result.files.find(file => file.path === path)?.state === 'undone')
       setToggleAction(allUndone ? 'redo' : 'undo')
     }).catch(() => {
-      // The action remains usable after a transient inspection failure; execution
-      // performs the same Host-side checks again.
+      // 巡检瞬时失败后动作仍保持可用：真正执行时宿主会再做同样的校验。
     }).finally(() => {
       if (active) setStatusPending(false)
     })
@@ -596,6 +643,105 @@ export function ProducedFiles({
     statusPending, togglePending,
   ])
 
+  // 目录折叠（借鉴 dsh-checkpoint-diff 的 tree.js）：扁平清单 → 折叠目录树；
+  // 目录行可开合，叶子行 = 原有 fileRow（深链 + 悬停浮层 + 单文件撤销）。
+  const [collapsedDirs, setCollapsedDirs] = useState<ReadonlySet<string>>(() => new Set())
+  const dirTree = useMemo(
+    () => buildDirTree(reviewsWithStats.map((entry) => entry.review.path)),
+    [reviewsWithStats],
+  )
+  const itemByPath = useMemo(
+    () => new Map(reviewsWithStats.map((entry) => [entry.review.path, entry])),
+    [reviewsWithStats],
+  )
+  const toggleDir = useCallback((dirPath: string) => {
+    setCollapsedDirs((current) => {
+      const next = new Set(current)
+      if (next.has(dirPath)) next.delete(dirPath)
+      else next.add(dirPath)
+      return next
+    })
+  }, [])
+
+  const renderFileLeaf = (review: ProducedFileReview, stats: UnifiedDiffStats, depth: number) => {
+    const reversible = reversiblePaths.has(review.path)
+    const fileAction: FileReviewAction = fileStates.get(review.path) === 'undone' ? 'redo' : 'undo'
+    return (
+      <div className={css.fileRow} key={review.path} title={review.path}>
+        <button
+          type="button"
+          className={css.fileLink}
+          aria-label={t('produced.review', { name: review.path })}
+          onMouseEnter={() => { schedulePopoverShow(review) }}
+          onMouseLeave={schedulePopoverHide}
+          onFocus={() => { schedulePopoverShow(review) }}
+          onBlur={schedulePopoverHide}
+          onClick={() => {
+            setPopover(null)
+            clearPopoverTimers('both')
+            openInSidebarTab?.([review.path], turnNumber)
+          }}
+        >
+          {depth > 0 && <span className={css.dirIndent} aria-hidden="true" style={{ width: depth * 14 }} />}
+          <span className={css.fileName}>{basename(review.path)}</span>
+          {review.deleted === true
+            ? <span className={css.deletedBadge}>{t('produced.deleted')}</span>
+            : review.dir === true
+              ? <span className={css.deletedBadge}>{t('produced.dir')}</span>
+              : (
+                <>
+                  <StatBar stats={stats} />
+                  <Stats
+                    stats={stats}
+                    label={t('review.stats', {
+                      added: String(stats.added), removed: String(stats.removed),
+                    })}
+                  />
+                </>
+              )}
+        </button>
+        {/* fs 占位条目（全文未补齐）也给出撤销按钮：点击时按需补齐再提交。 */}
+        {(review.deleted !== true || review.diffs.length > 0 || review.dir === true) && (reversible || review.origin === 'fs') && (
+          <button
+            type="button"
+            className={css.fileUndoButton}
+            disabled={statusPending || togglePending || fileBusy !== null}
+            aria-label={t(fileAction === 'undo' ? 'produced.undoFile' : 'produced.redoFile')}
+            title={t(fileAction === 'undo' ? 'produced.undoFile' : 'produced.redoFile')}
+            onClick={() => { runFileToggle(review) }}
+          >
+            {fileAction === 'undo' ? <FileUndoIcon /> : <FileRedoIcon />}
+          </button>
+        )}
+      </div>
+    )
+  }
+
+  const renderDirNodes = (nodes: readonly DirTreeNode[], depth: number): ReactNode[] => nodes.flatMap((node) => {
+    if (node.children === undefined) {
+      const item = itemByPath.get(node.path)
+      return item === undefined ? [] : [renderFileLeaf(item.review, item.stats, depth)]
+    }
+    const isCollapsed = collapsedDirs.has(node.path)
+    return [
+      (
+        <button
+          type="button"
+          key={`dir:${node.path}`}
+          className={css.dirRow}
+          onClick={() => { toggleDir(node.path) }}
+          aria-expanded={!isCollapsed}
+        >
+          {depth > 0 && <span className={css.dirIndent} aria-hidden="true" style={{ width: depth * 14 }} />}
+          <span className={css.dirToggle}>{isCollapsed ? '▸' : '▾'}</span>
+          <span className={css.dirName}>{node.name}/</span>
+          <span className={css.dirCount}>{String(countLeafFiles(node.children))}</span>
+        </button>
+      ),
+      ...(isCollapsed ? [] : renderDirNodes(node.children, depth + 1)),
+    ]
+  })
+
   return (
     <>
       <section ref={cardRef} className={css.card} aria-label={t('produced.summary')}>
@@ -619,6 +765,7 @@ export function ProducedFiles({
                 })}
               />
             )}
+            {statsMatter && <StatBar stats={totalStats} />}
           </div>
           <button
             type="button"
@@ -643,55 +790,7 @@ export function ProducedFiles({
           </button>
         </header>
         <div className={css.fileList}>
-          {reviewsWithStats.map(({ review, stats }) => {
-            const reversible = reversiblePaths.has(review.path)
-            const fileAction: FileReviewAction = fileStates.get(review.path) === 'undone' ? 'redo' : 'undo'
-            return (
-              <div className={css.fileRow} key={review.path} title={review.path}>
-                <button
-                  type="button"
-                  className={css.fileLink}
-                  aria-label={t('produced.review', { name: review.path })}
-                  onMouseEnter={() => { schedulePopoverShow(review) }}
-                  onMouseLeave={schedulePopoverHide}
-                  onFocus={() => { schedulePopoverShow(review) }}
-                  onBlur={schedulePopoverHide}
-                  onClick={() => {
-                    setPopover(null)
-                    clearPopoverTimers('both')
-                    openInSidebarTab?.([review.path], turnNumber)
-                  }}
-                >
-                  <span className={css.fileName}>{basename(review.path)}</span>
-                  {review.deleted === true
-                    ? <span className={css.deletedBadge}>{t('produced.deleted')}</span>
-                    : review.dir === true
-                      ? <span className={css.deletedBadge}>{t('produced.dir')}</span>
-                      : (
-                        <Stats
-                          stats={stats}
-                          label={t('review.stats', {
-                            added: String(stats.added), removed: String(stats.removed),
-                          })}
-                        />
-                      )}
-                </button>
-                {/* fs 占位条目（全文未补齐）也给出撤销按钮：点击时按需补齐再提交。 */}
-                {(review.deleted !== true || review.diffs.length > 0 || review.dir === true) && (reversible || review.origin === 'fs') && (
-                  <button
-                    type="button"
-                    className={css.fileUndoButton}
-                    disabled={statusPending || togglePending || fileBusy !== null}
-                    aria-label={t(fileAction === 'undo' ? 'produced.undoFile' : 'produced.redoFile')}
-                    title={t(fileAction === 'undo' ? 'produced.undoFile' : 'produced.redoFile')}
-                    onClick={() => { runFileToggle(review) }}
-                  >
-                    {fileAction === 'undo' ? <FileUndoIcon /> : <FileRedoIcon />}
-                  </button>
-                )}
-              </div>
-            )
-          })}
+          {renderDirNodes(dirTree, 0)}
         </div>
       </section>
 

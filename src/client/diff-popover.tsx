@@ -1,8 +1,8 @@
 /**
- * DiffPopover: shared hover preview for the turn-tail card AND the live bar.
- * The anchor is the host frame's rect (card or live bar), so the popover is
- * exactly as wide as the frame and left-aligned with it — both surfaces get
- * the same look by construction.
+ * DiffPopover —— 轮尾卡片与轮中 live 条**共用**的悬停预览浮层。
+ *
+ * 锚点是宿主框（卡片或 live 条）自身的 rect：浮层与框同宽、左对齐，于是两
+ * 个面天然长得一样，不需要各自维护一套定位逻辑。上下方向按视口余量翻转。
  */
 import type { ProducedFileReview } from './turn-deliverables.ts'
 import type { UnifiedDiffStats } from './UnifiedDiff.tsx'
@@ -11,7 +11,7 @@ import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type { NS } from './chat-locales.ts'
 import css from './ProducedFiles.module.css'
 
-/** Host frame rect (viewport coordinates) the popover aligns to. */
+/** 宿主框的 rect（视口坐标），浮层据此对齐与定宽。 */
 export interface PopoverAnchorRect {
   readonly top: number
   readonly bottom: number
@@ -19,6 +19,7 @@ export interface PopoverAnchorRect {
   readonly width: number
 }
 
+/** DiffPopover 的入参：一个文件的审查数据 + 锚点 + 已算好的行数字。 */
 export interface DiffPopoverProps {
   readonly review: ProducedFileReview
   readonly anchor: PopoverAnchorRect
@@ -32,8 +33,8 @@ export interface DiffPopoverProps {
 export function DiffPopover({
   review, anchor, stats, statsLabel, t, onEnter, onLeave,
 }: DiffPopoverProps) {
-  // Above the frame when there is room, below otherwise; width/left follow
-  // the frame so the popover reads as an extension of the card or live bar.
+  // 上方放得下就朝上、否则朝下；宽与左边界都跟随宿主框，让浮层看起来
+  // 就是卡片或 live 条的延伸。
   const above = anchor.top > 300
   const width = Math.min(anchor.width, window.innerWidth - 16)
   const left = Math.min(Math.max(8, anchor.left), window.innerWidth - width - 8)

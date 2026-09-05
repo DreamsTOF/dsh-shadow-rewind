@@ -83,9 +83,9 @@ test('窗口归因：快照缺少会话 id → unknown；序列化按约定映�
 test('引擎集成：双会话窗口归因 + 勾选式子集恢复只还原勾选路径', async () => {
   const storageDir = await mkdtemp(join(tmpdir(), 'shadow-rewind-attr-'))
   const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-ws-'))
+  const engine = new ShadowRewindEngine({ storageDir, turnCheckpointMode: 'sqlite' })
+  await engine.ready
   try {
-    const engine = new ShadowRewindEngine({ storageDir, turnCheckpointMode: 'legacy' })
-    await engine.ready
     const signal = new AbortController().signal
     await writeFile(join(workspace, 'a.txt'), 'A0\n')
     await writeFile(join(workspace, 'b.txt'), 'B0\n')
@@ -141,6 +141,7 @@ test('引擎集成：双会话窗口归因 + 勾选式子集恢复只还原勾�
       (error) => error.code === 'INVALID_ARGUMENTS',
     )
   } finally {
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
     await rm(workspace, { recursive: true, force: true })
   }

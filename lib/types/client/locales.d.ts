@@ -1,14 +1,16 @@
 /**
- * Minimal zh/en copy for the file-review sidebar tab. Follows the DSH i18n
- * system: the client apply attaches the locale service (`ctx.locale`,
- * provided by `@deepseek-ai/dsh-client-locale`) through {@link attachLocale},
- * and `t()` resolves the active locale from it. Without an attached service
- * (standalone/test compositions) the browser language is used. Mirrors the
- * dsh-better-sidebar locales pattern.
+ * 侧边栏「文件审查」tab 的最小 zh / en 文案层。
+ *
+ * 走 DSH 的 i18n 体系：客户端 apply 通过 `attachLocale` 挂上语言服务
+ * （`ctx.locale`，由 `@deepseek-ai/dsh-client-locale` 提供），`t()` 从它
+ * 读取当前语言；没有挂载服务时（独立 / 测试装配）退回浏览器语言。整体沿用
+ * dsh-better-sidebar 的 locales 模式。
+ *
+ * 与聊天面（`chat-locales.ts`）的键集来源相反：这一份以 `zh` 为真相来源。
  */
-/** The dictionary namespace this plugin owns in the DSH locale registry. */
+/** 本插件在 DSH 语言注册表里拥有的字典命名空间。 */
 export declare const LOCALE_NS = "fileReviewTab";
-/** The zh dictionary (the key-set source of truth). */
+/** 中文字典（键集的唯一真相来源）。 */
 export declare const zh: {
     readonly tabTitle: "文件审查";
     readonly empty: "本会话暂无文件改动";
@@ -106,15 +108,15 @@ export declare const zh: {
     readonly close: "关闭";
     readonly cancel: "取消";
 };
-/** Union of this namespace's dictionary keys. */
+/** 本命名空间全部字典键的联合类型。 */
 export type CopyKey = keyof typeof zh;
-/** The en dictionary. */
+/** 英文字典（`Record` 约束保证与中文键集一一对应，漏翻即编译报错）。 */
 export declare const en: Record<CopyKey, string>;
-/** Attach (or detach, with undefined) the DSH locale service. */
+/** 挂上（传 undefined 即摘下）DSH 语言服务。 */
 export declare function attachLocale(service: {
     getSnapshot(): {
         active: string;
     };
 } | undefined): void;
-/** Translate a copy key; `{name}` placeholders interpolate from `params`. */
+/** 翻译一个文案键；`{name}` 占位符由 `params` 插值填充。 */
 export declare function t(key: CopyKey, params?: Record<string, string | number>): string;

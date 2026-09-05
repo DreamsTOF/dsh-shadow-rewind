@@ -1,9 +1,14 @@
-/** `file-review` namespace dictionaries. */
+/**
+ * 聊天面（`file-review` 命名空间）的 zh / en 字典。
+ *
+ * 英文是键集的唯一真相来源：添加文案必须先动 `en`，再补 `zh`——缺键时
+ * `t()` 回落到英文，反过来则会裸露键名给用户看。
+ */
 
-/** Dictionary namespace owned by this plugin. */
+/** 本插件在 DSH 语言注册表里拥有的字典命名空间。 */
 export const NS = 'file-review'
 
-/** English dictionary (the key-set source of truth). */
+/** 英文字典（键集的唯一真相来源）。 */
 export const en = {
   'produced.summary': 'Edited files',
   'produced.editedOne': 'Edited 1 file',
@@ -55,10 +60,10 @@ export const en = {
   'live.more': '{count} more',
 }
 
-/** Union of this namespace's dictionary keys. */
+/** 本命名空间全部字典键的联合类型。 */
 export type DeliverablesKey = keyof typeof en
 
-/** Simplified Chinese dictionary. */
+/** 简体中文字典（`Record` 约束保证与英文键集一一对应，漏翻即编译报错）。 */
 export const zh: Record<DeliverablesKey, string> = {
   'produced.summary': '已编辑文件',
   'produced.editedOne': '已编辑 1 个文件',

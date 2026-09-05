@@ -26,20 +26,21 @@ function makeHandlers(liveSessions, engine, coordinator, writeGate, commandWindo
   }
   installShadowRewindHttp({
     logger: { warn: () => {} },
+    // dsh 0.1.2 宿主形状：sessions.get 返回核心 Session（header +
+    // inheritedEventCount + snapshotEvents()）。
     sessions: { get: (id) => liveSessions.get(id) },
     sessionQuery: {
       readSession: async (id) => {
         const live = liveSessions.get(id)
         return live === undefined
-          ? { session: { id }, events: [] }
-          : { session: { id: live.id, cwd: live.session.header.cwd }, events: [] }
+          ? { session: { id }, inheritedEventCount: 0, events: [] }
+          : { session: { id: live.id, cwd: live.session.header.cwd }, inheritedEventCount: 0, events: [] }
       },
     },
-    apiProxy: {
-      sessions: {
-        create: async () => ({ result: { ok: true, value: { sessionId: 'x' } } }),
-        fork: async () => ({ result: { ok: true, value: { sessionId: 'x' } } }),
-      },
+    // dsh 0.1.2：apiProxy 移除，会话网关收敛为 sessionController。
+    sessionController: {
+      create: async () => ({ sessionId: 'x' }),
+      fork: async () => ({ sessionId: 'x' }),
     },
     agents: { list: () => [] },
     webServer,
@@ -66,7 +67,7 @@ async function callFsChanges(handlers, sessionId) {
 
 async function makeEngine() {
   const storageDir = await mkdtemp(join(tmpdir(), 'shadow-rewind-fs-store-'))
-  const engine = new ShadowRewindEngine({ storageDir, turnCheckpointMode: 'legacy' })
+  const engine = new ShadowRewindEngine({ storageDir, turnCheckpointMode: 'sqlite' })
   await engine.ready
   return { engine, storageDir }
 }
@@ -87,7 +88,7 @@ test('fs-changes：轮次配对的 added/removed 行数与 rev', async () => {
     await captureTurn(engine, workspace, 's1', 2, 20)
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const coordinator = new TurnCheckpointCoordinator(engine)
     const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
@@ -114,6 +115,7 @@ test('fs-changes：轮次配对的 added/removed 行数与 rev', async () => {
     assert.equal(typeof newChange.newMode, 'number')
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -136,8 +138,8 @@ test('fs-changes：轮次配对归属过滤——剔除落在其它会话窗口�
     await captureTurn(engine, workspace, 's1', 2, 20)
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
-      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
+      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const coordinator = new TurnCheckpointCoordinator(engine)
     const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
@@ -151,6 +153,7 @@ test('fs-changes：轮次配对归属过滤——剔除落在其它会话窗口�
     assert.ok(!paths.includes('s2-wrote.txt'), '属于 s2 窗口的写入必须被剔除')
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -168,8 +171,8 @@ test('fs-changes：live-tail 行数 + 剔除其它会话写入的路径', async 
     await writeFile(join(workspace, 's2-made.txt'), 'Y\n', 'utf8')
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
-      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
+      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const coordinator = new TurnCheckpointCoordinator(engine)
     const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
@@ -197,6 +200,7 @@ test('fs-changes：live-tail 行数 + 剔除其它会话写入的路径', async 
     assert.ok(!paths2.includes('s1-made.txt'), 's1 更早的写入不属于 s2 的 live-tail')
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -209,7 +213,7 @@ test('fs-changes：检查点捕获后 rev 递增，无变化时不递增', async
     await captureTurn(engine, workspace, 's1', 1, 10)
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const coordinator = new TurnCheckpointCoordinator(engine)
     const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
@@ -239,6 +243,7 @@ test('fs-changes：检查点捕获后 rev 递增，无变化时不递增', async
     assert.ok(after > before, `捕获后 rev 必须递增（${String(before)} → ${String(after)}）`)
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -289,7 +294,7 @@ test('fs-changes 闸关：归因三态（唯一命令/重叠歧义/外部）与 
     await captureTurn(engine, workspace, 's1', 2, 20)
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const handlers = closedGateHandlers(liveSessions, engine, registry)
     const body = await callFsChanges(handlers, 's1')
@@ -325,6 +330,7 @@ test('fs-changes 闸关：归因三态（唯一命令/重叠歧义/外部）与 
     )
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -344,8 +350,8 @@ test('fs-changes 闸关：保留其它会话窗口的写入并附归属（不再
     await captureTurn(engine, workspace, 's1', 2, 20)
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
-      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
+      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const handlers = closedGateHandlers(liveSessions, engine, undefined)
     const body = await callFsChanges(handlers, 's1')
@@ -367,6 +373,7 @@ test('fs-changes 闸关：保留其它会话窗口的写入并附归属（不再
     assert.equal(typeof s2file.writtenAt, 'number', 'mtime 落盘的写入时间仍透出')
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -388,7 +395,7 @@ test('fs-changes 闸关：旧清单无 mtimeNs 降级（无 writtenAt、归因�
     await writeFile(manifestPath, JSON.stringify(raw), 'utf8')
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const handlers = closedGateHandlers(liveSessions, engine, undefined)
     const body = await callFsChanges(handlers, 's1')
@@ -401,6 +408,7 @@ test('fs-changes 闸关：旧清单无 mtimeNs 降级（无 writtenAt、归因�
     assert.equal(legacy.owner, 'target')
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -437,8 +445,8 @@ test('fs-changes 闸关：包围轮内的他会话写入降级 multi（不默认
     await captureTurn(engine, workspace, 's1', 2, 20)
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
-      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
+      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const handlers = closedGateHandlers(liveSessions, engine, registry)
     const body = await callFsChanges(handlers, 's1')
@@ -458,6 +466,7 @@ test('fs-changes 闸关：包围轮内的他会话写入降级 multi（不默认
     )
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -488,8 +497,8 @@ test('fs-changes 闸开：包围轮内的他会话写入同样被剔除', async 
     await captureTurn(engine, workspace, 's1', 2, 20)
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
-      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
+      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const coordinator = new TurnCheckpointCoordinator(engine)
     const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
@@ -502,6 +511,7 @@ test('fs-changes 闸开：包围轮内的他会话写入同样被剔除', async 
     assert.ok(!paths.includes('enclosed.txt'), '包围轮内的他会话写入必须被剔除（网格看不见它，靠终值证据降级）')
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -534,8 +544,8 @@ test('fs-changes 重启等价：包围轮降级证据随注册表重启存活', 
     await captureTurn(engine, workspace, 's1', 2, 20)
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
-      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
+      ['s2', { id: 's2', status: 'idle', session: { id: 's2', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
 
     // 重启前第一遍归因。
@@ -561,6 +571,7 @@ test('fs-changes 重启等价：包围轮降级证据随注册表重启存活', 
     )
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -588,7 +599,7 @@ test('fs-changes 闸关：窗口内容（detail）随命令级归因透出', asy
     await captureTurn(engine, workspace, 's1', 2, 20)
 
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const handlers = closedGateHandlers(liveSessions, engine, registry)
     const body = await callFsChanges(handlers, 's1')
@@ -599,6 +610,7 @@ test('fs-changes 闸关：窗口内容（detail）随命令级归因透出', asy
     assert.equal(cmd.command?.detail, '{"command":"echo A"}', '窗口内容必须随归因透出到端点')
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })

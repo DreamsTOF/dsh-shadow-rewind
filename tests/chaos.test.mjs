@@ -22,7 +22,7 @@ const pause = (ms = 3) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function makeEngine(overrides = {}) {
   const storageDir = await mkdtemp(join(tmpdir(), 'chaos-store-'))
-  const engine = new ShadowRewindEngine({ storageDir, turnCheckpointMode: 'legacy', ...overrides })
+  const engine = new ShadowRewindEngine({ storageDir, turnCheckpointMode: 'sqlite', ...overrides })
   await engine.ready
   return { engine, storageDir }
 }
@@ -91,20 +91,21 @@ function makeHandlers(liveSessions, engine, coordinator, writeGate) {
   }
   installShadowRewindHttp({
     logger: { warn: () => {} },
+    // dsh 0.1.2 宿主形状：sessions.get 返回核心 Session（header +
+    // inheritedEventCount + snapshotEvents()）。
     sessions: { get: (id) => liveSessions.get(id) },
     sessionQuery: {
       readSession: async (id) => {
         const live = liveSessions.get(id)
         return live === undefined
-          ? { session: { id }, events: [] }
-          : { session: { id: live.id, cwd: live.session.header.cwd }, events: [] }
+          ? { session: { id }, inheritedEventCount: 0, events: [] }
+          : { session: { id: live.id, cwd: live.session.header.cwd }, inheritedEventCount: 0, events: [] }
       },
     },
-    apiProxy: {
-      sessions: {
-        create: async () => ({ result: { ok: true, value: { sessionId: 'x' } } }),
-        fork: async () => ({ result: { ok: true, value: { sessionId: 'x' } } }),
-      },
+    // dsh 0.1.2：apiProxy 移除，会话网关收敛为 sessionController。
+    sessionController: {
+      create: async () => ({ sessionId: 'x' }),
+      fork: async () => ({ sessionId: 'x' }),
     },
     agents: { list: () => [] },
     webServer,
@@ -162,8 +163,8 @@ test('混沌：双会话交错写盘——归属分离、空目录流转、整�
 
     // 端点归属：A 轮 1 只见自己窗口的写入；B 的写入（含 sub 变空的目录条目）被剔除。
     const liveSessions = new Map([
-      ['sA', { id: 'sA', status: 'idle', session: { id: 'sA', header: { cwd: workspace }, events: [] } }],
-      ['sB', { id: 'sB', status: 'idle', session: { id: 'sB', header: { cwd: workspace }, events: [] } }],
+      ['sA', { id: 'sA', status: 'idle', session: { id: 'sA', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
+      ['sB', { id: 'sB', status: 'idle', session: { id: 'sB', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const coordinator = new TurnCheckpointCoordinator(engine)
     const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
@@ -206,6 +207,7 @@ test('混沌：双会话交错写盘——归属分离、空目录流转、整�
     await assertTreeMatches(engine, workspace, aT1.id, '恢复后收敛')
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -244,6 +246,7 @@ test('混沌：淘汰与 GC 压力下存活检查点全部可恢复', async () =
     assert.equal(gen1Gone.changes.length, 0)
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -349,7 +352,7 @@ async function fuzzRun(mode, seed) {
       }
       // 端点在搅拌后仍然可服务（形态完整、不抛错）。
       const liveSessions = new Map(sessions.map((id) => [
-        id, { id, status: 'idle', session: { id, header: { cwd: workspace }, events: [] } },
+        id, { id, status: 'idle', session: { id, header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } },
       ]))
       const coordinator = new TurnCheckpointCoordinator(engine)
       const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
@@ -359,11 +362,12 @@ async function fuzzRun(mode, seed) {
     }
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 }
 
-test('混沌（模糊）：双会话随机操作/恢复/淘汰全搅拌（legacy）', () => fuzzRun('legacy', 20260830))
+test('混沌（模糊）：双会话随机操作/恢复/淘汰全搅拌（sqlite）', () => fuzzRun('sqlite', 20260830))
 
 function jjOnPath() {
   try {
@@ -388,7 +392,7 @@ test('混沌：轮末检查点冻结轮末树——轮结束后的写盘不计�
     const coordinator = new TurnCheckpointCoordinator(engine)
     const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
     const liveSessions = new Map([
-      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, events: [] } }],
+      ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const handlers = makeHandlers(liveSessions, engine, coordinator, writeGate)
 
@@ -434,6 +438,7 @@ test('混沌：轮末检查点冻结轮末树——轮结束后的写盘不计�
     await assertTreeMatches(engine, workspace, endCp.id, '轮末检查点整树收敛')
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -459,7 +464,7 @@ test('混沌：协调器经 session/event 的 turn/end 事件捕获轮末检查�
     // 触发 turn/end 事件（fire-and-forget，等待异步捕获落盘）。
     const sessionListener = listeners.find(([e]) => e === 'session/event')[1]
     sessionListener(
-      { id: 'sX', header: { cwd: workspace }, events: [{ type: 'turn/start', seq: 100, data: { turn: 1 } }] },
+      { id: 'sX', header: { cwd: workspace }, snapshotEvents: () => [{ type: 'turn/start', seq: 100, data: { turn: 1 } }] },
       { type: 'turn/end', data: { turn: 1 } },
     )
     await pause(80)
@@ -476,12 +481,13 @@ test('混沌：协调器经 session/event 的 turn/end 事件捕获轮末检查�
 
     // turn/start 事件缺失时静默跳过（不抛异常）。
     sessionListener(
-      { id: 'sY', header: { cwd: workspace }, events: [] },
+      { id: 'sY', header: { cwd: workspace }, snapshotEvents: () => [] },
       { type: 'turn/end', data: { turn: 9 } },
     )
     await pause(20)
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })
@@ -510,6 +516,7 @@ test('混沌：轮起/轮末淘汰各按相位计窗口，互不挤占', async (
     await assert.rejects(() => readFile(join(workspace, 'f6.txt')), { code: 'ENOENT' })
   } finally {
     await rm(workspace, { recursive: true, force: true })
+    await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })
   }
 })

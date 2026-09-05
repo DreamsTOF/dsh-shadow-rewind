@@ -7,6 +7,7 @@ import { CommandWindowRegistry } from './command-windows.js';
 import type { AgentFace, HostContext } from './rewind-host.js';
 import type { RestorePointSummary, ShadowRewindConfig } from './types.js';
 import { WorkspaceWriteGate } from './write-gate.js';
+export * from './char-highlight.js';
 export * from './engine.js';
 export * from './errors.js';
 export * from './rewind-host.js';
@@ -30,11 +31,13 @@ interface PluginContext {
         }): () => void;
     };
     sessions?: {
-        get(sessionId: string): AgentFace | undefined;
+        get(sessionId: string): unknown;
     };
     sessionQuery?: unknown;
-    apiProxy?: unknown;
+    /** dsh 0.1.2 起会话网关（替代被移除的 apiProxy）。 */
+    sessionController?: import('./rewind-host.js').SessionControllerLike;
     agents?: {
+        get?(sessionId: string): AgentFace | undefined;
         list(): readonly AgentFace[];
     };
 }
@@ -68,6 +71,8 @@ export declare class ShadowRewindService {
     planRestore(options: Parameters<ShadowRewindEngine['planRestore']>[0]): ReturnType<ShadowRewindEngine['planRestore']>;
     /** 执行已批准的恢复计划。 */
     applyRestore(options: Parameters<ShadowRewindEngine['applyRestore']>[0]): ReturnType<ShadowRewindEngine['applyRestore']>;
+    /** 撤销该工作区最近一次恢复（进程内单次 undo，重启失效）。 */
+    undoLastRestore(options: Parameters<ShadowRewindEngine['undoLastRestore']>[0]): ReturnType<ShadowRewindEngine['undoLastRestore']>;
     /** 删除恢复点（confirmation 必须逐字等于 `DELETE <id>`）。 */
     delete(options: Parameters<ShadowRewindEngine['delete']>[0]): ReturnType<ShadowRewindEngine['delete']>;
     /** 列出中断/需人工介入的恢复操作。 */

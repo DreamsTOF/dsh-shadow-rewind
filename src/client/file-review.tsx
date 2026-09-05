@@ -1,32 +1,29 @@
 /**
- * File-review surface, browser half (ported from dsh-file-review-tab): TWO
- * coexisting surfaces over the same produced-file vocabulary —
+ * 文件审查面，浏览器半边（自 dsh-file-review-tab 移植）：在**同一套产出文件
+ * 词汇**上共存的两块 UI——
  *
- * 1. the chat turn-tail row (the original dsh-file-review card: "Edited N
- *    files · +M -K / Undo / Review"), registered into the
- *    'conversation.chat.turnTail' chain at priority -2 so it claims the chain
- *    BEFORE dsh-better-sidebar's own -1 interception row (chain election is
- *    first-claim-wins: exactly one row ever renders, never both); and
- * 2. the 'file-review' better-sidebar tab (per-session change list + inline
- *    red/green diffs + per-hunk/per-file/per-turn undo, plus per-turn jj
- *    snapshot restore).
+ * 1. 聊天轮尾行（原始 dsh-file-review 卡片：「已编辑 N 个文件 · +M -K /
+ *    撤销 / 审查」），注册在 `conversation.chat.turnTail` 链的 priority -2，
+ *    以便**先于** dsh-better-sidebar 自己的 -1 拦截行认领链（链的选举规则是
+ *    先到先得：任一时刻只有一行渲染，绝不两行并现）；
+ * 2. `file-review` better-sidebar tab（按会话的变更列表 + 行级红/绿 diff +
+ *    按 hunk / 按文件 / 按轮撤销，外加按轮做 jj 快照恢复）。
  *
- * The Host half's undo/redo capability reaches both surfaces through the
- * package's Typert remote contribution, mounted here exactly like
- * dsh-file-review did. Every registration is wrapped in ctx.effect so fiber
- * disposal (HMR / plugin disable) unregisters cleanly. Mounted by the merged
- * client entry (index.tsx) alongside the rewind surface.
+ * 宿主半边的撤销 / 重做能力经本包的 Typert 远端贡献抵达两个面，装配方式与
+ * dsh-file-review 完全一致。每一处注册都包在 `ctx.effect` 里，fiber 销毁
+ * （HMR / 插件禁用）即干净注销。由合并后的客户端入口（index.tsx）与 rewind
+ * 面一同挂载。
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { ConversationSnapshot, ISessions, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
-import type { ChatFileMentions } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { ChatFileMentions, ChatSnapshot, TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { BetterSidebarService, TabDescriptor } from 'dsh-better-sidebar/client/service'
-import type { TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { FileReviewRequest, FileReviewResult, ProducedFileReview } from '../file-review/change-types.ts'
 import { TYPERT_REMOTE } from '../file-review/remote.ts'
 import { FileReviewTab } from './FileReviewTab.tsx'
@@ -44,12 +41,11 @@ import {
 } from './turn-deliverables.ts'
 
 /**
- * Turn-tail claim with file-system awareness: tool-produced reviews claim as
- * before; a turn whose only writes happened outside the tools (PowerShell etc.)
- * claims with an EMPTY match when the warmed fs-changes cache already knows
- * that turn (keyed by the turn/start seq, unique per session) — the mounted
- * card then fetches contents and fills itself. select() is synchronous, so the
- * async endpoint result can only arrive via this cache.
+ * 带文件系统感知的轮尾认领：工具产出的审查照旧认领；而一轮的写盘只发生在
+ * 工具之外（PowerShell 等）时，只要 warm 过的 fs-changes 缓存已经知道该轮
+ * （键是每会话唯一的 turn/start seq），就用**空 match** 认领——挂载后的卡片
+ * 自行拉取内容填满自己。select() 是同步的，异步端点的结果只能经由这个缓存
+ * 抵达。
  */
 function selectProducedFilesWithFs(owner: TurnTailOwnerProps): readonly ProducedFileReview[] | null {
   const reviews = selectProducedFiles(owner)
@@ -61,22 +57,20 @@ function selectProducedFilesWithFs(owner: TurnTailOwnerProps): readonly Produced
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
-    /** Turn-tail row copy (the chat-side surface). */
+    /** 轮尾行文案（聊天侧的 UI 面）。 */
     'file-review': DeliverablesKey
   }
 }
 
 /**
- * Required services: session snapshots, locale, remote, and the slot registry
- * (turn-tail chain). Two more services are deliberately NOT static injects and
- * are resolved dynamically in apply() instead: the conversation Definition
- * registry's service name moved across dsh releases (<= 0.1.1: root
- * `conversationEvents`; 0.1.2-alpha.1+: `uiConversation.events`), so a hard
- * inject on either name leaves the whole plugin forever "pending" on the
- * other version and fails web boot (issue #6); and `betterSidebar` is only
- * provided by the OPTIONAL dsh-better-sidebar plugin — a hard inject would
- * keep this plugin pending forever on a host without it, while the
- * rewind/live-bar/turn-tail surfaces all work standalone.
+ * 必需服务：会话快照、locale、remote 与槽位注册表（轮尾链）。另外两个服务
+ * **刻意不做静态注入**，而是在 apply() 里动态解析：conversation Definition
+ * 注册表的服务名随 dsh 版本迁移过（<= 0.1.1 是根 `conversationEvents`，
+ * 0.1.2-alpha.1+ 是 `uiConversation.events`），硬注入任何一个名字都会让整个
+ * 插件在另一个版本上永远「pending」并拖垮 web 启动（issue #6）；而
+ * `betterSidebar` 只由**可选**的 dsh-better-sidebar 插件提供——硬注入会让本
+ * 插件在没装它的宿主上永远等待，而 rewind / live 条 / 轮尾行这些面都能
+ * 独立工作。
  */
 export const fileReviewInject = [
   'sessions',
@@ -85,7 +79,7 @@ export const fileReviewInject = [
   'slots',
 ]
 
-/** The tab icon: a modest line-diff glyph drawn at the host-given size. */
+/** Tab 图标：按宿主给的大小画的一个朴素行 diff 字形。 */
 function FileReviewIcon({ size }: { readonly size: number }) {
   return (
     <svg
@@ -112,29 +106,54 @@ interface FileReviewRemote {
 }
 
 /**
- * The tab-strip badge: the number of distinct files this session changed.
- * The sidebar re-renders the tab bar constantly (and streams publish a fresh
- * snapshot reference per event), so the derivation is memoized by a cheap
- * structural fingerprint per session — streaming token flushes keep the
- * fingerprint stable and skip the full re-derive.
+ * Tab 条徽标：本会话改过的不重复文件数。
+ * 侧边栏的 tab 条几乎总在重渲染（而且事件流每个事件都发布新快照引用），所以
+ * 推导结果按每会话一个廉价的**结构指纹**记忆化——token 流刷新时指纹保持稳定，
+ * 直接跳过完整重推导。
  */
 const badgeMemo = new Map<string, { fingerprint: string; count: number | null }>()
 
-function snapshotFingerprint(snapshot: ConversationSnapshot | null): string {
+function snapshotFingerprint(snapshot: ChatSnapshot | null): string {
   if (snapshot === null) return 'none'
+  const legacy = snapshot.legacy
   let lastEnd = 0
-  for (const endSeq of snapshot.turnEnds.values()) lastEnd = endSeq
-  return `${snapshot.nodes.length}:${snapshot.turnEnds.size}:${lastEnd}`
+  for (const endSeq of legacy.turnEnds.values()) lastEnd = endSeq
+  return `${legacy.nodes.length}:${legacy.turnEnds.size}:${lastEnd}`
+}
+
+/**
+ * Read a cordis service without the inject requirement（新版 cordis 走
+ * `ctx.get`，旧版回落 reflect.get）。
+ */
+function getService(ctx: Context, name: string): unknown {
+  const anyCtx = ctx as unknown as { get?: (name: string) => unknown }
+  if (typeof anyCtx.get === 'function') return anyCtx.get(name)
+  return ctx.reflect.get(name)
+}
+
+/**
+ * Resolve one session's Chat target snapshot（dsh 0.1.2：会话变更推导的数据
+ * 源从 runtime 会话快照换成 uiConversation 会话绑定的 `chat` 视图快照）。
+ * uiConversation 缺失（未装配的宿主）返回 null——徽标降级为空。
+ */
+function resolveChatSnapshot(ctx: Context, sessionId: string): ChatSnapshot | null {
+  const uiConversation = getService(ctx, 'uiConversation') as
+    | { binding?(source: string): { target?(target: 'chat'): { getSnapshot?(): ChatSnapshot | undefined } } }
+    | undefined
+  const binding = uiConversation?.binding?.(sessionId)
+  const chat = binding?.target?.('chat')?.getSnapshot?.()
+  return chat ?? null
 }
 
 function badgeCount(ctx: Context, sessionId: string): number | null {
   // 搭车预热 fs-changes 缓存：tab 条渲染高频且覆盖所有会话，warm 内部节流。
   warmFsChanges(sessionId)
-  // Host and browser sessions services share one Cordis key (see
-  // dsh-file-review): narrow to the browser ISessions at this boundary.
+  // Host 与浏览器的 sessions 服务共用一个 Cordis 键（见 dsh-file-review）：
+  // 在这个边界收窄到浏览器的 ISessions。
   const sessions = (ctx as unknown as { readonly sessions: ISessions }).sessions
-  const session = sessions.binding(sessionId as SessionId)?.session
-  const snapshot = session?.getSnapshot() ?? null
+  // 先物化会话绑定（scope 树挂载），chat 目标快照才有数据源。
+  void sessions.binding(sessionId as SessionId)
+  const snapshot = resolveChatSnapshot(ctx, sessionId)
   const fingerprint = snapshotFingerprint(snapshot)
   const hit = badgeMemo.get(sessionId)
   if (hit !== undefined && hit.fingerprint === fingerprint) return hit.count
@@ -145,62 +164,45 @@ function badgeCount(ctx: Context, sessionId: string): number | null {
 }
 
 /**
- * The conversation Definition registry face this plugin needs: just the
- * per-turn deliverables registration. Same shape on every dsh release — only
- * the service path to reach it moved.
+ * 本插件需要的 conversation Definition 注册表面：只有按轮注册 deliverables
+ * 这一件事。各 dsh 版本上形状相同——变的只是抵达它的服务路径。
  */
 interface ConversationDefinitionRegistry {
   register(definition: typeof deliverablesDefinition): () => void
 }
 
 /**
- * Resolve the conversation Definition registry without statically injecting
- * it. dsh 0.1.2-alpha.1+ folds the old `conversationEvents` /
- * `conversationViews` pair into a single `uiConversation` service (the
- * registry is its `.events` property); dsh 0.1.1 and earlier expose it as the
- * standalone root `conversationEvents` service. Returns undefined when the
- * running dsh provides neither — the caller degrades instead of blocking.
+ * 不静态注入、动态解析 conversation Definition 注册表。
+ * dsh 0.1.2-alpha.1+ 把旧的 `conversationEvents` / `conversationViews` 对折
+ * 进单一 `uiConversation` 服务（注册表在其 `.events` 属性上）；dsh 0.1.1 及
+ * 更早则暴露为独立的根 `conversationEvents` 服务。运行的 dsh 两者都不提供时
+ * 返回 undefined——调用方优雅降级而非阻塞。
  */
 function resolveConversationEvents(ctx: Context): ConversationDefinitionRegistry | undefined {
-  const lookup = (name: string): unknown => {
-    // ctx.get() exists on newer cordis; ctx.reflect.get() is the documented
-    // "read a service without the inject requirement" escape hatch on both.
-    const anyCtx = ctx as unknown as { get?: (name: string) => unknown }
-    if (typeof anyCtx.get === 'function') return anyCtx.get(name)
-    return ctx.reflect.get(name)
-  }
-  const uiConversation = lookup('uiConversation') as
+  const uiConversation = getService(ctx, 'uiConversation') as
     | { readonly events?: ConversationDefinitionRegistry | null }
     | undefined
   if (uiConversation?.events !== undefined && uiConversation.events !== null) return uiConversation.events
-  const conversationEvents = lookup('conversationEvents') as ConversationDefinitionRegistry | undefined
+  const conversationEvents = getService(ctx, 'conversationEvents') as ConversationDefinitionRegistry | undefined
   if (conversationEvents !== undefined && conversationEvents !== null) return conversationEvents
   return undefined
 }
 
 /**
- * Resolve the better-sidebar registry without statically injecting it:
- * `betterSidebar` is published only by the OPTIONAL dsh-better-sidebar
- * plugin, and this plugin must boot without it (rewind / live bar /
- * turn-tail row all stand alone). Returns undefined when that plugin is
- * absent — every caller degrades instead of blocking.
+ * 不静态注入、动态解析 better-sidebar 注册表：`betterSidebar` 只由**可选**的
+ * dsh-better-sidebar 插件发布，而本插件必须能在没有它的宿主上启动
+ * （rewind / live 条 / 轮尾行都能独立运行）。插件缺席时返回 undefined——每个
+ * 调用方都优雅降级而非阻塞。
  */
 function resolveBetterSidebar(ctx: Context): BetterSidebarService | undefined {
-  const lookup = (name: string): unknown => {
-    // Same escape hatch as resolveConversationEvents above.
-    const anyCtx = ctx as unknown as { get?: (name: string) => unknown }
-    if (typeof anyCtx.get === 'function') return anyCtx.get(name)
-    return ctx.reflect.get(name)
-  }
-  const sidebar = lookup('betterSidebar') as BetterSidebarService | undefined
+  const sidebar = getService(ctx, 'betterSidebar') as BetterSidebarService | undefined
   if (sidebar === undefined || sidebar === null) return undefined
   return sidebar
 }
 
 /**
- * Client plugin body: attach locale, mount the Typert remote, register the
- * chat turn-tail row AND the sidebar tab.
- * @param ctx - client root context.
+ * 客户端插件主体：挂 locale、装载 Typert remote、注册聊天轮尾行与侧边栏 tab。
+ * @param ctx - 客户端根上下文。
  */
 export function applyFileReview(ctx: Context): void {
   attachLocale(ctx.locale)
@@ -230,14 +232,11 @@ export function applyFileReview(ctx: Context): void {
     }
   }, 'shadow-rewind: typert remote')
 
-  // The turn-local mutation accumulator both chat-side surfaces read: the
-  // turn-tail row's select() and the prose-mention vocabulary derive from the
-  // 'deliverables' Turn data this Definition publishes. Registered against
-  // whichever conversation registry the running dsh exposes (see
-  // resolveConversationEvents); re-registered when the owning service is
-  // (re-)provided or replaced, and skipped entirely on a dsh that exposes
-  // neither — the sidebar tab derives from session snapshots and keeps
-  // working without it.
+  // 两个聊天侧 UI 面都在读这个轮内变更累积器：轮尾行的 select() 与行文提及
+  // 词汇都派生自本 Definition 发布的 'deliverables' Turn 数据。注册到运行时
+  // dsh 暴露的任一 conversation 注册表（见 resolveConversationEvents）；所属
+  // 服务被（重新）提供或替换时重注册；一个都不暴露的 dsh 上整个跳过——侧边栏
+  // tab 从会话快照派生，没有它也能继续工作。
   let registeredOn: ConversationDefinitionRegistry | undefined
   const registerDeliverables = (): void => {
     const events = resolveConversationEvents(ctx)
@@ -253,12 +252,13 @@ export function applyFileReview(ctx: Context): void {
     if (name === 'conversationEvents' || name === 'uiConversation') registerDeliverables()
   })
 
-  // The chat turn-tail row — the original dsh-file-review card, verbatim.
-  // priority -2 runs BEFORE dsh-better-sidebar's -1 interception row: chain
-  // election is first-claim-wins in ascending priority order, so this row
-  // renders and the sidebar's chip row declines (never a double row). When
-  // this plugin is composed out, the -1 row (or the host fallback) takes over
-  // again — the off state needs no cleanup here.
+  // 聊天轮尾行——原版 dsh-file-review 卡片，逐字移植。
+  // priority -2 先于 dsh-better-sidebar 的 -1 拦截行执行：链的选举规则是
+  // 按优先级升序先到先得，所以这一行渲染、侧边栏的 chip 行就放弃（绝不双行）。
+  // 本插件被移出装配时，-1 行（或宿主回退）重新接管——关闭态在此无需清理。
+  //
+  // dsh 0.1.2：链槽位的 inject 为零参工厂（会话身份由组件标准 props
+  // sessionId 提供），因此这里的回调全部以 sessionId 为首参。
   ctx.effect(
     () => ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
       name: 'conversation.chat.turnTail',
@@ -266,53 +266,49 @@ export function applyFileReview(ctx: Context): void {
       priority: -2,
       locale: CHAT_NS,
       registrant: 'dsh-shadow-rewind',
-      inject: (sessionId: string) => {
+      inject: () => {
         const sessions = (ctx as unknown as { readonly sessions: ISessions }).sessions
-        const projectRoot = sessions.list.getSnapshot().byId[sessionId as SessionId]?.cwd
+        const projectRootFor = (id: string): string | undefined =>
+          sessions.list.getSnapshot().byId[id as SessionId]?.cwd
         const invoke = async (
+          id: string,
           method: 'status' | 'apply',
           request: FileReviewRequest,
         ): Promise<FileReviewResult> => {
-          const scope = sessions.scope(sessionId as SessionId)
+          const scope = sessions.scope(id as SessionId)
           if (scope === undefined) throw new Error('Session is unavailable')
-          // Session scopes are minted by the client runtime and cannot
-          // statically inject namespaces contributed later by feature plugins.
-          // `get()` is the Cordis escape hatch for an explicitly mounted
-          // dynamic service; tracing still binds the Remote call to this
-          // Session scope.
-          const fileReview = scope.get('remote.fileReview') as FileReviewRemote | undefined
+          // 会话 scope 会铸造自己的 Remote 面：带作用域的命名空间乘在 scope 的
+          // `remote` 上（agent 标签路由，Tracing 绑定本会话）。
+          const fileReview = scope.remote.fileReview as FileReviewRemote | undefined
           if (fileReview === undefined) throw new Error('File review Remote is unavailable')
           const result = await fileReview[method](request)
           if (!result.ok) throw new Error(result.error.message)
           return result.value
         }
         return {
-          projectRoot,
+          projectRootFor,
           // status 巡检在传输层做 in-flight 去重（同会话同请求只发一次）；
           // apply 有副作用，绝不参与去重。
-          inspectChanges: (request: FileReviewRequest) => dedupeStatus(sessionId, request, (bound) => invoke('status', bound)),
-          applyChanges: (request: FileReviewRequest) => invoke('apply', request),
-          // 审查 button / per-file chip: open (or focus) the sidebar tab with
-          // these paths pre-expanded. updateTab runs FIRST: an already-open
-          // tab receives the fresh meta reference here (the tab replays the
-          // expansion), while openTab below only FOCUSES an existing tab —
-          // it never applies a seed's meta to one (see the sidebar service's
-          // openTab: meta lands only on creation). For a not-yet-open tab
-          // updateTab is a strict no-op and openTab creates the tab WITH the
-          // meta. activateTab then guarantees focus either way.
-          // `path` rides along only so the host treats this as a CONTENT open:
-          // a collapsed side panel auto-expands to land the tab in sight
-          // (type-only opens leave collapsed panels alone). The tab itself
-          // never reads tab.path.
-          openInSidebarTab: (paths: readonly string[], turn?: number) => {
+          inspectChanges: (id: string, request: FileReviewRequest) => dedupeStatus(id, request, (bound) => invoke(id, 'status', bound)),
+          applyChanges: (id: string, request: FileReviewRequest) => invoke(id, 'apply', request),
+          // 审查 button / per-file chip：用这些预展开路径打开（或聚焦）侧边栏
+          // tab。updateTab 先跑：已经打开的 tab 在这里收到新的 meta 引用（tab
+          // 据此重放展开），而下面的 openTab 对已存在的 tab 只**聚焦**、绝不把
+          // seed 的 meta 套上去（见 sidebar 服务的 openTab：meta 只在创建时落
+          // 地）。对尚未打开的 tab，updateTab 是严格空操作，openTab 则**带着**
+          // meta 创建 tab。之后 activateTab 无论如何保证聚焦。
+          // `path` 只是顺带传上，好让宿主把它当成一次**内容**打开：折叠中的
+          // 侧栏会自动展开把 tab 带进视野（纯类型打开不会动折叠面板）。tab
+          // 本身从不读 tab.path。
+          openInSidebarTab: (id: string, paths: readonly string[], turn?: number) => {
             const sidebar = resolveBetterSidebar(ctx)
             const first = paths[0]
             if (sidebar === undefined || first === undefined) return
-            // `turn` anchors the deep link to one turn: the tab expands only
-            // that turn's rows for these paths (a recurring path stays
-            // collapsed in its other turns).
+            // `turn` 把深链锚定到某一轮：tab 只为这些路径展开**那一轮**的行
+            // （反复出现的路径在其它轮保持折叠）。
             const meta = { expandPaths: [...paths], ...(turn !== undefined ? { turn } : {}) }
-            const scope = { sessionId, ...(projectRoot !== undefined ? { cwd: projectRoot } : {}) }
+            const projectRoot = projectRootFor(id)
+            const scope = { sessionId: id, ...(projectRoot !== undefined ? { cwd: projectRoot } : {}) }
             sidebar.updateTab('file-review', { meta })
             sidebar.openTab({ type: 'file-review', path: first, meta }, scope)
             sidebar.activateTab('file-review', scope)
@@ -323,10 +319,9 @@ export function applyFileReview(ctx: Context): void {
     'shadow-rewind: turn-tail row',
   )
 
-  // Live readout while a turn is in flight: the one-line ambient seat above
-  // the composer card. Renders nothing when idle or unchanged; the completed
-  // turn's tail card takes over once the turn closes. The dock seat has no
-  // inject face, so the sessions handle (for cwd lookup) is bound once here.
+  // 轮子进行时的 live 读数：输入卡上方那一行环境座位。空闲或没改动时不渲染
+  // 任何东西；轮一结束，轮尾卡片接管。dock 座位没有 inject 面，所以会话句柄
+  // （供 cwd 查询）在这里绑定一次。
   bindLiveBarSessions((ctx as unknown as { readonly sessions: ISessions }).sessions)
   bindLiveBarOpenSidebar((sessionId, paths, turn) => {
     const sidebar = resolveBetterSidebar(ctx)
@@ -350,14 +345,14 @@ export function applyFileReview(ctx: Context): void {
     'shadow-rewind: live changes bar',
   )
 
-  // The prose side of the same vocabulary: the chat view reaches this face
-  // via ctx.get, so its absence — this plugin composed out — is the off state.
+  // 同一词汇的行文侧：聊天视图经 ctx.get 抵达这个面，所以它的缺席——本插件
+  // 被移出装配——就是关闭态。
   ctx.effect(() => {
     const tChat = ctx.locale.bind(CHAT_NS)
     const mentions: ChatFileMentions = {
       forClosing(owner) {
-        // Same claim test the turn-tail chain entry runs: no produced files,
-        // no vocabulary — the two surfaces agree by construction.
+        // 与轮尾链条目跑同一个认领判定：没有产出文件就没有提及词汇——
+        // 两个面在构造上就保持一致。
         const reviews = selectProducedFiles(owner)
         if (reviews === null) return undefined
         return producedFileMentions(
@@ -370,10 +365,9 @@ export function applyFileReview(ctx: Context): void {
     return ctx.provide('chatFileMentions', mentions)
   }, 'shadow-rewind: chat file mentions')
 
-  // The sidebar tab exists only when the OPTIONAL dsh-better-sidebar plugin
-  // is installed: register against whichever service instance shows up (see
-  // resolveBetterSidebar), re-register when it is (re-)provided later, and
-  // skip entirely on a host without it — every other surface keeps working.
+  // 侧边栏 tab 只在**可选**的 dsh-better-sidebar 插件存在时才有意义：注册到
+  // 任何出现的服务实例上（见 resolveBetterSidebar），它之后被（重新）提供时
+  // 再注册一次；没装它的宿主上整体跳过——其余每个面都继续工作。
   let tabRegisteredOn: BetterSidebarService | undefined
   const registerSidebarTab = (): void => {
     const sidebar = resolveBetterSidebar(ctx)

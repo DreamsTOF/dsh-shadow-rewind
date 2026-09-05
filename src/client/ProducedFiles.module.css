@@ -85,6 +85,75 @@
   color: var(--dsw-alias-state-error-primary);
 }
 
+/* 增/删比例色条：红绿两段，宽度按 added/removed 占比。 */
+.statBar {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 48px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--dsw-alias-border-l1);
+}
+
+.statBarAdded {
+  height: 100%;
+  background: var(--dsw-alias-state-success-primary);
+}
+
+.statBarRemoved {
+  height: 100%;
+  background: var(--dsw-alias-state-error-primary);
+}
+
+/* 目录折叠行：可点击开合，聚合子树文件数。 */
+.dirRow {
+  display: flex;
+  width: 100%;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 0 12px;
+  border: 0;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-container, Canvas);
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+
+.dirRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.dirToggle {
+  flex: 0 0 auto;
+  width: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.dirName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+}
+
+.dirCount {
+  margin-left: auto;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.dirIndent {
+  display: inline-block;
+  flex: 0 0 auto;
+}
+
 .reviewButton,
 .toggleButton,
 .toolbarButton,

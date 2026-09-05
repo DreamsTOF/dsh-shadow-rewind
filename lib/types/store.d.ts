@@ -30,19 +30,33 @@ export declare class WorkspaceStore {
         reason: string;
     } | undefined>;
     deleteTurnSkip(workspace: string, sessionId: string, turn: number, turnStartSeq: number): Promise<void>;
-    /** 写入并校验一个 blob；已存在时读回比对（内容寻址下等价即安全）。 */
-    putBlob(workspace: string, hash: string, content: Buffer): Promise<void>;
-    /** 缓存命中校验用：blob 是否确实存在于存储（不读内容，仅 stat）。 */
-    blobExists(workspace: string, hash: string): Promise<boolean>;
+    private readonly sqliteDbs;
+    /** 打开（或复用）工作区的快照内容库：单文件 SQLite（WAL + FULL），内容寻址。 */
+    private sqliteDb;
+    /**
+     * 批量写入内容寻址 blob（单事务）。
+     * ponytail: 整库单文件 + 内容寻址表；天花板是「跨工作区全局去重」与
+     * 「增量压缩」，需要时再加全局库或 VACUUM 策略，当前单工作区去重已够。
+     */
+    putSqliteBlobs(workspace: string, items: readonly {
+        readonly hash: string;
+        readonly content: Buffer;
+    }[]): Promise<void>;
+    /** 缓存命中校验用：内容行是否确实存在于库（不读内容）。 */
+    sqliteBlobExists(workspace: string, hash: string): Promise<boolean>;
     /** 读取并校验一个 blob。 */
-    readBlob(workspace: string, hash: string): Promise<Buffer>;
-    /** 删除未被任何 manifest 引用的 blob（只统计 blob 后端的引用）。 */
+    readSqliteBlob(workspace: string, hash: string): Promise<Buffer>;
+    /** 删除未被任何 manifest 引用的内容行（只统计 sqlite 后端的引用）。 */
     collectGarbage(workspace: string): Promise<{
         deletedBlobs: number;
         retainedBlobs: number;
     }>;
     /** 启动恢复用：列出全部工作区状态目录（key 形式）。 */
     listWorkspaceKeys(): Promise<readonly string[]>;
+    /** 关闭全部打开的 SQLite 句柄（受控关闭/测试清理用；幂等）。 */
+    closeAll(): Promise<void>;
     /** 状态根必须不在被管理工作区内（防自吞）。 */
     assertStorageSeparated(workspace: string): Promise<void>;
 }
+/** 探测宿主机 `node:sqlite` 是否可用（一次性开销；Node ≥22.19 自带）。 */
+export declare function sqliteAvailable(): boolean;
