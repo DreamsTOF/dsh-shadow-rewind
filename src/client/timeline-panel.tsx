@@ -67,6 +67,8 @@ const styles = `
 .srw-tl-trigger:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}
 .srw-tl-dialog{box-sizing:border-box;display:flex;flex-direction:column;gap:10px;width:min(880px,100%);max-height:calc(100dvh - 96px);padding:16px 18px;border-radius:14px;background:var(--dsw-alias-bg-layer-2,#111a2e);border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.1));box-shadow:0 18px 60px rgba(0,0,0,.5);color:var(--dsw-alias-label-primary,#e6ecff)}
 .srw-tl-head{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:15px;font-weight:600}
+.srw-tl-head > span:first-child{display:inline-flex;align-items:center;gap:8px;min-width:0}
+.srw-tl-lineage{flex:none;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 8px;border-radius:6px;background:color-mix(in srgb,var(--dsw-alias-state-business-primary,#5b8cff) 16%,transparent);color:var(--dsw-alias-state-business-primary,#5b8cff);font-size:11px;font-weight:500}
 .srw-tl-close{border:0;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;font-size:18px;line-height:1;padding:4px}
 .srw-tl-body{min-height:0;overflow-y:auto;overscroll-behavior:contain;display:flex;flex-direction:column;gap:10px}
 .srw-tl-section{font-size:12px;color:var(--dsw-alias-label-tertiary)}
@@ -500,6 +502,24 @@ function TimelinePanel({ sessionId, onClose }: { readonly sessionId: string; rea
   const [rangeError, setRangeError] = React.useState<string | null>(null)
   const [expanded, setExpanded] = React.useState<ReadonlySet<string>>(new Set())
   const [restoredHint, setRestoredHint] = React.useState(false)
+  // fork 谱系徽标（ABSORB-RECALL 四）：本会话若是「恢复并继续」fork 出的
+  // 下一代，头部显示「v2 · 恢复自 <检查点>」。展示性增强，失败静默无徽标。
+  const [badge, setBadge] = React.useState<{ version: number; restoredFrom?: string } | null>(null)
+
+  React.useEffect(() => {
+    let active = true
+    fetchJson(`/shadow-rewind/lineage?sessionId=${encodeURIComponent(sessionId)}`)
+      .then((body) => {
+        const parsed = body as { version?: unknown; restoredFrom?: unknown }
+        if (!active || typeof parsed?.version !== 'number') return
+        setBadge({
+          version: parsed.version,
+          ...(typeof parsed.restoredFrom === 'string' ? { restoredFrom: parsed.restoredFrom } : {}),
+        })
+      })
+      .catch(() => { /* 无谱系/端点不可用：无徽标 */ })
+    return () => { active = false }
+  }, [sessionId])
 
   const load = React.useCallback(() => {
     let active = true
@@ -631,7 +651,13 @@ function TimelinePanel({ sessionId, onClose }: { readonly sessionId: string; rea
   },
     React.createElement('div', { className: 'srw-tl-dialog' },
       React.createElement('div', { className: 'srw-tl-head' },
-        React.createElement('span', null, '文件时间线'),
+        React.createElement('span', null,
+          '文件时间线',
+          badge !== null ? React.createElement('span', {
+            className: 'srw-tl-lineage',
+            title: badge.restoredFrom !== undefined ? `恢复自检查点 ${badge.restoredFrom}` : '恢复并从新会话继续',
+          }, `v${String(badge.version)} · 恢复自${badge.restoredFrom !== undefined ? ` ${badge.restoredFrom}` : ''}`) : null,
+        ),
         React.createElement('button', { type: 'button', className: 'srw-tl-close', onClick: onClose, 'aria-label': '关闭' }, '×'),
       ),
       React.createElement('div', { className: 'srw-tl-bar' },

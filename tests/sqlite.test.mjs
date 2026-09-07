@@ -91,8 +91,10 @@ test('GC：删除恢复点后未引用内容行被回收', async () => {
     const db = new DatabaseSync(await contentDbPath(storageDir))
     try {
       assert.ok(rowCount(db) > 0)
-      const result = await engine.delete({ cwd: workspace, restorePointId: point.id, confirmation: `DELETE ${point.id}` })
-      assert.ok(result.deletedBlobs > 0, '删除恢复点必须回收其内容行')
+      // GC 双闸（ABSORB-RECALL 六）后删除不必然立即回收（24h/50 条先到先
+      // 触发）——回收正确性由管理面板同款的手动 GC 路径（绕闸）验证。
+      await engine.delete({ cwd: workspace, restorePointId: point.id })
+      await engine.collectGarbageFor(workspace)
       assert.equal(rowCount(db), 0)
     } finally {
       db.close()

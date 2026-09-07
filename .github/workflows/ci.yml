@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: Typecheck + tests + bundle freshness
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        # @deepseek-ai/* 实际发布在公共 npm（匿名可拉元数据与 tarball），
+        # 无需 token；peer 区间与 devDeps 对齐（5.1 逐 tuple 窗口修复后
+        # 不再有 prerelease 越界误报）。
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm run typecheck
+      - name: Unit tests
+        # test script 自带 build（tsdown + d.ts），测试跑在新鲜产物上。
+        run: pnpm test
+      - name: Bundle freshness gate
+        # 产物新鲜度门禁（吸收自 dsh-recall-plugin）：改 src 忘 rebuild 时
+        # lib/ 的陈旧产物可静默合入并随发布流出。同版本构建器输出确定性
+        # 可依赖——rebuild 后产物必须与提交内容逐字一致，否则红。
+        run: |
+          pnpm run build
+          git diff --exit-code lib/

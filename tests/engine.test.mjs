@@ -52,7 +52,7 @@ async function rewindTo(engine, workspace, checkpointId) {
     restorePointId: checkpointId,
     expectedCurrentTreeHash: inspection.currentTreeHash,
   })
-  return engine.applyRestore({ planId: plan.id, confirmation: plan.confirmation })
+  return engine.applyRestore({ planId: plan.id })
 }
 
 async function assertRoundtrip(mode) {
@@ -148,7 +148,7 @@ test('超大文件被显式跳过且恢复不动它', async () => {
     })
     // 即使它混进了计划，恢复也不应有任何针对它的动作。
     assert.ok(!plan.changes.some((change) => change.path === 'added-big.bin'))
-    await engine.applyRestore({ planId: plan.id, confirmation: plan.confirmation })
+    await engine.applyRestore({ planId: plan.id })
     assert.equal(await readFile(join(workspace, 'a.txt'), 'utf8'), 'hello v1\n')
     assert.equal((await readFile(join(workspace, 'added-big.bin')))[0], 3)
   } finally {
@@ -244,7 +244,7 @@ test('计划过期：计划后文件再变 → PLAN_STALE 拒绝执行', async (
     // 检查之后又改了一次。
     await writeFile(join(workspace, 'a.txt'), 'v3\n', 'utf8')
     await assert.rejects(
-      () => engine.applyRestore({ planId: plan.id, confirmation: plan.confirmation }),
+      () => engine.applyRestore({ planId: plan.id }),
       (error) => error instanceof ShadowRewindError && error.code === 'PLAN_STALE',
     )
   } finally {
@@ -252,16 +252,13 @@ test('计划过期：计划后文件再变 → PLAN_STALE 拒绝执行', async (
   }
 })
 
-test('删除需要逐字确认串', async () => {
+test('删除：确认串已废除（EXPECTED-DESIGN 1.4 #2），undo 引用的 rescue 点仍拒绝删除', async () => {
   const workspace = await makeWorkspace()
   const { engine } = await makeEngine({ mode: 'sqlite' })
   try {
     const checkpoint = await captureTurn(engine, workspace)
-    await assert.rejects(
-      () => engine.delete({ cwd: workspace, restorePointId: checkpoint.id, confirmation: 'delete it' }),
-      (error) => error instanceof ShadowRewindError && error.code === 'CONFIRMATION_MISMATCH',
-    )
-    await engine.delete({ cwd: workspace, restorePointId: checkpoint.id, confirmation: `DELETE ${checkpoint.id}` })
+    // 直接删除不再需要确认串。
+    await engine.delete({ cwd: workspace, restorePointId: checkpoint.id })
     await assert.rejects(
       () => engine.inspect({ cwd: workspace, restorePointId: checkpoint.id }),
       (error) => error instanceof ShadowRewindError && error.code === 'RESTORE_POINT_NOT_FOUND',
@@ -311,7 +308,7 @@ test('死缓存自愈（sqlite）：删除触发 GC 后，缓存不再引用已�
   try {
     const t1 = await captureTurn(engine, workspace, 1)
     // 删除 t1 → GC 把 a.txt/sub b.txt 的内容行从库里清掉（无其它引用）。
-    const deleted = await engine.delete({ cwd: workspace, restorePointId: t1.id, confirmation: `DELETE ${t1.id}` })
+    const deleted = await engine.delete({ cwd: workspace, restorePointId: t1.id })
     assert.ok((deleted.deletedBlobs ?? 0) > 0, '删除唯一恢复点后 GC 应清掉全部 blob')
     // 修复点：GC 后 stat 缓存必须被作废；否则下一次捕获会命中死缓存，
     // 把「已删除的 blob」直接写进新 manifest（旧代码在此处埋雷）。

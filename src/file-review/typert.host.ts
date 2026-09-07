@@ -8,7 +8,10 @@
  */
 
 import type { TypertContribution } from '@deepseek-ai/dsh-typert-registry/types'
-import { FILE_REVIEW_INVOCATIONS, PACKAGE_NAME } from './typert-descriptors.ts'
+import { FILE_REVIEW_INVOCATIONS, PACKAGE_NAME, wireSchemas } from './typert-descriptors.ts'
+
+/** 供契约往返测试直接驱动与描述符同一份 zod 定义（未摇树）。 */
+export { wireSchemas }
 
 export const TYPERT: TypertContribution = {
   package: PACKAGE_NAME,

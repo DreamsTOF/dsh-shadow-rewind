@@ -17,7 +17,8 @@ import { constants } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { ShadowRewindError } from './errors.js'
 import { isNodeError, resolveWorkspacePath } from './path-utils.js'
-import { cacheEntryOf, cacheMatches, type CacheEntry, type CaptureCache } from './capture-cache.js'
+import { cacheEntryOf, cacheMatches, checksumOf, type CacheEntry, type CaptureCache } from './capture-cache.js'
+import { hashTree } from './manifest.js'
 import type { ScannedPath } from './scan.js'
 import type { SkippedPath, SnapshotEntry } from './types.js'
 
@@ -206,29 +207,6 @@ interface BigIntStats {
   readonly ctimeNs: bigint
 }
 
-/**
- * 全树确定性哈希：路径 + 条目完整签名（与存储后端无关）。
- * 刻意不含 mtimeNs：树哈希是内容寻址，恢复写回不保留时间戳——若时间戳进哈希，
- * 恢复后树哈希必变，会击穿 planRestore 的树哈希 CAS（旧清单也因而判「损坏」）。
- */
-export function hashTree(entries: Readonly<Record<string, SnapshotEntry>>): string {
-  const hash = createHash('sha256')
-  for (const path of Object.keys(entries).sort((a, b) => Buffer.from(a).compare(Buffer.from(b)))) {
-    const entry = entries[path]
-    if (entry === undefined) continue
-    hash.update(path)
-    hash.update('\0')
-    if (entry.kind === 'file') {
-      hash.update(`file\0${entry.blob}\0${entry.size}\0${entry.mode}\0`)
-    } else if (entry.kind === 'symlink') {
-      hash.update(`symlink\0${entry.target}\0${entry.mode}\0`)
-    } else {
-      hash.update(`dir\0${entry.mode}\0`)
-    }
-  }
-  return hash.digest('hex')
-}
-
-function checksumOf(paths: Record<string, CacheEntry>): string {
-  return createHash('sha256').update(JSON.stringify(paths)).digest('hex')
-}
+// hashTree / checksumOf 的唯一实现分别在 manifest.ts / capture-cache.ts
+//（K8 归一）：树哈希是「持久 manifest 读取时重算校验」的依据，任何一份
+// 拷贝被单边改动都会把全部已持久化清单判成 STATE_CORRUPT。

@@ -19,7 +19,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ShadowRewindEngine } from '../lib/index.js'
 import { installShadowRewindHttp, TurnCheckpointCoordinator } from '../lib/rewind-host.js'
-import { WorkspaceWriteGate } from '../lib/write-gate.js'
 import { canonicalDirectory } from '../lib/path-utils.js'
 
 const pause = (ms = 2) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -119,7 +118,7 @@ function entryKey(path, kind, dir) {
 
 // ── 端点脚手架（免网络直驱） ─────────────────────────────────────────────
 
-function makeHandlers(liveSessions, engine, coordinator, writeGate) {
+function makeHandlers(liveSessions, engine, coordinator) {
   const handlers = new Map()
   const webServer = {
     register(route) {
@@ -147,7 +146,7 @@ function makeHandlers(liveSessions, engine, coordinator, writeGate) {
     },
     agents: { list: () => [] },
     webServer,
-  }, engine, coordinator, writeGate)
+  }, engine, coordinator)
   return handlers
 }
 
@@ -187,6 +186,8 @@ async function runMultiScenario(bias, seed) {
   // 不再是该会话独有，端点会正确剔除——期望集必须同样剔除。
   const touchLog = []
   const lastEventIndex = new Map()
+  /** 每次开轮捕获时刻的树快照（eventIndex → {files, dirs}）。 */
+  const snapshots = []
   let seqCounter = 0
   let eventIndex = -1
 
@@ -201,6 +202,11 @@ async function runMultiScenario(bias, seed) {
       seqCounter += 1
       await engine.createTurnCheckpoint({ cwd: workspace, sessionId, turn, turnStartSeq: seqCounter })
       await pause()
+      // 捕获时刻的树快照（窗口净变更 = 前后两快照之差）。
+      snapshots[eventIndex] = {
+        files: [...liveFiles],
+        dirs: [...dirEntries(trackedDirs, liveFiles)],
+      }
 
       // 轮内 n 次操作：全部发生在下一次开轮捕获之前（写入闸现实）。
       // 期望 = 本轮净变更：文件增/改/删 + 空目录条目的出现/消失。
@@ -291,53 +297,64 @@ async function runMultiScenario(bias, seed) {
       { id: session.id, status: 'idle', session: { id: session.id, header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } },
     ]))
     const coordinator = new TurnCheckpointCoordinator(engine)
-    const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
-    const handlers = makeHandlers(liveSessions, engine, coordinator, writeGate)
+    const handlers = makeHandlers(liveSessions, engine, coordinator)
 
-    // 归属感知的精确核对：端点结果 == 该会话该轮的真实净变更，减去归属
-    // 范围（本会话相邻两次捕获之间的开区间；末轮延伸到时间线终点）内被
-    // 其它会话再触碰过的路径——那些路径多主/它主，端点保守剔除是正确的。
-    // 三条性质同时成立：无中生有零容忍（精度）、独占变更必上报（召回）、
-    // 每一项剔除都能用「它主触碰」解释（剔除可解释）。
+    // 归属感知的精确核对（对称语义）：端点结果 = 该会话窗口内的**全部**净
+    // 树变更（本会话 + 窗口内其它会话的写入都保留），每条附检查点网格归属
+    // 标签。窗口 = 本会话相邻两次捕获之间（末轮 live-tail 延伸到时间线终点
+    // = 当前磁盘）。四条性质同时成立：无中生有零容忍（精度）、窗口内净变更
+    // 必上报（召回）、独占变更归属 target 且默认勾选、归属与「窗口内触碰者
+    // 集合」精确一致（归属可解释）。
     const captureIndexOf = new Map()
     for (const [index, event] of schedule.entries()) {
       captureIndexOf.set(`${event.sessionId}|${event.turn}`, index)
     }
-    const otherTouchInRange = (path, sessionId, lo, hi) => touchLog.some((touch) => touch.path === path
-      && touch.sessionId !== sessionId
-      && touch.eventIndex > lo
-      && touch.eventIndex < hi)
+    // 终点快照：全部事件结束后的树状态（live-tail 的「当前磁盘」）。
+    snapshots[schedule.length] = {
+      files: [...liveFiles],
+      dirs: [...dirEntries(trackedDirs, liveFiles)],
+    }
 
     for (const session of SESSIONS) {
       const body = await callFsChanges(handlers, session.id)
-      let expectedCount = session.turns
       for (let turn = 1; turn <= session.turns; turn += 1) {
-        const wantRaw = expected.get(`${session.id}|${turn}`)
+        const isLast = turn === session.turns
         const lo = captureIndexOf.get(`${session.id}|${turn}`) ?? -1
-        const hi = turn < session.turns
-          ? (captureIndexOf.get(`${session.id}|${turn + 1}`) ?? Number.MAX_SAFE_INTEGER)
-          : Number.MAX_SAFE_INTEGER
+        const hi = isLast ? schedule.length : (captureIndexOf.get(`${session.id}|${turn + 1}`) ?? schedule.length)
+        // 窗口内触碰者（每条净变更的所属事件会话）+ 候选路径。
+        const contributors = new Map()
+        for (const touch of touchLog) {
+          if (lo <= touch.eventIndex && touch.eventIndex < hi) {
+            const set = contributors.get(touch.path) ?? new Set()
+            set.add(touch.sessionId)
+            contributors.set(touch.path, set)
+          }
+        }
+        // 窗口净变更：触碰过的路径按捕获时刻快照对比定形态（内容全局唯一，
+        // 「两次快照都在场且被触碰」= modified；增了又删的净消失，不出现）。
         const want = new Map()
-        for (const [path, key] of wantRaw ?? []) {
-          if (!otherTouchInRange(path, session.id, lo, hi)) want.set(path, key)
+        for (const [path] of contributors) {
+          const inFromF = snapshots[lo].files.includes(path)
+          const inToF = snapshots[hi].files.includes(path)
+          if (inFromF && inToF) want.set(path, entryKey(path, 'modified', false))
+          else if (inToF) want.set(path, entryKey(path, 'added', false))
+          else if (inFromF) want.set(path, entryKey(path, 'deleted', false))
+          else {
+            const inFromD = snapshots[lo].dirs.includes(path)
+            const inToD = snapshots[hi].dirs.includes(path)
+            if (inToD && !inFromD) want.set(path, entryKey(path, 'added', true))
+            else if (inFromD && !inToD) want.set(path, entryKey(path, 'deleted', true))
+            // 目录两侧都在场/都不在场：净无变化（增了又删/删了又建），不出现。
+          }
         }
         if (want.size === 0) {
-          // 归属滤空：该轮的独占变更为空（全部路径被它主/多主触碰），
-          // 端点不产出条目是正确行为。
           const absent = body.turns.find((entry) => entry.turn === turn)
-          assert.ok(absent === undefined, `${session.id} 轮 ${turn}：滤空后不应有条目`)
-          expectedCount -= 1
+          assert.ok(absent === undefined, `${session.id} 轮 ${turn}：窗口无净变更时不应有条目`)
           continue
         }
         const turnEntry = body.turns.find((entry) => entry.turn === turn)
         if (turnEntry === undefined) {
-          const diag = [...want.keys()].map((path) => {
-            const touches = touchLog.filter((touch) => touch.path === path)
-              .map((touch) => `${touch.sessionId}@${touch.eventIndex}`)
-              .join(',')
-            return `${path}（range ${lo},${hi}；touches: ${touches}）`
-          }).join(' | ')
-          assert.fail(`${session.id} 轮 ${turn}：端点必须有条目；want=[${diag}]；body.turns=[${body.turns.map((entry) => `${entry.turn}${entry.live === true ? 'L' : ''}`).join(',')}]`)
+          assert.fail(`${session.id} 轮 ${turn}：端点必须有条目；want=[${[...want.keys()].join(' | ')}]；body.turns=[${body.turns.map((entry) => `${entry.turn}${entry.live === true ? 'L' : ''}`).join(',')}]`)
         }
         const got = new Map(turnEntry.changes.map((change) => [
           change.path,
@@ -346,10 +363,32 @@ async function runMultiScenario(bias, seed) {
         assert.deepEqual(
           [...got.entries()].sort(),
           [...want.entries()].sort(),
-          `${session.id} 轮 ${turn}${turnEntry.live === true ? '（live）' : ''}：识别结果必须与该会话该轮的独占净变更精确相等`,
+          `${session.id} 轮 ${turn}${turnEntry.live === true ? '（live）' : ''}：识别结果必须与窗口净变更精确相等`,
         )
+        for (const change of turnEntry.changes) {
+          const touched = contributors.get(change.path) ?? new Set()
+          const others = [...touched].filter((id) => id !== session.id)
+          if (others.length === 0) {
+            assert.deepEqual(
+              { owner: change.owner, autoSelect: change.autoSelect },
+              { owner: 'target', autoSelect: true },
+              `${session.id} 轮 ${turn} ${change.path}：独占变更必须归属本会话并默认勾选`,
+            )
+          } else if (touched.size === 1) {
+            assert.deepEqual(
+              { owner: change.owner, autoSelect: change.autoSelect },
+              { owner: others[0], autoSelect: false },
+              `${session.id} 轮 ${turn} ${change.path}：单它主变更必须归属该会话且不默认勾选`,
+            )
+          } else {
+            assert.deepEqual(
+              { owner: change.owner, autoSelect: change.autoSelect },
+              { owner: 'multi', autoSelect: false },
+              `${session.id} 轮 ${turn} ${change.path}：多主变更必须归属 multi 且不默认勾选`,
+            )
+          }
+        }
       }
-      assert.equal(body.turns.length, expectedCount, `${session.id}：条数 = 轮数（滤空的 live 轮除外）`)
     }
 
     return completionProfile(schedule)

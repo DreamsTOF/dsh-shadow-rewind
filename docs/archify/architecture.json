@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "dsh-shadow-rewind 总体架构",
+    "locale": "zh-CN",
+    "output": "C:/code/dsh-shadow-rewind/docs/src/diagrams/architecture.html",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    {
+      "id": "client",
+      "type": "frontend",
+      "label": "DSH Web UI（浏览器半边）",
+      "sublabel": "轮尾卡片 · 侧边栏审查 · 时间线",
+      "pos": [
+        40,
+        80
+      ],
+      "size": [
+        200,
+        78
+      ]
+    },
+    {
+      "id": "filereview",
+      "type": "backend",
+      "label": "FileReviewService",
+      "sublabel": "Typert fileReview · hunk 撤销/重做",
+      "pos": [
+        480,
+        80
+      ],
+      "size": [
+        200,
+        78
+      ]
+    },
+    {
+      "id": "httpapi",
+      "type": "backend",
+      "label": "/shadow-rewind HTTP",
+      "sublabel": "同源端点 · 仅回环请求",
+      "pos": [
+        40,
+        230
+      ],
+      "size": [
+        200,
+        72
+      ]
+    },
+    {
+      "id": "events",
+      "type": "messagebus",
+      "label": "宿主事件瀑布",
+      "sublabel": "agent/pre-step · turn/end · post-execute",
+      "pos": [
+        260,
+        230
+      ],
+      "size": [
+        190,
+        86
+      ]
+    },
+    {
+      "id": "coordinator",
+      "type": "backend",
+      "label": "轮检查点协调器",
+      "sublabel": "TurnCheckpointCoordinator",
+      "pos": [
+        480,
+        230
+      ],
+      "size": [
+        200,
+        72
+      ]
+    },
+    {
+      "id": "workspace",
+      "type": "external",
+      "label": "被管理的工作区目录",
+      "sublabel": "只扫描目录，不读写 .git / .jj",
+      "pos": [
+        40,
+        390
+      ],
+      "size": [
+        160,
+        78
+      ]
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "ShadowRewindEngine",
+      "sublabel": "捕获 · 对比 · 计划 · 恢复 · 撤销",
+      "tag": "核心",
+      "pos": [
+        280,
+        390
+      ],
+      "size": [
+        210,
+        86
+      ]
+    },
+    {
+      "id": "backend",
+      "type": "database",
+      "label": "内容后端（二选一）",
+      "sublabel": "影子 jj 仓库 / content.db 降级",
+      "pos": [
+        700,
+        390
+      ],
+      "size": [
+        210,
+        78
+      ]
+    },
+    {
+      "id": "stateman",
+      "type": "database",
+      "label": "manifests · stat-cache",
+      "sublabel": "恢复点清单 · 崩溃日志 · 增量指纹",
+      "pos": [
+        700,
+        150
+      ],
+      "size": [
+        210,
+        78
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "DSH Web UI",
+      "wraps": [
+        "client"
+      ],
+      "pad": 18
+    },
+    {
+      "kind": "region",
+      "label": "DSH 宿主进程（cordis 服务 ctx.shadowRewind）",
+      "wraps": [
+        "httpapi",
+        "events",
+        "coordinator",
+        "filereview",
+        "engine"
+      ],
+      "pad": 20
+    },
+    {
+      "kind": "region",
+      "label": "被管理的项目目录（与存储物理隔离）",
+      "wraps": [
+        "workspace"
+      ],
+      "pad": 18
+    },
+    {
+      "kind": "region",
+      "label": "插件存储根 $DSH_HOME/shadow-rewind/v1",
+      "wraps": [
+        "backend",
+        "stateman"
+      ],
+      "pad": 20
+    }
+  ],
+  "connections": [
+    {
+      "from": "client",
+      "to": "httpapi",
+      "label": "fetch 同源 JSON",
+      "labelDy": 32
+    },
+    {
+      "from": "client",
+      "to": "filereview",
+      "label": "Typert fileReview 撤销/重做",
+      "variant": "dashed"
+    },
+    {
+      "from": "httpapi",
+      "to": "engine",
+      "label": "预览 / 计划 / 恢复 / diff",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "events",
+      "to": "coordinator",
+      "label": "轮起/轮末",
+      "labelDy": -40
+    },
+    {
+      "from": "events",
+      "to": "filereview",
+      "label": "run_code 录制",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "from": "coordinator",
+      "to": "engine",
+      "label": "createTurnCheckpoint",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "engine",
+      "to": "workspace",
+      "label": "扫描 / 恢复写盘"
+    },
+    {
+      "from": "engine",
+      "to": "stateman",
+      "label": "manifest · 操作日志 · GC",
+      "labelDy": 30,
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "from": "engine",
+      "to": "backend",
+      "label": "镜像 + jj commit / blob",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "两条铁律",
+      "items": [
+        "文件枚举只走目录扫描，绝不触碰工作区自身的 .git / .jj",
+        "恢复五闸：计划限时 + 确认串 + rescue 备份 + 操作日志 + 事后验证"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "三层 diff 来源",
+      "items": [
+        "快照配对：轮起 ↔ 轮末检查点，终端与外部写盘也可见",
+        "轨迹重放：write / edit / str_replace_editor，历史会话可用",
+        "工具 hunk：轮尾卡片逐块撤销/重做"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "双后端与降级",
+      "items": [
+        "jj CLI 可用：隐藏影子仓库，每次快照一条 jj commit",
+        "jj 缺失：自动降级 node:sqlite 内容库，功能不中断"
+      ]
+    }
+  ]
+}

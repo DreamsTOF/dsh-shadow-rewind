@@ -9,7 +9,46 @@
  * 注意：编解码器是**线上契约**，改动等于改协议——新增字段一律可选，避免
  * 旧 bundle 与新宿主互相判对方非法。
  */
+import { z } from 'zod';
 import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol';
 export declare const PACKAGE_NAME = "dsh-shadow-rewind";
+/** 线上 schema 的测试出口：编解码往返用例直接驱动同一份 zod 定义。 */
+export declare const wireSchemas: {
+    diffSchema: z.ZodObject<{
+        path: z.ZodString;
+        oldText: z.ZodNullable<z.ZodString>;
+        newText: z.ZodString;
+        oldStart: z.ZodOptional<z.ZodNumber>;
+        newStart: z.ZodOptional<z.ZodNumber>;
+        oldMode: z.ZodOptional<z.ZodNumber>;
+        newMode: z.ZodOptional<z.ZodNumber>;
+    }, z.core.$strip>;
+    requestSchema: z.ZodObject<{
+        action: z.ZodEnum<{
+            undo: "undo";
+            redo: "redo";
+        }>;
+        files: z.ZodArray<z.ZodObject<{
+            path: z.ZodString;
+            diffs: z.ZodArray<z.ZodObject<{
+                path: z.ZodString;
+                oldText: z.ZodNullable<z.ZodString>;
+                newText: z.ZodString;
+                oldStart: z.ZodOptional<z.ZodNumber>;
+                newStart: z.ZodOptional<z.ZodNumber>;
+                oldMode: z.ZodOptional<z.ZodNumber>;
+                newMode: z.ZodOptional<z.ZodNumber>;
+            }, z.core.$strip>>;
+            origin: z.ZodOptional<z.ZodEnum<{
+                fs: "fs";
+            }>>;
+            dirKind: z.ZodOptional<z.ZodEnum<{
+                added: "added";
+                deleted: "deleted";
+            }>>;
+        }, z.core.$strict>>;
+        force: z.ZodOptional<z.ZodBoolean>;
+    }, z.core.$strict>;
+};
 /** 本包对外登记的调用集合：状态巡检、开关、录制读取。 */
 export declare const FILE_REVIEW_INVOCATIONS: readonly InvocationDescriptor[];

@@ -84,7 +84,14 @@ export declare function contentOps(events: readonly TraceEvent[]): {
     notes: readonly string[];
 };
 /**
+ * B1：会话内所有内容型工具触碰过的路径。重放基线只需要这些路径的内容——
+ * 基线里未被区间触碰的文件在 diff 中自然抵消，逐个读全文是纯浪费。
+ */
+export declare function traceBaselinePaths(events: readonly TraceEvent[]): readonly string[];
+/**
  * 任意两个轨迹节点 (fromSeq, toSeq] 的内容区间 diff（同一 LCS 引擎语义：
  * chronologically from → to，del = 会被带走的行，add = 会出现的行）。
  */
-export declare function traceRangeDiff(events: readonly TraceEvent[], fromSeq: number, toSeq: number): TraceRangeResult;
+export declare function traceRangeDiff(events: readonly TraceEvent[], fromSeq: number, toSeq: number, options?: {
+    readonly baseline?: ReadonlyMap<string, string>;
+}): TraceRangeResult;

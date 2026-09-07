@@ -68,7 +68,8 @@ function makeCache(paths: Record<string, CacheEntry>): CaptureCache {
   return { version: 1, paths, checksum: checksumOf(paths) }
 }
 
-function checksumOf(paths: Record<string, CacheEntry>): string {
+/** 缓存校验和的唯一实现（capture.ts 写侧共用，K8 归一）。 */
+export function checksumOf(paths: Record<string, CacheEntry>): string {
   return createHash('sha256').update(JSON.stringify(paths)).digest('hex')
 }
 

@@ -244,7 +244,101 @@ test('fs 语义：内容与记录不符 → conflict，不做任何写盘', asyn
   }
 })
 
-// ── fs 撤销的删除安全网（rescue 副本）与 origin 标记 ─────────────────────
+// ── EXPECTED-DESIGN 1.2：force 强制开关（用户在冲突弹窗授权「全部回滚」） ──
+
+test('force：fs 内容漂移的冲突被强制覆盖（added 撤销 = 删除、deleted 重做 = 覆盖重建）', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-force-'))
+  try {
+    const service = new FileReviewService(new Context(), {})
+    const agent = fsAgent(workspace)
+    // added 形状但磁盘内容已被外部改过：普通 undo 报 conflict，force 删除。
+    await writeFile(join(workspace, 'drift.txt'), 'someone edited later\n', 'utf8')
+    const addRequest = {
+      files: [{ path: 'drift.txt', diffs: [diff('drift.txt', null, 'original new content\n')] }],
+    }
+    const addUndo = await service.apply(agent, { ...addRequest, action: 'undo' })
+    assert.equal(addUndo.files[0].state, 'conflict', '无 force 时拒绝')
+    assert.equal(await readFile(join(workspace, 'drift.txt'), 'utf8'), 'someone edited later\n', '冲突时不动磁盘')
+    const forcedUndo = await service.apply(agent, { ...addRequest, action: 'undo', force: true })
+    assert.equal(forcedUndo.files[0].state, 'undone', 'force 覆盖冲突')
+    assert.equal(forcedUndo.files[0].changed, true)
+    await assertFileAbsent(join(workspace, 'drift.txt'))
+
+    // deleted 形状但文件以不同内容重新出现：force 写回记录的旧内容。
+    await writeFile(join(workspace, 'back.txt'), 'not the old content\n', 'utf8')
+    const delRequest = {
+      files: [{ path: 'back.txt', diffs: [diff('back.txt', 'the recorded old content\n', '')] }],
+    }
+    const delRedo = await service.apply(agent, { ...delRequest, action: 'redo' })
+    assert.equal(delRedo.files[0].state, 'conflict', '无 force 时拒绝')
+    assert.equal(await readFile(join(workspace, 'back.txt'), 'utf8'), 'not the old content\n')
+    const forcedRedo = await service.apply(agent, { ...delRequest, action: 'redo', force: true })
+    assert.equal(forcedRedo.files[0].state, 'applied', 'force 覆盖冲突')
+    await assertFileAbsent(join(workspace, 'back.txt'))
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('force：目录「非空拒删」闸放开——先落逐文件 rescue 副本再递归删除', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-forcedir-'))
+  const storageDir = await mkdtemp(join(tmpdir(), 'shadow-rewind-forcedir-store-'))
+  try {
+    const service = new FileReviewService(new Context(), { storageDir })
+    const agent = fsAgent(workspace)
+    // 本轮新建的空目录里被终端塞了文件：rmdir 报 ENOTEMPTY → conflict。
+    await mkdir(join(workspace, 'newdir'), { recursive: true })
+    await writeFile(join(workspace, 'newdir', 'stray.txt'), 'stray content\n', 'utf8')
+    const request = {
+      files: [{ path: 'newdir', dirKind: 'added', diffs: [] }],
+    }
+    const plainUndo = await service.apply(agent, { ...request, action: 'undo' })
+    assert.equal(plainUndo.files[0].state, 'conflict', '非空目录默认拒绝删除')
+    assert.equal(await readFile(join(workspace, 'newdir', 'stray.txt'), 'utf8'), 'stray content\n')
+    // force：递归删除，但子文件先落 rescue 副本。
+    const forcedUndo = await service.apply(agent, { ...request, action: 'undo', force: true })
+    assert.equal(forcedUndo.files[0].state, 'undone', 'force 放开非空拒删闸')
+    await assertFileAbsent(join(workspace, 'newdir'))
+    const rescueFiles = await readdir(join(storageDir, 'file-review', 'rescue'))
+    assert.ok(rescueFiles.some(name => name.includes('stray')), '子文件的 rescue 副本已落盘')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
+
+test('force：hunk 锚点定位失败 → conflict（进二次回滚清单），绝不猜着改', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-forcehunk-'))
+  try {
+    const service = new FileReviewService(new Context(), {})
+    const agent = fsAgent(workspace)
+    // 内容漂移过大、锚点找不到：force 也只能如实报 conflict——
+    // 客户端把它列入二次回滚清单，由用户决定后续（绝不猜着改）。
+    await writeFile(join(workspace, 'lost.txt'), 'totally rewritten\n', 'utf8')
+    const lostRequest = {
+      files: [{ path: 'lost.txt', diffs: [diff('lost.txt', 'hello\n', 'hello v2\n', 1, 1)] }],
+    }
+    const plainUndo = await service.apply(agent, { ...lostRequest, action: 'undo' })
+    assert.equal(plainUndo.files[0].state, 'conflict', '普通路径拒绝')
+    const lostForce = await service.apply(agent, { ...lostRequest, action: 'undo', force: true })
+    assert.equal(lostForce.files[0].state, 'conflict', '锚点定位失败进二次回滚清单')
+    assert.ok(lostForce.files[0].reason?.includes('could not locate'), '原因点名强制回放定位失败')
+    assert.equal(await readFile(join(workspace, 'lost.txt'), 'utf8'), 'totally rewritten\n', '定位失败绝不写盘')
+
+    // 对照：漂移发生在 hunk 区域之外时锚点仍在——普通撤销本就成功
+    //（transform 是局部回放，用户追加的行天然保留 = 1.3 的「保留手动小修改」）。
+    await writeFile(join(workspace, 'shift.txt'), 'l1\nl2\nL3\nl4\nuser appended\n', 'utf8')
+    const shiftRequest = {
+      files: [{ path: 'shift.txt', diffs: [diff('shift.txt', 'l3\n', 'L3\n', 3, 3)] }],
+    }
+    const plainShift = await service.apply(agent, { ...shiftRequest, action: 'undo' })
+    assert.equal(plainShift.files[0].state, 'undone', '区域外漂移不构成冲突')
+    assert.equal(await readFile(join(workspace, 'shift.txt'), 'utf8'), 'l1\nl2\nl3\nl4\nuser appended\n',
+      '锚点块被回滚，用户追加的行原样保留')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
 
 test('fs 撤销安全网：fs-added 撤销删除前先落 rescue 副本；origin 标记随请求透传', async () => {
   const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-rescue-ws-'))
@@ -491,4 +585,79 @@ test('fsChangeShape 守卫：带锚点的「改到空」hunk 不误判为整文�
   } finally {
     await rm(workspace, { recursive: true, force: true })
   }
+})
+
+// ── F1：typert 线上契约——判别字段必须穿越编解码（而非被静默剥离）──────
+
+test('wire schema：origin/dirKind/oldMode/newMode 穿越 parse 往返', async () => {
+  const { wireSchemas } = await import('../lib/typert.host.js')
+  const request = {
+    action: 'undo',
+    files: [
+      {
+        path: 'dir-a',
+        diffs: [],
+        origin: 'fs',
+        dirKind: 'added',
+      },
+      {
+        path: 'a.txt',
+        diffs: [{ path: 'a.txt', oldText: 'x\n', newText: 'x\n', oldMode: 0o644, newMode: 0o755 }],
+        origin: 'fs',
+      },
+    ],
+  }
+  const parsed = wireSchemas.requestSchema.parse(request)
+  assert.equal(parsed.files[0].dirKind, 'added', 'dirKind 必须到达宿主（否则目录撤销走文件语义报 error）')
+  assert.equal(parsed.files[0].origin, 'fs')
+  assert.equal(parsed.files[1].diffs[0].oldMode, 0o644, 'oldMode 必须到达宿主（否则 mode-only 条目恒 unsupported）')
+  assert.equal(parsed.files[1].diffs[0].newMode, 0o755)
+})
+
+test('wire schema：request 层 strict——未知字段显式报错而非静默剥离', async () => {
+  const { wireSchemas } = await import('../lib/typert.host.js')
+  assert.throws(
+    () => wireSchemas.requestSchema.parse({
+      action: 'undo',
+      files: [{ path: 'a.txt', diffs: [], bogusField: 1 }],
+    }),
+    (error) => error instanceof Error,
+    '未知字段必须显式失败（静默剥离曾让判别字段丢失无从排查）',
+  )
+})
+
+// ── H4/E2：录制产线的 LF 归一、空文件保留与白名单 ──────────────────────────
+
+test('H4：CRLF 文件的 run_code 录制 hunk 与宿主 LF 基线对齐', async () => {
+  const { diffsFromBeforeAfter } = await import('../lib/client-recorded-diffs.js')
+  const hunks = diffsFromBeforeAfter('a.txt', 'hello\r\nworld\r\n', 'hello\r\nbrave\r\nworld\r\n')
+  assert.equal(hunks.length, 1)
+  assert.ok(!hunks[0].newText.includes('\r'), 'hunk 行尾不得携带 CR（宿主在 LF 文本上锚点匹配）')
+  assert.ok(!hunks[0].oldText.includes('\r'))
+  // 撤销可回放性：宿主 transformFile 在归一文本上命中锚点。
+  const file = { path: 'a.txt', diffs: hunks }
+  const restored = transformFile('hello\r\nbrave\r\nworld\r\n'.replace(/\r\n/g, '\n'), file, 'undo')
+  assert.equal(restored, 'hello\nworld\n')
+})
+
+test('H4/J7：run_code 创建空文件不再被静默丢弃（added 语义与 write 同形）', async () => {
+  const { diffsFromBeforeAfter } = await import('../lib/client-recorded-diffs.js')
+  const hunks = diffsFromBeforeAfter('empty.txt', null, '')
+  assert.deepEqual(hunks, [{ path: 'empty.txt', oldText: null, newText: '' }])
+})
+
+// ── H3：统一 CAS ──────────────────────────────────────────────────────────
+
+test('H3：contentMatches 按 LF 归一比较，CRLF 与 LF 内容等价', async () => {
+  const { contentMatches } = await import('../lib/file-review/cas.js')
+  assert.equal(contentMatches(Buffer.from('a\r\nb\r\n'), Buffer.from('a\nb\n')), true)
+  assert.equal(contentMatches(Buffer.from('a\nb\n'), Buffer.from('a\nc\n')), false)
+})
+
+test('H3：hunk 撤销对「仅行尾漂移」不再误报冲突，写回还原当前行尾', async () => {
+  // applyOne 的 CAS 现按统一规则（LF 归一）比较——同一内容仅行尾不同的
+  // 两次读取不再判 conflict，且写回还原重读内容的行尾风格。
+  const { transformFile } = await import('../lib/file-review/file-review-service.js')
+  const file = { path: 'a.txt', diffs: [{ path: 'a.txt', oldText: 'hello\n', newText: 'hi\n', oldStart: 1, newStart: 1 }] }
+  assert.equal(transformFile('hi\n', file, 'undo'), 'hello\n')
 })

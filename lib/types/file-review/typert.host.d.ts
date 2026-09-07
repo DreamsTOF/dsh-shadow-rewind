@@ -7,5 +7,8 @@
  * 不生成模型工具集。
  */
 import type { TypertContribution } from '@deepseek-ai/dsh-typert-registry/types';
+import { wireSchemas } from './typert-descriptors.ts';
+/** 供契约往返测试直接驱动与描述符同一份 zod 定义（未摇树）。 */
+export { wireSchemas };
 export declare const TYPERT: TypertContribution;
 export default TYPERT;

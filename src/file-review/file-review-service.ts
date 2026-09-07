@@ -14,8 +14,8 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { chmod, lstat, mkdir, readFile, realpath, rm, rmdir } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
@@ -48,25 +48,14 @@ interface ResolvedFile {
 }
 
 /**
- * 为什么需要行尾归一化：变更工具录制的 hunk（diff 卡片与 Code Mode 的
- * before / after 都是）走的是文件系统后端的 LF 基准，而磁盘文件可能是
- * CRLF。所有 hunk 匹配因此一律在归一化文本上进行，写回路径再把文件自己的
- * 行尾风格还原回去。
+ * 行尾归一化与统一 CAS 规则收敛在 ./cas.ts（H3 归一）：hunk 匹配、fs 形状
+ * 比较、提交前复核共用同一套「未被改动」定义，写回一律还原文件自己的行尾。
  */
-function normalizeNewlines(text: string): string {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-}
+import { isWithin } from '../path-utils.ts'
+import { contentMatches, crlfStyle, normalizeNewlines, restoreNewlines } from './cas.ts'
 
-/** 把归一化文本还原成文件自己的行尾风格（CRLF 文件写回仍是 CRLF）。 */
-function restoreNewlines(text: string, crlf: boolean): string {
-  return crlf ? text.replace(/\n/g, '\r\n') : text
-}
-
-/** 工作区围栏：`candidate` 是否仍在 `root` 之内（含 root 自身）。 */
-function inside(root: string, candidate: string): boolean {
-  const child = relative(root, candidate)
-  return child === '' || (!child.startsWith('..') && !isAbsolute(child))
-}
+// 工作区围栏谓词统一用 path-utils.isWithin（K8 归一）：此前本模块自带的
+// inside() 对「..foo 这类合法目录名」误拒，三处 containment 各有一套边界。
 
 /**
  * 解析一个会话相对路径为可安全操作的目标文件。
@@ -76,12 +65,12 @@ function inside(root: string, candidate: string): boolean {
 async function resolveFile(cwd: string, requestedPath: string): Promise<ResolvedFile> {
   const root = await realpath(cwd)
   const candidate = resolve(root, requestedPath)
-  if (!inside(root, candidate)) throw new Error('path is outside the session workspace')
+  if (!isWithin(root, candidate)) throw new Error('path is outside the session workspace')
   const linkStat = await lstat(candidate)
   if (linkStat.isSymbolicLink()) throw new Error('symbolic links are not supported')
   if (!linkStat.isFile()) throw new Error('path is not a regular file')
   const filename = await realpath(candidate)
-  if (!inside(root, filename)) throw new Error('resolved path is outside the session workspace')
+  if (!isWithin(root, filename)) throw new Error('resolved path is outside the session workspace')
   const bytes = await readFile(filename)
   const text = bytes.toString('utf8')
   if (!Buffer.from(text, 'utf8').equals(bytes)) throw new Error('file is not valid UTF-8 text')
@@ -189,7 +178,7 @@ async function fsFileState(
 ): Promise<{ exists: false } | { exists: true; filename: string; text: string; mode: number }> {
   const root = await realpath(cwd)
   const candidate = resolve(root, requestedPath)
-  if (!inside(root, candidate)) throw new Error('path is outside the session workspace')
+  if (!isWithin(root, candidate)) throw new Error('path is outside the session workspace')
   let stat
   try {
     stat = await lstat(candidate)
@@ -200,7 +189,7 @@ async function fsFileState(
   if (stat.isSymbolicLink()) throw new Error('symbolic links are not supported')
   if (!stat.isFile()) throw new Error('path is not a regular file')
   const filename = await realpath(candidate)
-  if (!inside(root, filename)) throw new Error('resolved path is outside the session workspace')
+  if (!isWithin(root, filename)) throw new Error('resolved path is outside the session workspace')
   const bytes = await readFile(filename)
   const text = bytes.toString('utf8')
   if (!Buffer.from(text, 'utf8').equals(bytes)) throw new Error('file is not valid UTF-8 text')
@@ -214,7 +203,7 @@ async function fsDirState(
 ): Promise<{ exists: false } | { dir: true; mode: number } | { other: true }> {
   const root = await realpath(cwd)
   const candidate = resolve(root, requestedPath)
-  if (!inside(root, candidate)) throw new Error('path is outside the session workspace')
+  if (!isWithin(root, candidate)) throw new Error('path is outside the session workspace')
   let stat
   try {
     stat = await lstat(candidate)
@@ -295,16 +284,58 @@ function inspectFsChange(cwd: string, file: FileReviewChange, shape: FsChangeSha
   })()
 }
 
-/** 删除前的可找回副本：<rescueDir>/<时间戳>-<rand>-<净化文件名>。 */
-async function writeRescueCopy(rescueDir: string, path: string, content: string): Promise<boolean> {
+/** rescue 副本保留上限：超出即淘汰最旧（按文件名的 ms 时间戳排序）。
+ * 这条轻量删除路径不在引擎安全闸内，副本目录若无限增长会拖垮存储盘。 */
+const RESCUE_COPY_CAP = 50
+
+/** 删除前的可找回副本：<rescueDir>/<时间戳>-<rand>-<净化文件名>。
+ * content 为 string（fs 条目删除，走原子写）或 Buffer（force 递归删目录的
+ * 逐文件副本，普通写即可——副本本身是尽力而为的兜底，不需要原子语义）。 */
+async function writeRescueCopy(rescueDir: string, path: string, content: string | Uint8Array): Promise<boolean> {
   try {
     await mkdir(rescueDir, { recursive: true })
     const safe = path.replace(/[^A-Za-z0-9._-]/g, '_').slice(-80)
     const name = `${String(Date.now())}-${randomUUID().slice(0, 8)}-${safe === '' ? 'file' : safe}.txt`
-    await writeFileAtomic(join(rescueDir, name), content, { mode: 0o600 })
+    const target = join(rescueDir, name)
+    if (typeof content === 'string') await writeFileAtomic(target, content, { mode: 0o600 })
+    else await writeFile(target, content, { mode: 0o600 })
+    // 淘汰最旧：按文件名前缀的 ms 时间戳升序，超出上限的部分删除。
+    // 尽力而为：清理失败不影响本次副本的可用性。
+    const existing = (await readdir(rescueDir)).filter((name) => name.endsWith('.txt')).sort()
+    for (const stale of existing.slice(0, Math.max(0, existing.length - RESCUE_COPY_CAP))) {
+      await rm(join(rescueDir, stale), { force: true }).catch(() => undefined)
+    }
     return true
   } catch {
     return false
+  }
+}
+
+/**
+ * force 递归删目录前的逐文件可找回副本（尽力而为）：子树里每个普通文件
+ * 都落一份副本再删。目录本身不备份（结构可由路径重建）；单个文件副本
+ * 失败不阻止删除——force 是用户的显式授权，副本只是最后的善意。
+ */
+async function rescueCopyTree(rescueDir: string, absDir: string, relDir: string): Promise<void> {
+  let entries
+  try {
+    entries = await readdir(absDir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    const absChild = join(absDir, entry.name)
+    const relChild = `${relDir}/${entry.name}`
+    if (entry.isDirectory()) {
+      await rescueCopyTree(rescueDir, absChild, relChild)
+      continue
+    }
+    if (!entry.isFile()) continue
+    try {
+      await writeRescueCopy(rescueDir, relChild, await readFile(absChild))
+    } catch {
+      // 尽力而为：副本失败不阻止 force 删除。
+    }
   }
 }
 
@@ -313,7 +344,12 @@ async function writeRescueCopy(rescueDir: string, path: string, content: string)
  * rescueDir 提供时，任何删除分支（fs-added 撤销 / fs-deleted 重做）先把即将
  * 删除的内容落一份可找回的副本——这条轻量路径不在引擎的恢复安全闸之内，
  * 副本是唯一的服务端兜底；落盘失败则拒绝删除（宁可不删，不可删了找不回）。
- * 目录条目没有内容可备份（rmdir 只删空目录），不走 rescue。
+ * 目录条目没有内容可备份（rmdir 只删空目录），不走 rescue；force 递归删
+ * 非空目录前改为逐文件落副本（rescueCopyTree）。
+ *
+ * force（EXPECTED-DESIGN 1.2）：用户在冲突弹窗授权「全部回滚」——内容漂移
+ * （conflict）不再拒绝，覆盖用户的二次修改；结构性 error（磁盘读不出等）
+ * 仍如实上报。「非空拒删」闸随 force 放开为递归删除。
  */
 async function applyFsChange(
   cwd: string,
@@ -321,6 +357,7 @@ async function applyFsChange(
   action: FileReviewAction,
   shape: FsChangeShape,
   rescueDir?: string,
+  force?: boolean,
 ): Promise<FileReviewFileResult> {
   const diff = file.diffs[0]
   try {
@@ -328,17 +365,21 @@ async function applyFsChange(
     const sourceState = action === 'undo' ? 'applied' : 'undone'
     const targetState = action === 'undo' ? 'undone' : 'applied'
     if (inspected.state === targetState) return { path: file.path, state: targetState, changed: false }
-    if (inspected.state !== sourceState) {
+    if (inspected.state === 'error') {
+      return { path: file.path, state: inspected.state, changed: false, reason: inspected.reason }
+    }
+    if (inspected.state !== sourceState && force !== true) {
       return { path: file.path, state: inspected.state, changed: false, reason: inspected.reason }
     }
 
     if (shape.kind === 'mode') {
-      // mode-only：提交前复核内容未漂移，然后只改权限位。
+      // mode-only：不变量是「内容不动、只有权限位翻转」。force 时内容漂移
+      // 放行（授权覆盖），但文件缺席仍无从 chmod。
       if (diff === undefined || diff.oldMode === undefined || diff.newMode === undefined) {
         return { path: file.path, state: 'error', changed: false, reason: 'recorded change carries no mode pair' }
       }
       const state = await fsFileState(cwd, file.path)
-      if (!state.exists || normalizeNewlines(state.text) !== normalizeNewlines(diff.newText)) {
+      if (!state.exists || (force !== true && normalizeNewlines(state.text) !== normalizeNewlines(diff.newText))) {
         return { path: file.path, state: 'conflict', changed: false, reason: 'file changed while the operation was being prepared' }
       }
       const root = await realpath(cwd)
@@ -349,6 +390,7 @@ async function applyFsChange(
     if (shape.dir) {
       // added : undo → rmdir（必须仍为空）, redo → mkdir(newMode)
       // deleted: undo → mkdir(oldMode), redo → rmdir（必须仍为空）
+      // force：「非空拒删」放开——先逐文件落 rescue 副本，再递归删除。
       const removes = (shape.kind === 'added') === (action === 'undo')
       const root = await realpath(cwd)
       const target = resolve(root, file.path)
@@ -357,7 +399,12 @@ async function applyFsChange(
           await rmdir(target)
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === 'ENOTEMPTY') {
-            return { path: file.path, state: 'conflict', changed: false, reason: 'directory is not empty' }
+            if (force !== true) {
+              return { path: file.path, state: 'conflict', changed: false, reason: 'directory is not empty' }
+            }
+            if (rescueDir !== undefined) await rescueCopyTree(rescueDir, target, file.path)
+            await rm(target, { recursive: true, force: true })
+            return { path: file.path, state: targetState, changed: true }
           }
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
             return { path: file.path, state: 'conflict', changed: false, reason: 'directory changed while the operation was being prepared' }
@@ -391,10 +438,14 @@ async function applyFsChange(
     if (removes) {
       const expected = shape.kind === 'added' ? diff.newText : diff.oldText
       // CAS 复核按 LF 归一化比较（同 inspectFsChange：行尾风格差异不算漂移）。
+      // force：内容漂移放行（用户授权覆盖），文件缺席仍无东西可删。
       const matches = state.exists
         && expected !== null
         && normalizeNewlines(state.text) === normalizeNewlines(expected)
-      if (!matches) {
+      if (!state.exists) {
+        return { path: file.path, state: 'conflict', changed: false, reason: 'file changed while the operation was being prepared' }
+      }
+      if (!matches && force !== true) {
         return { path: file.path, state: 'conflict', changed: false, reason: 'file changed while the operation was being prepared' }
       }
       if (rescueDir !== undefined) {
@@ -406,7 +457,7 @@ async function applyFsChange(
       await rm(state.filename)
       return { path: file.path, state: targetState, changed: true }
     }
-    if (state.exists) {
+    if (state.exists && force !== true) {
       return { path: file.path, state: 'conflict', changed: false, reason: 'file changed while the operation was being prepared' }
     }
     const content = shape.kind === 'added' ? diff.newText : diff.oldText
@@ -414,8 +465,9 @@ async function applyFsChange(
       return { path: file.path, state: 'error', changed: false, reason: 'recorded change carries no restorable content' }
     }
     const root = await realpath(cwd)
-    // 权限位随 fs 条目透传（检查点记录的旧/新侧 mode）；缺省（旧宿主或
-    // 工具条目）回落 0o644——引擎级恢复仍是精确复刻权限的完整路径。
+    // 权限位随 fs 条目透传（检查点记录的旧/新侧 mode）。缺省（纯工具形状
+    // 条目，磁盘上没有可沿用的 mode）才回落 0o644——统一 CAS 规则：有据
+    // 必沿用，无据才猜。
     const mode = action === 'undo' ? diff.oldMode : diff.newMode
     await writeFileAtomic(resolve(root, file.path), content, { mode: mode ?? 0o644 })
     return { path: file.path, state: targetState, changed: true }
@@ -529,15 +581,17 @@ async function inspectOne(cwd: string, file: FileReviewChange): Promise<FileRevi
   }
 }
 
-/** 执行一个条目的开关动作（fs 形状直接落盘，否则走 hunk 回放 + CAS 复核）。 */
+/** 执行一个条目的开关动作（fs 形状直接落盘，否则走 hunk 回放 + CAS 复核）。
+ * force（EXPECTED-DESIGN 1.2）：冲突弹窗授权「全部回滚」后的强制开关。 */
 async function applyOne(
   cwd: string,
   file: FileReviewChange,
   action: FileReviewAction,
   rescueDir?: string,
+  force?: boolean,
 ): Promise<FileReviewFileResult> {
   const fsShape = fsChangeShape(file)
-  if (fsShape !== null) return applyFsChange(cwd, file, action, fsShape, rescueDir)
+  if (fsShape !== null) return applyFsChange(cwd, file, action, fsShape, rescueDir, force)
   if (file.diffs.length === 0 || !file.diffs.every(diff => hunkSupported(diff, file.path))) {
     return {
       path: file.path,
@@ -554,14 +608,36 @@ async function applyOne(
     if (inspected.state === targetState) {
       return { path: file.path, state: targetState, changed: false }
     }
+    if (force === true) {
+      // 强制回放：CAS 失配不再拒绝，仍按行锚点 / 全局唯一性定位并回放；
+      // 定位失败（内容漂移过大）如实报 conflict——客户端把它列入二次回滚
+      // 清单，绝不猜着改。写回按重读内容的行尾风格还原。
+      const nextText = transformFile(resolved.lfText, file, action)
+      if (nextText === null) {
+        return {
+          path: file.path,
+          state: 'conflict',
+          changed: false,
+          reason: 'forced replay could not locate the recorded hunks in the current content',
+        }
+      }
+      await writeFileAtomic(
+        resolved.filename,
+        restoreNewlines(nextText, crlfStyle(resolved.bytes)),
+        { mode: resolved.mode },
+      )
+      return { path: file.path, state: targetState, changed: true }
+    }
     if (inspected.state !== sourceState || inspected.nextText === undefined) {
       return { path: file.path, state: inspected.state, changed: false, reason: inspected.reason }
     }
 
     // 提交前再读一次。对于不参与本包写锁的外部编辑器，这是能拿到的最近的
-    // CAS 闸门——字节不等即判冲突，绝不覆盖别人的新修改。
+    // CAS 闸门——统一规则（contentMatches）：LF 归一后文本不等即判冲突，
+    // 绝不覆盖别人的新修改；纯行尾漂移不算漂移，写回按重读内容的行尾风格
+    // 还原。
     const current = await readFile(resolved.filename)
-    if (!Buffer.from(resolved.bytes).equals(current)) {
+    if (!contentMatches(current, resolved.bytes)) {
       return {
         path: file.path,
         state: 'conflict',
@@ -571,7 +647,7 @@ async function applyOne(
     }
     await writeFileAtomic(
       resolved.filename,
-      restoreNewlines(inspected.nextText, resolved.crlf),
+      restoreNewlines(inspected.nextText, crlfStyle(current)),
       { mode: resolved.mode },
     )
     return { path: file.path, state: targetState, changed: true }
@@ -829,12 +905,16 @@ export class FileReviewService extends TypertRemoteService {
    * 在接收方 Agent 空闲时逐个开关「各自独立安全」的文件。
    * 逐文件串行而非并行：同一路径的两个动作交错会让 CAS 闸门失去意义。
    * 单个文件失败不影响其余文件——结果里逐条如实报告。
+   * force（EXPECTED-DESIGN 1.2）：冲突弹窗授权「全部回滚」后为 true——
+   * CAS 失配的条目强制覆盖（详见 applyOne / applyFsChange）。
    */
   async apply(agent: Agent, request: FileReviewRequest): Promise<FileReviewResult> {
     const cwd = sessionCwd(agent)
     return agent.runMaintenance(async () => {
       const files: FileReviewFileResult[] = []
-      for (const file of request.files) files.push(await applyOne(cwd, file, request.action, this.rescueDir))
+      for (const file of request.files) {
+        files.push(await applyOne(cwd, file, request.action, this.rescueDir, request.force === true))
+      }
       return { files }
     })
   }

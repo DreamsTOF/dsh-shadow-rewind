@@ -130,7 +130,7 @@ test('引擎集成：双会话窗口归因 + 勾选式子集恢复只还原勾�
       paths: ['b.txt'],
     })
     assert.deepEqual(plan.changes.map(change => change.path), ['b.txt'])
-    await engine.applyRestore({ planId: plan.id, confirmation: plan.confirmation, sessionId: 'A' })
+    await engine.applyRestore({ planId: plan.id, sessionId: 'A' })
     assert.equal(await readFile(join(workspace, 'b.txt'), 'utf8'), 'B0\n', 'b.txt 回到目标检查点状态')
     assert.equal(await readFile(join(workspace, 'a.txt'), 'utf8'), 'A2\n', '未勾选的 a.txt 不受影响')
     assert.equal(await readFile(join(workspace, 'c.txt'), 'utf8'), 'C0\n', '未勾选的 c.txt 不受影响')

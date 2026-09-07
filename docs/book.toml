@@ -1,0 +1,14 @@
+[book]
+title = "dsh-shadow-rewind 架构讲解"
+authors = ["DreamsTOF"]
+description = "DeepSeek Harness 会话级文件快照与回退插件的完整架构与流程讲解"
+src = "src"
+language = "zh-CN"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "dark"
+git-repository-url = "https://github.com/DreamsTOF/dsh-shadow-rewind"
+edit-url-template = "https://github.com/DreamsTOF/dsh-shadow-rewind/edit/main/docs/{path}"

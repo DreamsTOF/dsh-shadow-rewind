@@ -143,37 +143,48 @@ export class ShadowJj {
     await mkdir(mirrorRoot, { recursive: true, mode: 0o755 })
     const wanted = new Set<string>()
     let writtenBytes = 0
-    for (const entry of paths) {
-      signal?.throwIfAborted()
-      wanted.add(entry.path)
-      if (entry.kind !== 'file') continue
-      const content = newContent.get(entry.path)
-      if (content === undefined) continue // 缓存命中：镜像里已是当前内容
-      const segments = entry.path.split('/')
-      const fileName = segments[segments.length - 1]
-      if (fileName === undefined || fileName === '' || segments.some((s) => s === '' || s === '.' || s === '..')) {
-        throw new ShadowRewindError('INVALID_PATH', `镜像路径不是规范形式：${entry.path}`)
+    try {
+      for (const entry of paths) {
+        signal?.throwIfAborted()
+        wanted.add(entry.path)
+        if (entry.kind !== 'file') continue
+        const content = newContent.get(entry.path)
+        if (content === undefined) continue // 缓存命中：镜像里已是当前内容
+        const segments = entry.path.split('/')
+        const fileName = segments[segments.length - 1]
+        if (fileName === undefined || fileName === '' || segments.some((s) => s === '' || s === '.' || s === '..')) {
+          throw new ShadowRewindError('INVALID_PATH', `镜像路径不是规范形式：${entry.path}`)
+        }
+        const target = join(mirrorRoot, ...segments)
+        await mkdir(dirname(target), { recursive: true, mode: 0o755 })
+        writtenBytes += content.length
+        if (writtenBytes > options.maxNewBytes) {
+          throw new ShadowRewindError('TURN_CHECKPOINT_NEW_CONTENT_LIMIT',
+            `本次自动检查点需新写 ${String(writtenBytes)} 字节，超出上限 ${String(options.maxNewBytes)}`)
+        }
+        await writeMirrorFile(target, content, entry.mode)
       }
-      const target = join(mirrorRoot, ...segments)
-      await mkdir(dirname(target), { recursive: true, mode: 0o755 })
-      writtenBytes += content.length
-      if (writtenBytes > options.maxNewBytes) {
-        throw new ShadowRewindError('TURN_CHECKPOINT_NEW_CONTENT_LIMIT',
-          `本次自动检查点需新写 ${String(writtenBytes)} 字节，超出上限 ${String(options.maxNewBytes)}`)
+      // 符号链接的 target 变化不产生「内容字节」，但镜像必须重建链接实体。
+      for (const entry of paths) {
+        if (entry.kind !== 'symlink' || !newLinks.has(entry.path)) continue
+        const segments = entry.path.split('/')
+        const target = join(mirrorRoot, ...segments)
+        await mkdir(dirname(target), { recursive: true, mode: 0o755 })
+        await rm(target, { force: true })
+        await symlink(entry.target ?? '', target)
       }
-      await writeMirrorFile(target, content, entry.mode)
+      await pruneExtra(mirrorRoot, mirrorRoot, wanted, signal)
+      await runJj(['commit', '-m', message], this.repoDir, signal)
+    } catch (error) {
+      // K6：中断（字节上限 / 取消）会让镜像工作副本残留半新内容。stat 缓存
+      // 只在成功路径更新，下一次捕获会重写全部差异路径——收敛不依赖这里；
+      // 但把工作副本复位回上次提交（@-）能立即消除半写残留，杜绝「镜像与
+      // 提交历史」在两次捕获之间被外部观测到不一致。
+      if (error instanceof ShadowRewindError) {
+        await runJj(['restore'], this.repoDir).catch(() => undefined)
+      }
+      throw error
     }
-    // 符号链接的 target 变化不产生「内容字节」，但镜像必须重建链接实体。
-    for (const entry of paths) {
-      if (entry.kind !== 'symlink' || !newLinks.has(entry.path)) continue
-      const segments = entry.path.split('/')
-      const target = join(mirrorRoot, ...segments)
-      await mkdir(dirname(target), { recursive: true, mode: 0o755 })
-      await rm(target, { force: true })
-      await symlink(entry.target ?? '', target)
-    }
-    await pruneExtra(mirrorRoot, mirrorRoot, wanted, signal)
-    await runJj(['commit', '-m', message], this.repoDir, signal)
     // 记录 git commit id 而非 change id：jj 各版本的 change id 长度不一，
     // 且部分版本不能把 change id hex 直接当 revset 字面量；40 位 commit id
     // 在任何版本都能被 `-r` 稳定解析。我们的历史只追加、永不 rebase，

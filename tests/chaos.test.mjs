@@ -15,7 +15,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ShadowRewindEngine } from '../lib/index.js'
 import { installShadowRewindHttp, TurnCheckpointCoordinator } from '../lib/rewind-host.js'
-import { WorkspaceWriteGate } from '../lib/write-gate.js'
 import { canonicalDirectory } from '../lib/path-utils.js'
 
 const pause = (ms = 3) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -39,7 +38,7 @@ async function rewindTo(engine, workspace, checkpointId) {
     restorePointId: checkpointId,
     expectedCurrentTreeHash: inspection.currentTreeHash,
   })
-  return engine.applyRestore({ planId: plan.id, confirmation: plan.confirmation })
+  return engine.applyRestore({ planId: plan.id })
 }
 
 /** 恢复不变量：工作区与检查点零差异（含空目录条目）。 */
@@ -81,7 +80,7 @@ async function snapshotTree(root) {
 
 // ── 端点脚手架（与 fs-changes 测试同款，免网络直驱） ─────────────────────
 
-function makeHandlers(liveSessions, engine, coordinator, writeGate) {
+function makeHandlers(liveSessions, engine, coordinator) {
   const handlers = new Map()
   const webServer = {
     register(route) {
@@ -109,7 +108,7 @@ function makeHandlers(liveSessions, engine, coordinator, writeGate) {
     },
     agents: { list: () => [] },
     webServer,
-  }, engine, coordinator, writeGate)
+  }, engine, coordinator)
   return handlers
 }
 
@@ -161,39 +160,37 @@ test('混沌：双会话交错写盘——归属分离、空目录流转、整�
     // B 轮 2 收尾。
     await captureTurn(engine, workspace, 'sB', 2)
 
-    // 端点归属：A 轮 1 只见自己窗口的写入；B 的写入（含 sub 变空的目录条目）被剔除。
+    // 端点归属：A 轮 1 的清单保留窗口内的全部写入，附检查点网格归属标签
+    //（建议，不裁决可见性）；B 的写入标 sB、不默认勾选。
     const liveSessions = new Map([
       ['sA', { id: 'sA', status: 'idle', session: { id: 'sA', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
       ['sB', { id: 'sB', status: 'idle', session: { id: 'sB', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
     const coordinator = new TurnCheckpointCoordinator(engine)
-    const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
-    const handlers = makeHandlers(liveSessions, engine, coordinator, writeGate)
+    const handlers = makeHandlers(liveSessions, engine, coordinator)
 
     const bodyA = await callFsChanges(handlers, 'sA')
     const aTurn1 = bodyA.turns.find((turn) => turn.turn === 1 && turn.live !== true)
     assert.ok(aTurn1, 'A 轮 1 必须有配对条目')
-    const aPaths = aTurn1.changes.map((change) => change.path)
-    assert.ok(aPaths.includes('a.txt'), 'A 自己的修改必须保留')
-    assert.ok(aPaths.includes('emptyA'), 'A 创建的空目录必须保留')
-    const emptyAChange = aTurn1.changes.find((change) => change.path === 'emptyA')
-    assert.equal(emptyAChange.dir, true, '空目录条目必须带 dir 标记')
-    assert.ok(!aPaths.includes('b-new.txt'), 'B 窗口写入必须从 A 的清单剔除')
-    assert.ok(!aPaths.includes('sub/b.txt'), 'B 造成的删除必须从 A 的清单剔除')
-    assert.ok(!aPaths.includes('sub'), 'sub 变空发生在 B 的窗口，必须剔除')
+    const aByPath = Object.fromEntries(aTurn1.changes.map((change) => [change.path, change]))
+    assert.equal(aByPath['a.txt'].owner, 'target', 'A 自己的修改必须归属本会话')
+    assert.equal(aByPath['a.txt'].autoSelect, true)
+    assert.equal(aByPath['emptyA'].dir, true, '空目录条目必须带 dir 标记')
+    assert.equal(aByPath['b-new.txt'].owner, 'sB', 'B 窗口写入必须归属 sB')
+    assert.equal(aByPath['b-new.txt'].autoSelect, false, 'B 的写入不得默认勾选')
+    assert.equal(aByPath['sub/b.txt'].owner, 'sB', 'B 造成的删除归属 sB')
+    assert.equal(aByPath['sub'].owner, 'sB', 'sub 变空发生在 B 的窗口，归属 sB')
 
     const bodyB = await callFsChanges(handlers, 'sB')
     const bTurn1 = bodyB.turns.find((turn) => turn.turn === 1 && turn.live !== true)
     assert.ok(bTurn1, 'B 轮 1 必须有配对条目')
-    const bPaths = bTurn1.changes.map((change) => change.path)
-    assert.ok(bPaths.includes('sub/b.txt'), 'B 自己的删除必须保留')
-    assert.ok(bPaths.includes('b-new.txt'), 'B 自己的新增必须保留')
-    // 注意：B 在自己开轮捕获「之前」删掉了 sub/b.txt——「sub 变空」这一树
-    // 事实在 B-t1 捕获时就已成形，归属落在窗口 0（A 一侧），因此从 B 的清单
-    // 剔除。这是窗口模型的固有近似（开轮前写盘归属前一个窗口），测试按此断言。
-    assert.ok(!bPaths.includes('sub'), 'sub 变空成形于 B 开轮捕获，归属窗口 0，应从 B 清单剔除')
-    assert.ok(!bPaths.includes('sub/c.txt'), 'A 窗口的写入必须从 B 的清单剔除')
-    assert.ok(!bPaths.includes('emptyA'), 'A 删除 emptyA 属于 A 的窗口，必须剔除')
+    const bByPath = Object.fromEntries(bTurn1.changes.map((change) => [change.path, change]))
+    assert.equal(bByPath['b-new.txt'].owner, 'target', 'B 自己的新增必须归属本会话')
+    assert.equal(bByPath['sub/b.txt'].owner, 'target', 'B 自己的删除归属本会话（发生在 B-t1 之后）')
+    assert.ok(!('sub' in bByPath), 'sub 变空成形于 B 开轮捕获，不在 B 的配对 diff 里')
+    assert.equal(bByPath['sub/c.txt'].owner, 'sA', 'A 窗口的写入归属 sA')
+    assert.equal(bByPath['sub/c.txt'].autoSelect, false)
+    assert.equal(bByPath['emptyA'].owner, 'sA', 'A 删除 emptyA 属于 A 的窗口，归属 sA')
 
     // 整树恢复收敛：回到 A 轮 1 轮起——B 的一切与 A 轮 1 的写入全部消失。
     const aT1 = (await engine.listTurnCheckpoints({ cwd: workspace, sessionId: 'sA' }))
@@ -355,8 +352,7 @@ async function fuzzRun(mode, seed) {
         id, { id, status: 'idle', session: { id, header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } },
       ]))
       const coordinator = new TurnCheckpointCoordinator(engine)
-      const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
-      const handlers = makeHandlers(liveSessions, engine, coordinator, writeGate)
+        const handlers = makeHandlers(liveSessions, engine, coordinator)
       const body = await callFsChanges(handlers, sessionId)
       assert.ok(Array.isArray(body.turns), 'fs-changes.turns 必须是数组')
     }
@@ -390,11 +386,10 @@ test('混沌：轮末检查点冻结轮末树——轮结束后的写盘不计�
   const { engine, storageDir } = await makeEngine()
   try {
     const coordinator = new TurnCheckpointCoordinator(engine)
-    const writeGate = new WorkspaceWriteGate({ canonicalDirectory, agents: { list: () => [] } })
     const liveSessions = new Map([
       ['s1', { id: 's1', status: 'idle', session: { id: 's1', header: { cwd: workspace }, inheritedEventCount: 0, snapshotEvents: () => [] } }],
     ])
-    const handlers = makeHandlers(liveSessions, engine, coordinator, writeGate)
+    const handlers = makeHandlers(liveSessions, engine, coordinator)
 
     // s1 轮 1：轮起 → 轮内写入 → 轮末捕获。
     await captureTurn(engine, workspace, 's1', 1)

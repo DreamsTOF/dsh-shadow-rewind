@@ -1,0 +1,288 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "恢复执行与撤销：计划 → rescue → 验证 → 单次 undo",
+    "locale": "zh-CN",
+    "output": "C:/code/dsh-shadow-rewind/docs/src/diagrams/restore-sequence.html",
+    "viewBox": [
+      860,
+      1120
+    ],
+    "quality_profile": "showcase"
+  },
+  "participants": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "用户",
+      "sublabel": "浏览器 UI"
+    },
+    {
+      "id": "http",
+      "type": "backend",
+      "label": "HTTP 端点",
+      "sublabel": "仅回环"
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "引擎",
+      "sublabel": "ShadowRewindEngine"
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "清单/日志",
+      "sublabel": "清单 · 操作日志"
+    },
+    {
+      "id": "disk",
+      "type": "external",
+      "label": "工作区磁盘",
+      "sublabel": "恢复目标"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 452,
+      "label": "预览与计划（限时）"
+    },
+    {
+      "from": 474,
+      "to": 808,
+      "label": "执行（五道安全闸）"
+    },
+    {
+      "from": 830,
+      "to": 1040,
+      "label": "撤销最近一次恢复"
+    }
+  ],
+  "messages": [
+    {
+      "from": "user",
+      "to": "http",
+      "y": 180,
+      "label": "GET 预览（messageSeq / turn）",
+      "variant": "emphasis"
+    },
+    {
+      "from": "http",
+      "to": "engine",
+      "y": 222,
+      "label": "inspect（快照 vs 当前树）"
+    },
+    {
+      "from": "engine",
+      "to": "store",
+      "y": 264,
+      "label": "读 manifest"
+    },
+    {
+      "from": "engine",
+      "to": "http",
+      "y": 306,
+      "label": "changes + treeHash",
+      "variant": "return"
+    },
+    {
+      "from": "http",
+      "to": "engine",
+      "y": 348,
+      "label": "planRestore"
+    },
+    {
+      "from": "engine",
+      "to": "http",
+      "y": 390,
+      "label": "planId + 确认串",
+      "variant": "return"
+    },
+    {
+      "from": "http",
+      "to": "user",
+      "y": 432,
+      "label": "逐文件 diff 预览 + 跳过项",
+      "variant": "return"
+    },
+    {
+      "from": "user",
+      "to": "http",
+      "y": 494,
+      "label": "POST planId + confirmation",
+      "variant": "emphasis"
+    },
+    {
+      "from": "http",
+      "to": "engine",
+      "y": 536,
+      "label": "applyRestore（计划复核 CAS）"
+    },
+    {
+      "from": "engine",
+      "to": "store",
+      "y": 578,
+      "label": "rescue 备份 + 操作日志 running",
+      "variant": "security"
+    },
+    {
+      "from": "engine",
+      "to": "disk",
+      "y": 620,
+      "label": "restorePaths：先删后写 · 原子替换",
+      "variant": "emphasis"
+    },
+    {
+      "from": "engine",
+      "to": "disk",
+      "y": 662,
+      "label": "verifyRestored：哈希/类型/权限",
+      "variant": "security"
+    },
+    {
+      "from": "engine",
+      "to": "store",
+      "y": 704,
+      "label": "日志 completed + undo 记录"
+    },
+    {
+      "from": "engine",
+      "to": "http",
+      "y": 746,
+      "label": "restoredPaths",
+      "variant": "return"
+    },
+    {
+      "from": "http",
+      "to": "user",
+      "y": 788,
+      "label": "恢复完成",
+      "variant": "return"
+    },
+    {
+      "from": "user",
+      "to": "http",
+      "y": 850,
+      "label": "POST restore-undo",
+      "variant": "dashed"
+    },
+    {
+      "from": "http",
+      "to": "engine",
+      "y": 892,
+      "label": "undoLastRestore（逐路径 CAS）",
+      "variant": "dashed"
+    },
+    {
+      "from": "engine",
+      "to": "disk",
+      "y": 934,
+      "label": "按 rescue 清单回写；被改路径跳过",
+      "variant": "dashed"
+    },
+    {
+      "from": "engine",
+      "to": "http",
+      "y": 976,
+      "label": "undonePaths / skippedPaths",
+      "variant": "return"
+    },
+    {
+      "from": "http",
+      "to": "user",
+      "y": 1018,
+      "label": "撤销结果",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "http",
+      "from": 174,
+      "to": 446,
+      "type": "backend"
+    },
+    {
+      "participant": "engine",
+      "from": 216,
+      "to": 404,
+      "type": "backend"
+    },
+    {
+      "participant": "store",
+      "from": 258,
+      "to": 278,
+      "type": "database"
+    },
+    {
+      "participant": "http",
+      "from": 488,
+      "to": 802,
+      "type": "backend"
+    },
+    {
+      "participant": "engine",
+      "from": 530,
+      "to": 760,
+      "type": "backend"
+    },
+    {
+      "participant": "store",
+      "from": 572,
+      "to": 718,
+      "type": "database"
+    },
+    {
+      "participant": "disk",
+      "from": 614,
+      "to": 676,
+      "type": "external"
+    },
+    {
+      "participant": "http",
+      "from": 844,
+      "to": 1032,
+      "type": "backend"
+    },
+    {
+      "participant": "engine",
+      "from": 886,
+      "to": 990,
+      "type": "backend"
+    },
+    {
+      "participant": "disk",
+      "from": 928,
+      "to": 948,
+      "type": "external"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "五道安全闸",
+      "items": [
+        "计划 15 分钟限时 + 确认串逐字回显",
+        "恢复前自动 rescue 备份（独立配额，不挤占手动恢复点）"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "失败即回滚",
+      "items": [
+        "主恢复失败 → 自动从 rescue 点还原全部涉及路径",
+        "回滚也失败 → recovery-required，留人工通道"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "单次撤销",
+      "items": [
+        "进程内只保留最近一次，重启失效（持久兜底是 rescue 点）",
+        "逐路径 CAS：被后续修改过的路径跳过并如实报告"
+      ]
+    }
+  ]
+}

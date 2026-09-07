@@ -39,9 +39,6 @@ export function fsAttributionOf(source: FsAttributionFields): FsAttributionField
   return {
     ...(source.owner !== undefined ? { owner: source.owner } : {}),
     ...(source.autoSelect !== undefined ? { autoSelect: source.autoSelect } : {}),
-    ...(source.attribution !== undefined ? { attribution: source.attribution } : {}),
-    ...(source.command !== undefined ? { command: source.command } : {}),
-    ...(source.writtenAt !== undefined ? { writtenAt: source.writtenAt } : {}),
   }
 }
 
@@ -102,22 +99,6 @@ export async function fetchCheckpointFileContent(
   }
 }
 
-/** 命令归因引用的宽松解析（形状非法返回 null）。 */
-function parseFsCommand(raw: unknown): FsChange['command'] | null {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
-  const record = raw as Record<string, unknown>
-  if (typeof record.tool !== 'string' || record.tool === '') return null
-  if (typeof record.sessionId !== 'string' || record.sessionId === '') return null
-  if (typeof record.startedAt !== 'number' || typeof record.endedAt !== 'number') return null
-  return {
-    tool: record.tool,
-    ...(typeof record.callId === 'string' && record.callId !== '' ? { callId: record.callId } : {}),
-    sessionId: record.sessionId,
-    startedAt: record.startedAt,
-    endedAt: record.endedAt,
-  }
-}
-
 /**
  * 从批量端点拉取所有轮次的文件系统变更。
  * 宽松解析：未知 / 缺失字段一律降级（条目丢了就丢了），绝不因一个坏字段
@@ -148,7 +129,6 @@ export async function fetchAllFsChanges(sessionId: string): Promise<FsChangesPay
           if (typeof c.path !== 'string' || c.path === '') return null
           const kind = c.kind === 'added' || c.kind === 'modified' || c.kind === 'deleted' ? c.kind : null
           if (kind === null) return null
-          const command = parseFsCommand(c.command)
           return {
             path: c.path,
             kind,
@@ -157,14 +137,9 @@ export async function fetchAllFsChanges(sessionId: string): Promise<FsChangesPay
             ...(typeof c.oldMode === 'number' ? { oldMode: c.oldMode } : {}),
             ...(typeof c.newMode === 'number' ? { newMode: c.newMode } : {}),
             ...(c.dir === true ? { dir: true } : {}),
-            // 归因字段宽松解析（旧宿主/开闸缺省；未知枚举丢字段）。
+            // 归属字段宽松解析（旧宿主缺省）。
             ...(typeof c.owner === 'string' && c.owner !== '' ? { owner: c.owner } : {}),
             ...(typeof c.autoSelect === 'boolean' ? { autoSelect: c.autoSelect } : {}),
-            ...(c.attribution === 'command' || c.attribution === 'ambiguous'
-              || c.attribution === 'external' || c.attribution === 'window'
-              || c.attribution === 'unknown' ? { attribution: c.attribution } : {}),
-            ...(command === null ? {} : { command }),
-            ...(typeof c.writtenAt === 'number' ? { writtenAt: c.writtenAt } : {}),
           }
         })
         .filter((change): change is FsChange => change !== null)
@@ -260,6 +235,15 @@ export function cachedFsTurnForSessionTurn(sessionId: string, turn: number): FsC
   return undefined
 }
 
+/** 某会话缓存的全部 fs 轮条目（按轮升序；live 条的会话累计视图用）。 */
+export function cachedFsTurnsForSession(sessionId: string): readonly FsChangeTurn[] {
+  const list: FsChangeTurn[] = []
+  for (const entry of fsCache.values()) {
+    if (entry.sessionId === sessionId) list.push(entry)
+  }
+  return list.sort((a, b) => a.turn - b.turn)
+}
+
 // ── 懒加载全文层：计数先行，全文按需 ─────────────────────────────────────
 // fs 条目先以「零全文」的占位形态渲染（行数来自服务端），全文（整文件
 // diff）只在真正需要展示/撤销时按条目拉取并记忆，直到该轮缓存条目变化。
@@ -332,11 +316,31 @@ async function generateFsDiff(
 }
 
 /**
+ * 一个 fs 条目是否属于「本会话自己的轮变更」：检查点窗口归属里，明确属于
+ * **其它会话**（owner = 对方 sessionId）的条目不进轮尾卡片与 live 条——
+ * 多会话并行写同一工作区时，B 的轮卡不该显示（更不该撤销）A 在同窗口的
+ * 写盘。'target'（本会话）/ 'multi'（双方都改过，含本会话的写入）/
+ * 'unknown'（轮间手动 / 外部写盘）/ 缺失（旧宿主、归因失败保守保留）照常
+ * 显示。侧边栏 tab 不经过这里：它是带归属标签的勾选清单，可见性交给用户。
+ */
+function isOwnSessionChange(change: FsChange): boolean {
+  const { owner } = change
+  return owner === undefined || owner === 'target' || owner === 'multi' || owner === 'unknown'
+}
+
+/**
  * 一个 fs 条目的占位形态：零全文、带服务端行数。卡片/侧边栏/live 条先用它
  * 渲染行与 +/−，内容在悬停、展开或撤销时经 ensureFsFileDiff 按需补齐。
  */
-export function fsTurnReviews(fsTurn: FsChangeTurn): readonly ProducedFileReview[] {
-  return fsTurn.changes.map((change) => ({
+export function fsTurnReviews(
+  fsTurn: FsChangeTurn,
+  /** 可选的条目级过滤（回滚遮蔽按轮近似剔除已恢复的写盘）。 */
+  keep?: (change: FsChange) => boolean,
+): readonly ProducedFileReview[] {
+  return fsTurn.changes
+    .filter(isOwnSessionChange)
+    .filter(change => keep?.(change) ?? true)
+    .map((change) => ({
     path: change.path,
     diffs: [],
     origin: 'fs',

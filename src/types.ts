@@ -11,9 +11,6 @@ export const FORMAT_VERSION = 1 as const
 /** 恢复点 id（形如 rp_<time>_<rand12>）。 */
 export type RestorePointId = string
 
-/** 恢复操作日志 id（形如 op_<time>_<rand12>）。 */
-export type RestoreOperationId = string
-
 /** 内存中的限时恢复计划 id（形如 plan_<time>_<rand12>）。 */
 export type RestorePlanId = string
 
@@ -75,8 +72,10 @@ export type RestorePointKind =
   | 'user'
   /** 恢复前自动创建的安全备份。 */
   | 'rescue'
-  /** 每轮对话开始前自动创建的隐藏检查点。 */
+  /** 回合检查点（轮起/轮末自动捕获）。 */
   | 'turn'
+  /** 消息检查点（写盘前 BEFORE 捕获的兜底恢复点，partial 部分树）。 */
+  | 'message'
 
 /** 一条意图记录：本轮内触发文件变更的内容型工具调用摘要（轮末检查点专用）。
  * 回答「这一轮是谁改的」——工具名 + 目标路径 + 对应 tool/call 事件 seq。
@@ -113,6 +112,14 @@ export interface Manifest {
   readonly intent?: readonly TurnIntent[]
   /** 旧式回合边界 seq（保留字段，当前不写入）。 */
   readonly turnEndSeq?: number
+  /** 消息检查点（kind 'message'）锚定的 user message seq。 */
+  readonly messageSeq?: number
+  /** 部分树标记：entries 只覆盖 BEFORE 捕获到的路径，磁盘上其余路径
+   * 一律「不在恢复范围」——计划绝不把它们当 added 删除。 */
+  readonly partial?: true
+  /** partial 树里记录了「捕获时不存在」的路径（BEFORE=null 的创建）：
+   * 计划把它们当成恢复删除的对象。 */
+  readonly createdPaths?: readonly string[]
   readonly createdAt: number
   /** 全部条目按 path 排序后的确定性哈希；读取时重算校验。 */
   readonly treeHash: string
@@ -152,6 +159,8 @@ export interface RestorePointSummary {
   readonly turn?: number
   readonly turnStartSeq?: number
   readonly phase?: 'start' | 'end'
+  /** 消息检查点锚定的 user message seq（kind 'message' 专用）。 */
+  readonly messageSeq?: number
   /** 本轮的内容型工具调用摘要（轮末检查点才有；旧数据/轮起缺省）。 */
   readonly intent?: readonly TurnIntent[]
   readonly createdAt: number
@@ -163,7 +172,9 @@ export interface RestorePointSummary {
   readonly lastRestoredAt?: number
 }
 
-/** 限时恢复计划：确认串必须逐字回显才会被执行。 */
+/** 限时恢复计划：执行前由 applyGuarded 核对计划与检查点同源。
+ * TTL 仍计算但只作软警告（EXPECTED-DESIGN 1.4 #1）：过期不阻断执行，
+ * 真正的防漂移闸是 apply 时的逐路径计划复核（assertPlanFresh）。 */
 export interface RestorePlan {
   readonly id: RestorePlanId
   readonly restorePointId: RestorePointId
@@ -171,7 +182,6 @@ export interface RestorePlan {
   readonly sessionId?: string
   readonly createdAt: number
   readonly expiresAt: number
-  readonly confirmation: string
   readonly changes: readonly WorkspaceChange[]
   /** 快照中显式跳过的路径（恢复不会碰它们，仅随计划透出展示）。 */
   readonly skippedPaths: readonly SkippedPath[]
@@ -179,57 +189,42 @@ export interface RestorePlan {
   readonly expected: Readonly<Record<string, SnapshotEntry | null>>
 }
 
-/** 一次恢复操作的持久化日志（崩溃恢复的依据）。 */
-export interface RestoreOperation {
-  readonly version: typeof FORMAT_VERSION
-  readonly id: RestoreOperationId
-  readonly workspace: string
-  readonly restorePointId: RestorePointId
-  readonly rescuePointId: RestorePointId
-  readonly sessionId?: string
-  readonly paths: readonly string[]
-  readonly startedAt: number
-  readonly finishedAt?: number
-  readonly state:
-    | 'running'
-    | 'rollback-running'
-    | 'completed'
-    | 'rolled-back'
-    | 'interrupted'
-    | 'recovery-required'
-  readonly error?: string
-  readonly rollbackError?: string
-}
+/** 恢复计划是否已超过 TTL（软警告：客户端据此提示，服务端不拒绝）。 */
+export type PlanFreshness = { readonly expired: boolean }
 
-/** 恢复成功的结果。 */
+/** 恢复成功的结果。
+ * EXPECTED-DESIGN 1.4：操作日志状态机已废除——失败即进程内自动回滚到状态 A
+ *（rescue 兜底），不再有持久化的 running/interrupted/recovery-required 中间态；
+ * 会话绑定不匹配等流程性检查降级为 `warnings` 软警告字段。 */
 export interface RestoreResult {
-  readonly operationId: RestoreOperationId
   readonly restorePointId: RestorePointId
   readonly rescuePointId: RestorePointId
   readonly restoredPaths: readonly string[]
+  /** 软警告（会话绑定不匹配等）：不阻断执行，如实呈现给用户。 */
+  readonly warnings?: readonly string[]
 }
 
-/** 恢复后单次撤销的结果（借鉴 dsh-checkpoint-diff 的 rollback-undo）。
- * 被后续修改过的路径跳过并如实报告；before=null（恢复新建的文件）的撤销
- * 是「绝不删除」的唯一例外——删除的是恢复操作自己刚创建的文件。 */
+/** 撤销探查结果（EXPECTED-DESIGN 1.2 两段式协议的第一段）：
+ * 逐路径 CAS 只读比对，不动磁盘。`conflicted` 是「恢复后又被修改过」的
+ * 路径清单，客户端据此弹三选项对话框（拒绝 / 全部回滚 / 只回滚正常部分）。 */
+export interface RestoreUndoProbe {
+  readonly restorePointId: RestorePointId
+  readonly rescuePointId: RestorePointId
+  readonly time: number
+  /** CAS 通过（当前磁盘仍等于恢复完成瞬间状态）的路径。 */
+  readonly clean: readonly string[]
+  /** CAS 失配的路径与原因；force 回滚可覆盖这些路径（用户显式授权）。 */
+  readonly conflicted: readonly { readonly path: string; readonly reason: string }[]
+}
+
+/** 恢复后撤销的结果（借鉴 dsh-checkpoint-diff 的 rollback-undo）。
+ * 被后续修改过的路径跳过并如实报告；force 回滚（用户授权）可覆盖——
+ * before=null 的路径（恢复新建的文件）强制撤销 = 删除，即使被改过。 */
 export interface RestoreUndoResult {
-  readonly operationId: RestoreOperationId
   readonly restorePointId: RestorePointId
   readonly rescuePointId: RestorePointId
   readonly undonePaths: readonly string[]
   readonly skippedPaths: readonly { readonly path: string; readonly reason: string }[]
-}
-
-/** 中断操作的恢复摘要。 */
-export interface RecoverySummary {
-  readonly operationId: RestoreOperationId
-  readonly restorePointId: RestorePointId
-  readonly rescuePointId: RestorePointId
-  readonly state: 'interrupted' | 'recovery-required'
-  readonly paths: readonly string[]
-  readonly startedAt: number
-  readonly error?: string
-  readonly rollbackError?: string
 }
 
 /** 插件公开配置（全部可选，缺省走 DEFAULTS）。 */
@@ -246,10 +241,8 @@ export interface ShadowRewindConfig {
   readonly maxFileBytes?: number
   /** 单个恢复点的文件总字节上限。 */
   readonly maxSnapshotBytes?: number
-  /** 恢复计划有效期（毫秒）。 */
+  /** 恢复计划有效期（毫秒）；过期只作软警告，不再阻断执行（EXPECTED-DESIGN 1.4 #1）。 */
   readonly planTtlMs?: number
-  /** 锁主人消失多久后允许回收其锁（毫秒）。 */
-  readonly staleLockMs?: number
   /**
    * 自动 turn 检查点实现：
    *  - `jj`（默认）：写入隐藏影子 jj 仓库；宿主机缺 jj CLI 时自动降级 sqlite；
@@ -268,25 +261,6 @@ export interface ShadowRewindConfig {
    * 字面路径（如 `node_modules`）视为「任意层级下的同名目录及其内容」。
    */
   readonly excludePatterns?: readonly string[]
-  /**
-   * 写入闸（「以当前为准」，默认开启）：同一工作区任一时刻只允许最近一个
-   * 开始回合的会话写入；其它会话的可变工具（含终端与 run_code）被拒绝，
-   * 只读工具照常。开启后恢复的占用闸放宽为「仅请求者自身与当前所有者
-   * 运行中才阻塞」。关闭时恢复保持旧行为（任何运行中的会话都阻塞）。
-   */
-  readonly writeGate?: boolean
-  /** 写入闸在只读白名单之外额外放行的工具名（白名单语义见 README）。 */
-  readonly writeGateAllow?: readonly string[]
-  /** 命令窗口落盘防抖（毫秒）。缺省 400。 */
-  readonly commandWindowFlushMs?: number
-  /** 命令窗口保留期（毫秒），超出即修剪。缺省 6 小时；超长回溯（如数月）
-   * 可自行调大——窗口仅是时间戳加少量文本，磁盘占用极小。 */
-  readonly commandWindowRetentionMs?: number
-  /** 每工作区保留的命令窗口条数上限（修剪保留最新）。缺省 2000。 */
-  readonly commandWindowMaxPerWorkspace?: number
-  /** 每条窗口记录的工具参数序列化字节上限（如终端命令文本）；0 = 不
-   * 记录内容。缺省 2048。内容仅供回溯展示，归因正确性不依赖它。 */
-  readonly commandWindowDetailBytes?: number
 }
 
 /** 解析完成（全部字段有值）的配置。 */
@@ -298,14 +272,9 @@ export interface ResolvedShadowRewindConfig {
   readonly maxFileBytes: number
   readonly maxSnapshotBytes: number
   readonly planTtlMs: number
-  readonly staleLockMs: number
   readonly turnCheckpointMode: 'off' | 'sqlite' | 'jj'
   readonly turnCheckpointTimeoutMs: number
   readonly turnCheckpointMaxNewBytes: number
   readonly turnCheckpointTrust: 'fast' | 'strict'
   readonly excludePatterns: readonly string[]
-  readonly commandWindowFlushMs: number
-  readonly commandWindowRetentionMs: number
-  readonly commandWindowMaxPerWorkspace: number
-  readonly commandWindowDetailBytes: number
 }

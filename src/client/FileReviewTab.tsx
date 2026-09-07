@@ -4,782 +4,51 @@
  * file-review Typert remote 提供按轮 / 按文件的撤销 + 重新应用。全部推导都
  * 挂在客户端 runtime 的已定稿会话快照上——什么都不会注入聊天流（那正是本
  * 移植要消除的样式冲突源）。
+ *
+ * 物理布局（拆分后本文件只持有主组件；子件与形状单向依赖）：
+ *  - ./file-review-tab-types.ts  共享类型 + 纯工具（stateKey/addStats…）；
+ *  - ./review-widgets.tsx        Stats / 图标 / StateBadge / LazyDiff；
+ *  - ./turn-rewind-dialog.tsx    「从快照恢复此轮」对话框（独立状态机）；
+ *  - ./review-dialogs.tsx        多会话确认弹窗 + 文件级时间线对话框。
  */
 
 import {
   useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore,
 } from 'react'
-import type { ReactNode } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { ChatSnapshot } from '@deepseek-ai/dsh-client-ui-chat/client'
-import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type {
   FileReviewAction, FileReviewFileState, FileReviewRequest, FileReviewResult,
-  RecordedMutation, RecordedRequest, RecordedResult,
+  RecordedMutation,
 } from '../file-review/change-types.ts'
 import {
   basename, deriveSessionChanges, deriveSessionRoots, mergeRecordedTurns,
-  resolveSessionPath, type FsAttributionFields, type SessionFileChange, type TurnFileChanges,
+  resolveSessionPath, pathKey, type SessionFileChange, type TurnFileChanges,
 } from './session-changes.ts'
-import { ensureFsFileDiff, fetchAllFsChanges, fsAttributionOf, type FsChangeTurn } from './fs-diff-utils.ts'
+import { ensureFsFileDiff, fetchAllFsChanges, fsAttributionOf, subscribeFsCache, type FsChangeTurn } from './fs-diff-utils.ts'
+import { dedupeStatus } from './status-dedupe.ts'
+import { invokeFileReview, invokeFileReviewRecorded } from './remote-access.ts'
+import { markRewound, snapshotBarrierOf } from './rewound-changes.ts'
+import { setReviewRows, subscribeReviewRows } from './review-state.ts'
 import { summarizeDiffs, UnifiedDiff, type UnifiedDiffStats } from './UnifiedDiff.tsx'
-import { fetchSubsetPlan, pathsTooLong } from './subset-plan.ts'
 import { t } from './locales.ts'
 import css from './FileReviewTab.module.css'
+import {
+  stateKey, fsOwnerBadge, isReversible, addStats,
+  SUCCESS_NOTICE_DURATION, ERROR_NOTICE_DURATION,
+} from './file-review-tab-types.ts'
+import type {
+  FileReviewTabProps, FileReviewRemote, Notice, FlatChange, PendingScroll,
+  FileTurnEntry, PathWindowStats,
+} from './file-review-tab-types.ts'
+import { Stats, UndoIcon, RedoIcon, Chevron, StateBadge, LazyDiff } from './review-widgets.tsx'
+import { TurnRewindDialog } from './turn-rewind-dialog.tsx'
+import { MultiSessionConfirmDialog, FileTimelineDialog } from './review-dialogs.tsx'
 
-const SUCCESS_NOTICE_DURATION = 3000
-const ERROR_NOTICE_DURATION = 8000
-
-/** Tab 组件入参（better-sidebar 的 TabComponentProps 的收窄版）。 */
-export interface FileReviewTabProps {
-  readonly ctx: Context
-  readonly sessionId: string
-  readonly cwd: string | undefined
-  /** 活跃 tab + 面板已打开；为 false 时暂停实时状态巡检。 */
-  readonly visible: boolean
-  /**
-   * 侧边栏 tab 句柄。`meta.expandPaths`（string[]）就是聊天轮尾行经
-   * updateTab / openTab 写入的深链：一份**新的** meta 引用会被重放成「展开
-   * 这些文件的 diff 并滚到第一个」。
-   */
-  readonly tab: { readonly meta?: unknown }
-}
-
-/** 本 tab 用到的 fileReview 远端方法面。 */
-interface FileReviewRemote {
-  status(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>
-  apply(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>
-  recorded(request: RecordedRequest): Promise<RemoteResult<RecordedResult>>
-}
-
-/** 页内通知气泡（成功/失败短暂停留后自动消失）。 */
-interface Notice {
-  readonly seq: number
-  readonly tone: 'success' | 'error'
-  readonly text: string
-}
-
-/** 摊平后的 (轮, 文件) 变更单元，用于状态巡检与开关请求。 */
-interface FlatChange extends FsAttributionFields {
-  readonly turn: number
-  readonly path: string
-  readonly diffs: SessionFileChange['diffs']
-  /** 终端删除的路径仍列出，但绝不送到宿主巡检器。 */
-  readonly deleted?: true
-  /** 条目来源：'fs' = 检查点对比派生（终端写盘）；缺省 = 工具结果视图。 */
-  readonly origin?: 'fs'
-  /** 空目录条目：提交时转成 dirKind，宿主走 mkdir/rmdir 语义。 */
-  readonly dir?: true
-  /** 服务端预算的行数（fs 条目懒加载全文前的显示用）。 */
-  readonly counts?: { readonly added: number; readonly removed: number }
-}
-
-/** 一个 (轮, 文件) 变更组的状态映射键。 */
-function stateKey(turn: number, path: string): string {
-  return `${turn}|${path}`
-}
-
-/** ms epoch → HH:MM（归因徽标的写入时间展示）。 */
-function formatClock(ms: number): string {
-  const date = new Date(ms)
-  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
-}
-
-/** fs 条目的归因徽标文案：开闸/旧宿主无归因（owner 缺省）→ 无徽标。
- * 命令级展示「命令 · 写入时间」；他会话展示会话标题；歧义/外部如实标注。 */
-function fsOwnerBadge(file: SessionFileChange, sessionTitle: (id: string) => string | undefined): string | null {
-  if (file.owner === undefined) return null
-  if (file.attribution === 'command' && file.command !== undefined) {
-    return `${file.command.tool} · ${formatClock(file.writtenAt ?? file.command.startedAt)}`
-  }
-  if (file.owner === 'multi') return t('ownerMulti')
-  if (file.owner === 'unknown') return t('ownerUnknown')
-  if (file.owner !== 'target') {
-    const title = sessionTitle(file.owner)
-    return title ?? t('ownerSession', {
-      id: file.owner.length > 12 ? `${file.owner.slice(0, 12)}…` : file.owner,
-    })
-  }
-  if (file.attribution === 'ambiguous') return t('attrAmbiguous')
-  if (file.attribution === 'external') return t('attrExternal')
-  return null
-}
-
-/** 深链的滚动目标：整轮链接滚到轮组，否则滚到文件行。 */
-interface PendingScroll {
-  /** 文件行的 stateKey：既是精确目标，也是所在节的回退目标。 */
-  readonly rowKey: string
-  /** 多文件链接时，其轮组的轮号——该轮组顶到视口顶部。 */
-  readonly turn: number | null
-}
-
-/** 一个文件在本会话某轮的改动记录（文件级时间线节点；按轮升序累积）。 */
-interface FileTurnEntry {
-  readonly turn: number
-  readonly live: boolean
-  readonly deleted?: true
-  readonly diffs: SessionFileChange['diffs']
-  /** 服务端预算的行数（fs 条目懒加载全文前的显示用）。 */
-  readonly counts?: { readonly added: number; readonly removed: number }
-}
-
-/** 恢复窗口内一个路径的累计统计与最近改动轮次（恢复对话框 +/− 跳转用）。 */
-interface PathWindowStats {
-  readonly stats: UnifiedDiffStats
-  readonly latestTurn: number
-}
-
-/** 一组变更只有在 hunks 完整可逆时才判定为可撤销。 */
-function isReversible(file: SessionFileChange): boolean {
-  // 整文件 fs 变更形状（检查点对比）：单条 diff，要么是新增（无旧侧），要么
-  // 是删除（新侧为空）。宿主按文件存在性翻转它们，不靠 hunk 回放。
-  if (file.diffs.length === 1) {
-    const only = file.diffs[0]
-    if (only !== undefined && only.path === file.path) {
-      if (only.oldText === null) return true
-      if (only.newText === '' && only.oldText !== '') return true
-    }
-  }
-  return file.diffs.length > 0 && file.diffs.every(diff =>
-    diff.path === file.path
-    && diff.oldText !== null
-    && diff.oldText !== diff.newText
-    && (diff.oldText !== '' || diff.oldStart !== undefined)
-    && (diff.newText !== '' || diff.newStart !== undefined))
-}
-
-function addStats(left: UnifiedDiffStats, right: UnifiedDiffStats): UnifiedDiffStats {
-  return { added: left.added + right.added, removed: left.removed + right.removed }
-}
-
-function Stats({ stats }: { readonly stats: UnifiedDiffStats }) {
-  return (
-    <span className={css.stats} aria-label={t('stats', {
-      added: String(stats.added), removed: String(stats.removed),
-    })}>
-      <span className={css.added}>+{stats.added}</span>
-      <span className={css.removed}>-{stats.removed}</span>
-    </span>
-  )
-}
-
-function UndoIcon() {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true" className={css.buttonIcon}>
-      <path d="M8 5 4 9l4 4M4 9h7a5 5 0 0 1 5 5v1" />
-    </svg>
-  )
-}
-
-function RedoIcon() {
-  return (
-    <svg viewBox="0 0 20 20" aria-hidden="true" className={css.buttonIcon}>
-      <path d="m12 5 4 4-4 4M16 9H9a5 5 0 0 0-5 5v1" />
-    </svg>
-  )
-}
-
-function Chevron({ open }: { readonly open: boolean }) {
-  return (
-    <svg
-      viewBox="0 0 20 20"
-      aria-hidden="true"
-      className={`${css.chevron} ${open ? css.chevronOpen : ''}`}
-    >
-      <path d="m7 5 5 5-5 5" />
-    </svg>
-  )
-}
-
-/** 每个 (轮, 文件) 的宿主巡检状态徽标；'applied' 时不渲染任何东西。 */
-function StateBadge({ state }: { readonly state: FileReviewFileState | undefined }) {
-  if (state === undefined || state === 'applied') return null
-  const label = state === 'undone'
-    ? t('stateUndone')
-    : state === 'conflict'
-      ? t('stateConflict')
-      : state === 'unsupported'
-        ? t('stateUnsupported')
-        : t('stateError')
-  const tone = state === 'undone'
-    ? css.badgeUndone
-    : state === 'unsupported'
-      ? css.badgeMuted
-      : css.badgeError
-  return <span className={`${css.stateBadge} ${tone}`}>{label}</span>
-}
-
-/** 懒渲染：只有行接近视口时才挂载重的 diff 渲染器（200px 预读余量）。 */
-function LazyDiff({ children }: { children: ReactNode }) {
-  const holderRef = useRef<HTMLDivElement | null>(null)
-  const [inView, setInView] = useState(false)
-  useEffect(() => {
-    if (inView) return
-    const element = holderRef.current
-    if (element === null) return
-    if (typeof IntersectionObserver === 'undefined') { setInView(true); return }
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some(entry => entry.isIntersecting)) {
-        setInView(true)
-        observer.disconnect()
-      }
-    }, { rootMargin: '200px 0px' })
-    observer.observe(element)
-    return () => { observer.disconnect() }
-  }, [inView])
-  return <div ref={holderRef}>{inView ? children : <div style={{ minHeight: '96px' }} />}</div>
-}
-
-// ── 每轮「从快照恢复此轮」对话框（走本插件宿主的 /shadow-rewind?turn= 分支）──
-
-interface TurnRewindDialogProps {
-  readonly sessionId: string
-  readonly turn: number
-  /** 恢复窗口（该轮起）内本会话对每个路径的累计 +/-；其它会话写入的路径没有
-   * 客户端 diff 数据，因此没有条目（对话框里这些行不显示统计）。 */
-  readonly windowStats: ReadonlyMap<string, PathWindowStats>
-  /** 点击某路径的 +/-：跳到该文件最近一轮的差异（父级负责关闭对话框）。 */
-  readonly onJumpToDiff: (turn: number, path: string) => void
-  /** 其它会话 id → displayTitle（会话列表快照查不到时回落截断 id）。 */
-  readonly sessionTitle: (id: string) => string | undefined
-  readonly onClose: () => void
-  /** 恢复成功后回调（刷新 tab 的状态巡检）。 */
-  readonly onRestored: () => void
-}
-
-/** `/shadow-rewind?turn=` 预览的浏览器侧形态（宽松解析）。 */
-interface TurnRewindPreview {
-  readonly status: 'ready' | 'pending' | 'skipped' | 'failed' | 'missing'
-  readonly checkpointId?: string
-  readonly planId?: string
-  readonly confirmation?: string
-  /** 恢复语义模式：current-wins=以当前为准（整树），symmetric=对称（勾选式子集）。 */
-  readonly mode?: 'current-wins' | 'symmetric'
-  readonly totalChanges: number
-  readonly changes: readonly {
-    readonly path: string
-    readonly kind: string
-    /** 对称模式归属：'target' | 'multi' | 'unknown' | 其它会话 id。 */
-    readonly owner?: string
-    /** 对称模式默认勾选（只属于目标会话的路径）。 */
-    readonly autoSelect?: boolean
-  }[]
-  readonly activeSessionIds: readonly string[]
-  /** 写入闸开启时的分诊：真正阻塞恢复的会话（请求者自身 / 当前所有者）。 */
-  readonly restoreBlocked?: boolean
-  readonly gatedSessionIds?: readonly string[]
-  readonly skippedPaths: readonly { readonly path: string; readonly reason: string }[]
-  readonly reason?: string
-  readonly error?: string
-  /** 分页（对称模式拉全清单时使用）。 */
-  readonly truncated?: boolean
-  readonly offset?: number
-  /** 下一轮检查点 ID（本轮的变更 = 本轮轮起检查点与该检查点对比）。 */
-  readonly nextCheckpointId?: string
-  /** 文件系统级别的变更（PowerShell 等终端命令创建/修改/删除的文件）。 */
-  readonly fileSystemChanges?: readonly { readonly path: string; readonly kind: 'added' | 'modified' | 'deleted' }[]
-}
-
-function decodeTurnPreview(value: unknown): TurnRewindPreview {
-  const record = typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
-  const status = record.status === 'ready' || record.status === 'pending'
-    || record.status === 'skipped' || record.status === 'failed' || record.status === 'missing'
-    ? record.status
-    : 'missing'
-  const changes = Array.isArray(record.changes)
-    ? record.changes.map((entry) => {
-      const item = typeof entry === 'object' && entry !== null && !Array.isArray(entry)
-        ? entry as Record<string, unknown>
-        : {}
-      return {
-        path: typeof item.path === 'string' ? item.path : '',
-        kind: typeof item.kind === 'string' ? item.kind : 'modified',
-        ...(typeof item.owner === 'string' ? { owner: item.owner } : {}),
-        ...(item.autoSelect === true ? { autoSelect: true as const } : {}),
-      }
-    }).filter(change => change.path !== '')
-    : []
-  return {
-    status,
-    ...(typeof record.checkpointId === 'string' ? { checkpointId: record.checkpointId } : {}),
-    ...(typeof record.planId === 'string' ? { planId: record.planId } : {}),
-    ...(typeof record.confirmation === 'string' ? { confirmation: record.confirmation } : {}),
-    ...(record.mode === 'symmetric' || record.mode === 'current-wins' ? { mode: record.mode } : {}),
-    ...(typeof record.reason === 'string' ? { reason: record.reason } : {}),
-    ...(typeof record.error === 'string' ? { error: record.error } : {}),
-    ...(typeof record.restoreBlocked === 'boolean' ? { restoreBlocked: record.restoreBlocked } : {}),
-    ...(Array.isArray(record.gatedSessionIds)
-      ? { gatedSessionIds: record.gatedSessionIds.filter((id): id is string => typeof id === 'string') }
-      : {}),
-    totalChanges: typeof record.totalChanges === 'number' ? record.totalChanges : changes.length,
-    changes,
-    truncated: record.truncated === true,
-    ...(typeof record.offset === 'number' ? { offset: record.offset } : {}),
-    activeSessionIds: Array.isArray(record.activeSessionIds)
-      ? record.activeSessionIds.filter((id): id is string => typeof id === 'string')
-      : [],
-    skippedPaths: Array.isArray(record.skippedPaths)
-      ? record.skippedPaths.map((entry) => {
-        const item = typeof entry === 'object' && entry !== null && !Array.isArray(entry)
-          ? entry as Record<string, unknown>
-          : {}
-        return {
-          path: typeof item.path === 'string' ? item.path : '',
-          reason: typeof item.reason === 'string' ? item.reason : '',
-        }
-      }).filter(skip => skip.path !== '')
-      : [],
-    // 新增：文件系统差异（PowerShell 等终端命令创建的文件）
-    ...(typeof record.nextCheckpointId === 'string' ? { nextCheckpointId: record.nextCheckpointId } : {}),
-    ...(Array.isArray(record.fileSystemChanges)
-      ? {
-          fileSystemChanges: record.fileSystemChanges
-            .map((entry): { readonly path: string; readonly kind: 'added' | 'modified' | 'deleted' } => {
-              const item = typeof entry === 'object' && entry !== null && !Array.isArray(entry)
-                ? entry as Record<string, unknown>
-                : {}
-              const path = typeof item.path === 'string' ? item.path : ''
-              const rawKind = typeof item.kind === 'string' ? item.kind : 'modified'
-              const kind = (rawKind === 'added' || rawKind === 'modified' || rawKind === 'deleted')
-                ? rawKind
-                : 'modified'
-              return { path, kind }
-            })
-            .filter(change => change.path !== ''),
-        }
-      : {}),
-  }
-}
-
-/** 快照跳过原因的用户文案。 */
-function skipReasonLabel(reason: string): string {
-  if (reason === 'too-large') return t('skipTooLarge')
-  if (reason === 'unsupported-type') return t('skipUnsupportedType')
-  if (reason === 'read-failed') return t('skipReadFailed')
-  return reason
-}
-
-/** 快照差异类别的用户文案（与回退对话框的 kindLabel 语义一致）。 */
-function snapshotKindLabel(kind: string): string {
-  switch (kind) {
-    case 'added': return t('kindAdded')
-    case 'deleted': return t('kindDeleted')
-    case 'modified': return t('kindModified')
-    case 'mode-changed': return t('kindModeChanged')
-    case 'type-changed': return t('kindTypeChanged')
-    default: return kind
-  }
-}
-
-function TurnRewindDialog({ sessionId, turn, windowStats, onJumpToDiff, sessionTitle, onClose, onRestored }: TurnRewindDialogProps) {
-  const [loading, setLoading] = useState(true)
-  const [preview, setPreview] = useState<TurnRewindPreview | null>(null)
-  const [applying, setApplying] = useState(false)
-  const [stale, setStale] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [done, setDone] = useState(false)
-  // 对称模式的勾选集（null = 非对称模式，整树恢复）。
-  const [selected, setSelected] = useState<ReadonlySet<string> | null>(null)
-
-  const load = useCallback(async (silent = false) => {
-    if (!silent) {
-      setLoading(true)
-      setStale(false)
-      setError(null)
-      setDone(false)
-    }
-    try {
-      const response = await fetch(`/shadow-rewind?sessionId=${encodeURIComponent(sessionId)}&turn=${String(turn)}`, {
-        headers: { accept: 'application/json' }, cache: 'no-store',
-      })
-      const value: unknown = await response.json()
-      if (!response.ok) {
-        const record = typeof value === 'object' && value !== null && !Array.isArray(value)
-          ? value as Record<string, unknown> : {}
-        if (record.code === 'RESTORE_POINT_NOT_FOUND') {
-          setPreview(null)
-          setError(t('snapshotMissing'))
-          return
-        }
-        throw new Error(typeof record.error === 'string' ? record.error : `HTTP ${String(response.status)}`)
-      }
-      const first = decodeTurnPreview(value)
-      // 对称模式：勾选清单必须覆盖全部变更——自动按页拉全（带归属标签），
-      // 然后以「只属于目标会话」的路径为默认勾选。
-      if (first.status === 'ready' && first.mode === 'symmetric' && first.truncated) {
-        const collected = [...first.changes]
-        let offset = collected.length
-        while (first.totalChanges > offset) {
-          const pageResponse = await fetch(`/shadow-rewind?sessionId=${encodeURIComponent(sessionId)}&turn=${String(turn)}&details=1&offset=${String(offset)}&limit=200`, {
-            headers: { accept: 'application/json' }, cache: 'no-store',
-          })
-          const pageValue: unknown = await pageResponse.json()
-          if (!pageResponse.ok) {
-            const pageRecord = typeof pageValue === 'object' && pageValue !== null && !Array.isArray(pageValue)
-              ? pageValue as Record<string, unknown> : {}
-            throw new Error(typeof pageRecord.error === 'string' ? pageRecord.error : `HTTP ${String(pageResponse.status)}`)
-          }
-          const page = decodeTurnPreview(pageValue)
-          if (page.status !== 'ready' || page.checkpointId !== first.checkpointId || page.offset !== offset) {
-            throw new Error(t('snapshotStale'))
-          }
-          collected.push(...page.changes)
-          offset += page.changes.length
-          if (page.changes.length === 0) break
-        }
-        const merged: TurnRewindPreview = { ...first, changes: collected, truncated: false }
-        setPreview(merged)
-        setSelected(new Set(merged.changes.filter(change => change.autoSelect === true).map(change => change.path)))
-        return
-      }
-      setPreview(first)
-      setSelected(first.status === 'ready' && first.mode === 'symmetric'
-        ? new Set(first.changes.filter(change => change.autoSelect === true).map(change => change.path))
-        : null)
-    } catch (caught) {
-      // 静默重查失败不动已有预览（占用未解除是常态，不算错误）。
-      if (!silent) setError(`${t('snapshotFailed')}: ${caught instanceof Error ? caught.message : String(caught)}`)
-    } finally {
-      if (!silent) setLoading(false)
-    }
-  }, [sessionId, turn])
-
-  useEffect(() => { void load() }, [load])
-
-  const ready = preview !== null && preview.status === 'ready' ? preview : null
-  // 阻塞判定：优先用服务端的写入闸分诊（restoreBlocked），旧协议回退到
-  // activeSessionIds 计数。
-  const blocked = ready !== null
-    && (ready.restoreBlocked ?? ready.activeSessionIds.length > 0)
-
-  // 占用自动重查：blocked 期间每 3s 静默重取预览，占用解除的瞬间按钮就地
-  // 变活——否则 blocked 时的预览不带 planId/confirmation，恢复按钮会一直
-  // 死在禁用态，只能靠用户手点「重新检查」。
-  useEffect(() => {
-    if (!blocked || done || applying) return
-    const timer = window.setInterval(() => { void load(true) }, 3000)
-    return () => { window.clearInterval(timer) }
-  }, [blocked, done, applying, load])
-  const gatedRunning = ready?.gatedSessionIds?.length ?? 0
-  const symmetric = ready?.mode === 'symmetric'
-  const selectedCount = selected?.size ?? 0
-  const allSelected = symmetric && ready !== null && selected !== null
-    && selected.size >= ready.changes.length && ready.changes.length > 0
-
-  const togglePath = useCallback((path: string) => {
-    setSelected((current) => {
-      if (current === null) return current
-      const next = new Set(current)
-      if (next.has(path)) next.delete(path)
-      else next.add(path)
-      return next
-    })
-  }, [])
-
-  const setAllPaths = useCallback((selectAll: boolean) => {
-    setSelected((current) => {
-      if (current === null) return current
-      if (!selectAll) return new Set<string>()
-      const readyNow = preview !== null && preview.status === 'ready' ? preview : null
-      return readyNow === null ? current : new Set(readyNow.changes.map(change => change.path))
-    })
-  }, [preview])
-
-  const canApply = ready !== null && !loading && !applying && !done && !stale && !blocked
-    && ready.totalChanges > 0
-    && (!symmetric || selectedCount > 0)
-    && ready.checkpointId !== undefined && ready.planId !== undefined && ready.confirmation !== undefined
-
-  const apply = useCallback(async () => {
-    if (ready === null || !canApply) return
-    if (ready.checkpointId === undefined || ready.planId === undefined || ready.confirmation === undefined) return
-    setApplying(true)
-    setError(null)
-    try {
-      let planId = ready.planId
-      let confirmation = ready.confirmation
-      // 对称模式且未全选：先铸造只覆盖勾选路径的子集计划（全套安全闸
-      // 原样保留——确认串、TTL、逐路径 CAS 都随新计划走）。
-      if (selected !== null && selected.size < ready.totalChanges) {
-        const paths = ready.changes.filter(change => selected.has(change.path)).map(change => change.path)
-        if (paths.length === 0) return
-        if (pathsTooLong(paths)) throw new Error(t('pathsTooLong'))
-        const subset = await fetchSubsetPlan(`sessionId=${encodeURIComponent(sessionId)}&turn=${String(turn)}`, paths)
-        planId = subset.planId
-        confirmation = subset.confirmation
-      }
-      const response = await fetch('/shadow-rewind', {
-        method: 'POST',
-        headers: { accept: 'application/json', 'content-type': 'application/json' },
-        body: JSON.stringify({
-          mode: 'code',
-          sessionId,
-          turn,
-          checkpointId: ready.checkpointId,
-          planId,
-          confirmation,
-        }),
-      })
-      const value: unknown = await response.json()
-      if (!response.ok) {
-        const record = typeof value === 'object' && value !== null && !Array.isArray(value)
-          ? value as Record<string, unknown> : {}
-        if (record.code === 'PLAN_STALE' || record.code === 'WORKSPACE_IN_USE') setStale(true)
-        throw new Error(typeof record.error === 'string' ? record.error : `HTTP ${String(response.status)}`)
-      }
-      setDone(true)
-      onRestored()
-    } catch (caught) {
-      setError(`${t('snapshotFailed')}: ${caught instanceof Error ? caught.message : String(caught)}`)
-    } finally {
-      setApplying(false)
-    }
-  }, [ready, canApply, selected, sessionId, turn, onRestored])
-
-  // srw-* 对话框样式由本插件的会话回退面（rewind.ts）全局注入，直接复用，
-  // 保证两个恢复入口的视觉与交互一致。
-  return (
-    <div className="srw-overlay" role="dialog" aria-modal="true">
-      <div className="srw-dialog">
-        <div className="srw-dialog-head">
-          <strong>{t('snapshotDialogTitle')}</strong>
-          <button type="button" className="srw-trigger" onClick={onClose} aria-label={t('close')}>✕</button>
-        </div>
-        <div className="srw-content">
-          <div className="srw-body">
-            {loading && <p className="srw-status">{t('snapshotLoading')}</p>}
-            {(preview?.status === 'pending') && <p className="srw-status">{t('snapshotLoading')}</p>}
-            {(preview?.status === 'missing' || preview?.status === 'skipped') && (
-              <p className="srw-error">{t('snapshotMissing')}</p>
-            )}
-            {preview?.status === 'failed' && (
-              <p className="srw-error">{t('snapshotFailed')}: {preview.error ?? preview.reason ?? ''}</p>
-            )}
-            {ready !== null && [
-              <p className="srw-warning" key="warn">{t('snapshotDialogWarn', { n: turn })}</p>,
-              <div className="srw-summary" key="summary">
-                <strong>
-                  {symmetric
-                    ? t('snapshotTotalSelected', { count: selectedCount, total: ready.totalChanges })
-                    : t('snapshotTotal', { count: ready.totalChanges })}
-                </strong>
-              </div>,
-              symmetric && <p className="srw-status" key="hint">{t('modeSymmetricHint')}</p>,
-              blocked && <p className="srw-error" key="blocked">{t('snapshotBlocked')}</p>,
-              gatedRunning > 0 && <p className="srw-warning" key="gated">{t('snapshotGatedRunning', { n: gatedRunning })}</p>,
-              ready.skippedPaths.length > 0 && (
-                <div className="srw-skipped" key="skipped">
-                  <div>{t('snapshotSkipped')}</div>
-                  {ready.skippedPaths.map(skip => (
-                    <div key={skip.path}>
-                      <code>{skip.path}</code>（{skipReasonLabel(skip.reason)}）
-                    </div>
-                  ))}
-                </div>
-              ),
-              stale && <p className="srw-error" key="stale">{t('snapshotStale')}</p>,
-              ready.totalChanges === 0 && <p className="srw-status" key="nochanges">{t('snapshotNoChanges')}</p>,
-              ready.changes.length > 0 && (
-                <div className="srw-files" key="files">
-                  {symmetric && (
-                    <label className="srw-select-all" key="selectall">
-                      <input
-                        type="checkbox"
-                        checked={allSelected}
-                        onChange={(event) => { setAllPaths(event.target.checked) }}
-                      />
-                      {t('selectAll')}
-                    </label>
-                  )}
-                  {ready.changes.map(change => {
-                    const badge = change.owner === undefined || change.owner === 'target'
-                      ? null
-                      : change.owner === 'multi'
-                        ? t('ownerMulti')
-                        : change.owner === 'unknown'
-                          ? t('ownerUnknown')
-                          : sessionTitle(change.owner)
-                            ?? t('ownerSession', { id: change.owner.length > 12 ? `${change.owner.slice(0, 12)}…` : change.owner })
-                    const windowEntry = windowStats.get(change.path)
-                    return (
-                      <div className="srw-file" key={change.path}>
-                        {symmetric && (
-                          <input
-                            type="checkbox"
-                            checked={selected?.has(change.path) ?? false}
-                            onChange={() => { togglePath(change.path) }}
-                          />
-                        )}
-                        <code>{change.path}</code>
-                        {badge !== null && <span className="srw-kind">{badge}</span>}
-                        <span className="srw-kind">{snapshotKindLabel(change.kind)}</span>
-                        {windowEntry !== undefined && (
-                          <button
-                            type="button"
-                            className={css.statsButton}
-                            title={t('viewDiff', { n: windowEntry.latestTurn })}
-                            onClick={(event) => {
-                              event.stopPropagation()
-                              onJumpToDiff(windowEntry.latestTurn, change.path)
-                            }}
-                          >
-                            <Stats stats={windowEntry.stats} />
-                          </button>
-                        )}
-                      </div>
-                    )
-                  })}
-                </div>
-              ),
-            ]}
-            {done && <p className="srw-status">{t('snapshotDone')}</p>}
-            {error !== null && <p className="srw-error">{error}</p>}
-            {!loading && (ready === null || stale || blocked) && !done && (
-              <button type="button" className="srw-retry" onClick={() => { void load() }}>
-                {t('snapshotRetry')}
-              </button>
-            )}
-          </div>
-        </div>
-        <div className="srw-foot">
-          <button type="button" onClick={onClose} disabled={applying}>{t('cancel')}</button>
-          <button type="button" onClick={() => { void apply() }} disabled={!canApply}>
-            {applying ? t('snapshotApplying') : done ? t('close') : t('snapshotApply')}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ── 多会话确认弹窗：提交批次含 owner === 'multi'（真冲突）才弹 ──
-
-interface MultiSessionConfirmProps {
-  /** 已过提交闸（显式勾选）的待提交批次。 */
-  readonly items: readonly FlatChange[]
-  readonly action: FileReviewAction
-  /** 其它会话 id → displayTitle（列表快照查不到时回落原始 id）。 */
-  readonly sessionTitle: (id: string) => string | undefined
-  readonly onCancel: () => void
-  /** 改为手动勾选：关弹窗 + 展开冲突行并滚动到位。 */
-  readonly onManual: () => void
-  readonly onProceed: () => void
-}
-
-/** 骨架复刻 TurnRewindDialog 的 srw-* 样式；纯同步确认，无 fetch 状态机。 */
-function MultiSessionConfirmDialog({ items, action, sessionTitle, onCancel, onManual, onProceed }: MultiSessionConfirmProps) {
-  const conflicts = items.filter(item => item.owner === 'multi')
-  const others = items.filter((item): item is FlatChange & { readonly owner: string } =>
-    item.owner !== undefined && item.owner !== 'target'
-    && item.owner !== 'multi' && item.owner !== 'unknown')
-  return (
-    <div className="srw-overlay" role="dialog" aria-modal="true">
-      <div className="srw-dialog">
-        <div className="srw-dialog-head">
-          <strong>{t('multiConfirmTitle')}</strong>
-          <button type="button" className="srw-trigger" onClick={onCancel} aria-label={t('close')}>✕</button>
-        </div>
-        <div className="srw-content">
-          <div className="srw-body">
-            <p className="srw-warning">{t('multiConfirmWarn')}</p>
-            <div className="srw-files">
-              {conflicts.map(item => (
-                <div className="srw-file" key={stateKey(item.turn, item.path)}>
-                  <code>{item.path}</code>
-                  <span className="srw-kind">{t('ownerMulti')}</span>
-                </div>
-              ))}
-            </div>
-            {others.length > 0 && (
-              <p className="srw-status">
-                {t('multiConfirmOthers')}
-                {others.map((item, index) => (
-                  <span key={stateKey(item.turn, item.path)}>
-                    {index > 0 ? '、' : ' '}
-                    {sessionTitle(item.owner) ?? item.owner}
-                  </span>
-                ))}
-              </p>
-            )}
-          </div>
-        </div>
-        <div className="srw-foot">
-          <button type="button" onClick={onCancel}>{t('cancel')}</button>
-          <button type="button" onClick={onManual}>{t('multiConfirmManual')}</button>
-          <button type="button" onClick={onProceed}>
-            {t(action === 'undo' ? 'multiConfirmProceedUndo' : 'multiConfirmProceedRedo')}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ── 文件级时间线：一个文件在本会话被改动的每一轮；点 +/- 跳到该轮差异 ──
-
-interface FileTimelineDialogProps {
-  readonly path: string
-  /** 该文件的逐轮改动（轮次升序）。 */
-  readonly entries: readonly FileTurnEntry[]
-  /** 点击某轮的 +/- 统计：父级关闭对话框并滚动到那一轮的差异。 */
-  readonly onPick: (turn: number) => void
-  readonly onClose: () => void
-}
-
-function FileTimelineDialog({ path, entries, onPick, onClose }: FileTimelineDialogProps) {
-  return (
-    <div className="srw-overlay" role="dialog" aria-modal="true">
-      <div className="srw-dialog">
-        <div className="srw-dialog-head">
-          <strong>{t('timelineTitle')}</strong>
-          <button type="button" className="srw-trigger" onClick={onClose} aria-label={t('close')}>✕</button>
-        </div>
-        <div className="srw-content">
-          <div className="srw-body">
-            <p className={css.timelinePath}>{path}</p>
-            {entries.length === 0
-              ? <p className="srw-status">{t('timelineEmpty')}</p>
-              : [
-                <p className="srw-status" key="hint">{t('timelineHint')}</p>,
-                <ul className={css.timelineList} key="list">
-                  {[...entries].reverse().map((entry) => {
-                    const stats = entry.counts ?? summarizeDiffs(entry.diffs)
-                    return (
-                      <li className={css.timelineItem} key={entry.turn}>
-                        <span className={css.timelineDot} aria-hidden="true" />
-                        <span className={css.turnTitle}>{t('turn', { n: entry.turn })}</span>
-                        {entry.live && <span className={css.liveBadge}>{t('turnLive')}</span>}
-                        {entry.deleted === true && <span className={css.deletedBadge}>{t('deleted')}</span>}
-                        {entry.diffs.length === 0
-                          ? <span className={css.turnCount}>{t('timelineNoDiff')}</span>
-                          : (
-                            <button
-                              type="button"
-                              className={css.statsButton}
-                              title={t('viewDiff', { n: entry.turn })}
-                              onClick={() => { onPick(entry.turn) }}
-                            >
-                              <Stats stats={stats} />
-                            </button>
-                          )}
-                      </li>
-                    )
-                  })}
-                </ul>,
-              ]}
-          </div>
-        </div>
-        <div className="srw-foot">
-          <button type="button" onClick={onClose}>{t('close')}</button>
-        </div>
-      </div>
-    </div>
-  )
-}
+// Tab 入参类型是本模块公开面的一部分（better-sidebar 装配方引用）。
+export type { FileReviewTabProps }
 
 /** 侧边栏 tab 本体：逐轮变更组 + 行内 diff + 撤销。 */
 export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewTabProps) {
@@ -790,6 +59,9 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const [notice, setNotice] = useState<Notice | null>(null)
   const [tick, setTick] = useState(0)
+  // 双向同步（review-state）：live 条行内撤销/重做的结果回流到这里——
+  // tick 触发宿主重巡检，本界面的行状态与 live 条保持同一事实。
+  useEffect(() => subscribeReviewRows(() => { setTick(value => value + 1) }), [])
   // 块级选择：stateKey → 选中 hunk 下标集合；缺省（无条目）= 隐式全选。
   const [hunkSelection, setHunkSelection] = useState<ReadonlyMap<string, ReadonlySet<number>>>(() => new Map())
   // 打开「从快照恢复此轮」对话框的回合号；null = 关闭。
@@ -837,7 +109,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     [sessionList],
   )
 
-  // Code Mode（run_code）根调用及其宿主录制的变更：嵌套派发没有可复用的视图，
+  // Code Mode（run_code）根调用及其宿主录制的变更：嵌套派发没有可复用的视图,
   // 所以每个根的变更要异步拉取，再并入下面快照推导出的各轮。拉取在根集合
   // 变化（新一轮 run_code）或手动刷新时重新触发。
   const roots = useMemo(
@@ -864,6 +136,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   useEffect(() => {
     if (!visible || cwd === undefined || cwd.trim() === '') {
       setFsRaw([])
+      setEnsuredFs(new Map())
       return
     }
 
@@ -871,6 +144,9 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
 
     fetchAllFsChanges(sessionId).then((payload) => {
       if (!active) return
+      // J6：全文记忆随清单更新一并失效——底层 lazy 缓存已被 warm 替换作废，
+      // 侧栏若继续命中 ensuredFs 会长期展示过期 diff（与卡片的失效规则相反）。
+      setEnsuredFs(new Map())
       setFsRaw(payload.turns)
     }).catch(() => {
       if (!active) return
@@ -880,6 +156,25 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     return () => { active = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, tick, sessionId, cwd])
+
+  // J6：接入 warm 缓存广播——live 条推进时审查界面同步重拉，消除
+  // 「双通道获取、两侧新鲜度不同」的展示分叉。
+  useEffect(() => {
+    if (!visible || cwd === undefined || cwd.trim() === '') return
+    let active = true
+    const unsubscribe = subscribeFsCache(() => {
+      if (!active) return
+      fetchAllFsChanges(sessionId).then((payload) => {
+        if (!active) return
+        setEnsuredFs(new Map())
+        setFsRaw(payload.turns)
+      }).catch(() => { /* warm 广播驱动的重拉失败：保留现有数据 */ })
+    })
+    return () => {
+      active = false
+      unsubscribe()
+    }
+  }, [visible, sessionId, cwd])
 
   /** 按需补齐 fs 条目全文（展开 diff、撤销提交、恢复窗口统计共用）。 */
   const ensureFsTurnFiles = useCallback(async (turn: number, paths?: readonly string[]): Promise<void> => {
@@ -940,18 +235,16 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     }
     return result
   }, [fsRaw, ensuredFs])
-  
+
   useEffect(() => {
     if (!visible || roots.length === 0) return
     let active = true
     const timer = window.setTimeout(() => {
-      const scope = sessions.scope(sessionId as SessionId)
-      const remote = scope?.remote.fileReview as FileReviewRemote | undefined
-      if (scope === undefined || remote === undefined) { active = false; return }
-      remote.recorded({ rootCallIds: roots.map(root => root.rootCallId) })
-        .then((result) => {
-          if (!result.ok || !active) return
-          setRecorded(result.value.mutations)
+      // 弹性解析（remote-access）：命名空间服务丢失时自动重挂一次再取。
+      invokeFileReviewRecorded(ctx, sessionId, { rootCallIds: roots.map(root => root.rootCallId) })
+        .then((value) => {
+          if (!active) return
+          setRecorded(value.mutations)
         })
         .catch(() => {
           // 瞬时拉取失败：保留上一次的记录；下一轮快照 / 手动刷新会重试。
@@ -980,7 +273,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         }
         const files = [...existing.files]
         for (const fsFile of fsTurn.files) {
-          const index = files.findIndex(f => f.path === fsFile.path)
+          const index = files.findIndex(f => pathKey(f.path) === pathKey(fsFile.path))
           if (index === -1) files.push(fsFile)
           // 同路径的工具视图条目已经带着 hunks，保留它们。
         }
@@ -1107,56 +400,21 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
   }, [])
 
-  // 写入闸运行时开关（宿主全局，不持久化；重启回到配置初值）。
-  // 挂载时读取宿主状态；端点不可用（旧版宿主）时按钮保持禁用。
-  const [gateOn, setGateOn] = useState<boolean | null>(null)
-  useEffect(() => {
-    let active = true
-    fetch('/shadow-rewind/gate', { headers: { accept: 'application/json' }, cache: 'no-store' })
-      .then((response) => response.json())
-      .then((value: unknown) => {
-        if (!active) return
-        const record = typeof value === 'object' && value !== null && !Array.isArray(value)
-          ? value as Record<string, unknown> : {}
-        if (typeof record.enabled === 'boolean') setGateOn(record.enabled)
-      })
-      .catch(() => { /* 端点不可用：按钮保持禁用 */ })
-    return () => { active = false }
-  }, [])
-  const toggleGate = useCallback(() => {
-    const next = !(gateOn ?? true)
-    fetch('/shadow-rewind/gate', {
-      method: 'POST',
-      headers: { accept: 'application/json', 'content-type': 'application/json' },
-      body: JSON.stringify({ enabled: next }),
-    }).then((response) => {
-      if (!response.ok) throw new Error(`HTTP ${String(response.status)}`)
-      return response.json() as Promise<unknown>
-    }).then((value) => {
-      const record = typeof value === 'object' && value !== null && !Array.isArray(value)
-        ? value as Record<string, unknown> : {}
-      if (typeof record.enabled !== 'boolean') throw new Error('invalid response')
-      setGateOn(record.enabled)
-      showNotice('success', record.enabled ? t('gateTitleOn') : t('gateTitleOff'))
-    }).catch((error: unknown) => {
-      showNotice('error', `${t('gateToggleFailed')}: ${error instanceof Error ? error.message : String(error)}`)
-    })
-  }, [gateOn, showNotice])
-
   // Remote 调用路径沿用 dsh-file-review。dsh 0.1.2 起 scope 的 Remote 是
-  // 网关客户端面（agent 标签路由），fileReview 命名空间直接可调。
+  // 网关客户端面（agent 标签路由）；解析与自愈重挂收拢在 remote-access。
   const invoke = useCallback(async (
     method: 'status' | 'apply',
     request: FileReviewRequest,
   ): Promise<FileReviewResult> => {
-    const scope = sessions.scope(sessionId as SessionId)
-    if (scope === undefined) throw new Error(t('sessionUnavailable'))
-    const remote = scope.remote.fileReview as FileReviewRemote | undefined
-    if (remote === undefined) throw new Error(t('remoteUnavailable'))
-    const result = await remote[method](request)
-    if (!result.ok) throw new Error(result.error.message)
-    return result.value
-  }, [sessions, sessionId])
+    try {
+      return await invokeFileReview(ctx, sessionId, method, request)
+    } catch (caught) {
+      if (caught instanceof Error && caught.message.includes('fileReview 命名空间')) {
+        throw new Error(t('remoteUnavailable'))
+      }
+      throw caught
+    }
+  }, [ctx, sessionId])
 
   // 宿主侧状态巡检：哪些录制变更仍 applied、已 undone、或冲突。tab 不可见
   // 时暂停。
@@ -1171,7 +429,9 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         action: 'undo',
         files: inspectable.map(item => ({ path: item.path, diffs: item.diffs })),
       }
-      invoke('status', request).then((result) => {
+      // J8：巡检走传输层 in-flight 去重（与卡片同层）——侧栏直连曾绕过
+      // 去重，卡片与侧栏对同一批文件的并发巡检会双发。
+      dedupeStatus(sessionId, request, (bound) => invoke('status', bound)).then((result) => {
         if (!active) return
         setStates(() => {
           const next = new Map<string, FileReviewFileState>()
@@ -1194,19 +454,37 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, flatKey, tick, invoke])
 
+  /** H2 归一：子集提交的状态键带 diff 集签名——apply 结果与全量巡检写入
+   * 不同槽位，不再互相覆盖震荡；混合态在两个视角下各自有独立事实。 */
+  const subsetSig = useCallback((diffs: SessionFileChange['diffs']): string => {
+    let hash = 0
+    for (const diff of diffs) {
+      hash = (Math.imul(hash, 31) + (diff.oldText === null ? -1 : diff.oldText.length)
+        + diff.newText.length + (diff.oldStart ?? 0) + (diff.newStart ?? 0)) | 0
+    }
+    return `${diffs.length}:${hash}`
+  }, [])
+
+
   const mergeResultStates = useCallback((
-    items: readonly FlatChange[],
+    items: readonly { readonly item: FlatChange; readonly full: boolean }[],
     result: FileReviewResult,
   ) => {
+    // 双向同步（review-state）：本界面的开关结果广播给 live 条的行内按钮。
+    setReviewRows(sessionId, result.files)
     setStates((current) => {
       const next = new Map(current)
-      items.forEach((item, index) => {
+      items.forEach(({ item, full }, index) => {
         const file = result.files[index]
-        if (file !== undefined) next.set(stateKey(item.turn, item.path), file.state)
+        if (file === undefined) return
+        const key = full
+          ? stateKey(item.turn, item.path)
+          : `${stateKey(item.turn, item.path)}|${subsetSig(item.diffs)}`
+        next.set(key, file.state)
       })
       return next
     })
-  }, [])
+  }, [sessionId, subsetSig])
 
   /** Toggle one change set (a whole turn, or one file) undo ↔ redo — 提交闸
    * 单点：轮/文件按钮都传全文，筛选在此统一完成。
@@ -1220,7 +498,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   ) => {
     if (busyKey !== null || items.length === 0) return
     setBusyKey(key)
-    let submitted: FlatChange[] = []
+    let submitted: readonly { readonly item: FlatChange; readonly full: boolean }[] = []
     void (async () => {
       // fs 占位条目先按需补齐全文再提交（零全文条目宿主无法回放）。
       const ensuredItems: FlatChange[] = []
@@ -1240,17 +518,19 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         }
       }
       // hunk 子集裁剪：有勾选则只提交勾选部分（子集为空 ⇒ 该条不提交）。
-      submitted = ensuredItems.flatMap((item) => {
+      // full 标记随行携带：全量提交写入全量状态槽，子集提交写入带签名的
+      // 子集槽（H2 归一，两槽互不覆盖）。
+      submitted = ensuredItems.flatMap((item): { item: FlatChange; full: boolean }[] => {
         if (item.diffs.length === 0) return []
         const selection = hunkSelection.get(stateKey(item.turn, item.path))
-        if (selection === undefined || selection.size >= item.diffs.length) return [item]
+        if (selection === undefined || selection.size >= item.diffs.length) return [{ item, full: true }]
         const subset = item.diffs.filter((_, index) => selection.has(index))
-        return subset.length > 0 ? [{ ...item, diffs: subset }] : []
+        return subset.length > 0 ? [{ item: { ...item, diffs: subset }, full: false }] : []
       })
       if (submitted.length === 0) return undefined
       return invoke('apply', {
         action,
-        files: submitted.map(item => ({
+        files: submitted.map(({ item }) => ({
           path: item.path,
           diffs: item.diffs,
           ...(item.origin !== undefined ? { origin: item.origin } : {}),
@@ -1463,7 +743,13 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   const renderFile = (turn: TurnFileChanges, file: SessionFileChange) => {
     const key = stateKey(turn.turn, file.path)
     const isOpen = expanded.has(key)
-    const state = states.get(key)
+    // H2 归一：用户对当前勾选子集的最近一次 apply 结果优先于全量巡检状态
+    // ——同一文件的两个视角（全量 / 子集）各自持有独立事实，不再互相覆盖。
+    const selection = hunkSelection.get(key)
+    const subsetKey = selection !== undefined && selection.size > 0 && selection.size < file.diffs.length
+      ? `${key}|${subsetSig(file.diffs.filter((_, index) => selection.has(index)))}`
+      : null
+    const state = (subsetKey !== null ? states.get(subsetKey) : undefined) ?? states.get(key)
     const reversible = isReversible(file)
     // fs 占位条目（全文未补齐）也可撤销：提交时按需补齐。
     const fsPending = file.origin === 'fs' && file.diffs.length === 0
@@ -1603,15 +889,6 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         {flat.length > 0 && <Stats stats={totalStats} />}
         <button
           type="button"
-          className={css.smallButton}
-          disabled={gateOn === null}
-          title={gateOn === false ? t('gateTitleOff') : t('gateTitleOn')}
-          onClick={toggleGate}
-        >
-          {gateOn === null ? t('gateUnknown') : gateOn ? t('gateOn') : t('gateOff')}
-        </button>
-        <button
-          type="button"
           className={css.refreshButton}
           disabled={statusPending}
           title={t('refresh')}
@@ -1643,6 +920,9 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           onClose={() => { setRewindTurn(null) }}
           onRestored={() => {
             setTick(value => value + 1)
+            // 整树恢复成功：以当前快照最大节点 seq 为屏障打整树遮蔽标记，
+            // live 条的会话累计视图随之扣掉恢复前的全部改动。
+            markRewound(sessionId, null, snapshotBarrierOf(snapshot))
             showNotice('success', t('snapshotDone'))
           }}
         />

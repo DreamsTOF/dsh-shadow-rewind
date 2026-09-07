@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "恢复操作（RestoreOperation）状态机",
+    "locale": "zh-CN",
+    "output": "C:/code/dsh-shadow-rewind/docs/src/diagrams/operation-lifecycle.html",
+    "viewBox": [
+      960,
+      680
+    ],
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "恢复执行主轨"
+    },
+    {
+      "id": "recovery",
+      "label": "失败回滚"
+    },
+    {
+      "id": "terminal",
+      "label": "终态与人工通道"
+    }
+  ],
+  "states": [
+    {
+      "id": "planned",
+      "type": "start",
+      "label": "计划已铸",
+      "sublabel": "planId + 确认串 · 15 分钟 TTL",
+      "lane": "main",
+      "col": 0,
+      "step": "01",
+      "tag": "限时"
+    },
+    {
+      "id": "running",
+      "type": "active",
+      "label": "running",
+      "sublabel": "rescue 备份 + 操作日志",
+      "lane": "main",
+      "col": 1,
+      "step": "02",
+      "tag": "执行"
+    },
+    {
+      "id": "verifying",
+      "type": "decision",
+      "label": "验证",
+      "sublabel": "逐路径哈希 / 类型 / 权限",
+      "lane": "main",
+      "col": 2,
+      "step": "03",
+      "tag": "闸"
+    },
+    {
+      "id": "completed",
+      "type": "success",
+      "label": "completed",
+      "sublabel": "undo 记录就绪",
+      "lane": "main",
+      "col": 3,
+      "step": "04",
+      "tag": "成功"
+    },
+    {
+      "id": "undone",
+      "type": "neutral",
+      "label": "已撤销",
+      "sublabel": "undoLastRestore · 单次",
+      "lane": "main",
+      "col": 4,
+      "step": "05",
+      "tag": "undo"
+    },
+    {
+      "id": "rollback",
+      "type": "active",
+      "label": "rollback-running",
+      "sublabel": "从 rescue 点整树还原",
+      "lane": "recovery",
+      "col": 0,
+      "tag": "自动"
+    },
+    {
+      "id": "interrupted",
+      "type": "failure",
+      "label": "interrupted",
+      "sublabel": "崩溃遗留 · 启动时标记",
+      "lane": "terminal",
+      "col": 0,
+      "tag": "终态"
+    },
+    {
+      "id": "rolledback",
+      "type": "neutral",
+      "label": "rolled-back",
+      "sublabel": "工作区回到 rescue 时点",
+      "lane": "terminal",
+      "col": 1,
+      "tag": "终态"
+    },
+    {
+      "id": "recoveryreq",
+      "type": "failure",
+      "label": "recovery-required",
+      "sublabel": "可从备份点手工恢复",
+      "lane": "terminal",
+      "col": 2,
+      "tag": "终态"
+    }
+  ],
+  "transitions": [
+    {
+      "from": "planned",
+      "to": "running",
+      "label": "applyRestore：确认串 + CAS",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        126,
+        110
+      ]
+    },
+    {
+      "from": "running",
+      "to": "verifying",
+      "label": "restorePaths 完成",
+      "route": "straight",
+      "labelAt": [
+        248,
+        110
+      ]
+    },
+    {
+      "from": "verifying",
+      "to": "completed",
+      "label": "全部路径与快照全等",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        462,
+        110
+      ]
+    },
+    {
+      "from": "running",
+      "to": "rollback",
+      "variant": "security",
+      "route": "bottom-channel",
+      "channelY": 233,
+      "note": "执行中抛错同样进入回滚"
+    },
+    {
+      "from": "verifying",
+      "to": "rollback",
+      "label": "恢复/验证失败",
+      "variant": "security",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        402,
+        220
+      ]
+    },
+    {
+      "from": "rollback",
+      "to": "rolledback",
+      "label": "rescue 写回 + 验证通过",
+      "labelAt": [
+        402,
+        400
+      ]
+    },
+    {
+      "from": "rollback",
+      "to": "recoveryreq",
+      "label": "回滚也失败",
+      "variant": "security",
+      "route": "right-channel",
+      "channelX": 690,
+      "labelAt": [
+        690,
+        400
+      ]
+    },
+    {
+      "from": "running",
+      "to": "interrupted",
+      "label": "进程崩溃（含回滚中）",
+      "variant": "dashed",
+      "labelAt": [
+        248,
+        330
+      ]
+    },
+    {
+      "from": "completed",
+      "to": "undone",
+      "label": "逐路径 CAS · 被改路径跳过",
+      "variant": "dashed",
+      "route": "straight",
+      "labelAt": [
+        633,
+        110
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "fail-closed",
+      "items": [
+        "任何一步不符立即停，绝不猜着改",
+        "被未完成日志引用的恢复点禁止删除"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "两条失败路径",
+      "items": [
+        "主恢复失败 → 自动从 rescue 还原",
+        "回滚也失败 → recovery-required 人工通道"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "成功之后",
+      "items": [
+        "completed 记录逐路径 before/after",
+        "undo 单次有效，rescue 点才是持久兜底"
+      ]
+    }
+  ]
+}

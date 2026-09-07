@@ -13,6 +13,9 @@ import * as React from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ProducedFileDiff } from '../file-review/change-types.ts'
 import { fetchCheckpointFileContent } from './fs-diff-utils.ts'
+import { pathKey } from './session-changes.ts'
+import { markRewound, popRewound } from './rewound-changes.ts'
+import { matchPendingRows, retractSpan, type SteeringItemLike } from './pending.ts'
 import { UnifiedDiff } from './UnifiedDiff.tsx'
 import { fetchSubsetPlan, pathsTooLong, SubsetPlanError } from './subset-plan.ts'
 
@@ -73,6 +76,22 @@ interface RewindTarget {
   readonly matched: RewindMatched
 }
 
+/** pending steering 气泡的撤回入口目标。 */
+interface PendingTarget {
+  readonly key: string
+  readonly container: HTMLElement
+  readonly itemId: string
+  readonly text: string | null
+  readonly preview: string
+}
+
+/** 会话 scope 的最小操作面（撤回用；getSnapshot 提供队列镜像）。 */
+interface SessionScopeLike {
+  getSnapshot(): unknown
+  cancel(): Promise<unknown>
+  updateQueue(itemId: string, action: { readonly kind: 'remove' }): Promise<unknown>
+}
+
 /** 快照节点里本插件关心的最小面（unknown-safe，不依赖宿主内部类型细节）。 */
 interface RewindNodeLike {
   readonly kind?: unknown
@@ -124,18 +143,14 @@ type RewindPreview =
     readonly checkpointId: string
     /** 工作区绝对路径（新宿主）：行级预览按需拉全文时的 cwd 参数。 */
     readonly workspace?: string
-    /** 恢复语义模式：current-wins=以当前为准（整树），symmetric=对称（勾选式子集）。 */
+    /** 恢复语义模式：恒为 symmetric（勾选式子集；旧宿主可能缺省）。 */
     readonly mode?: 'current-wins' | 'symmetric'
     readonly totalChanges: number
     readonly changes: readonly RewindPreviewChange[]
     readonly truncated: boolean
     readonly activeSessionIds: readonly unknown[]
-    /** 写入闸分诊（服务端新协议）：真正阻塞恢复的会话数。 */
-    readonly restoreBlocked?: boolean
-    readonly gatedSessionIds?: readonly unknown[]
     readonly skippedPaths: readonly RewindPreviewSkip[]
     readonly planId?: string
-    readonly confirmation?: string
     /** 当前页在全部变更中的起始下标（loadAll 分页校验用）。 */
     readonly offset?: number
   }
@@ -147,6 +162,7 @@ type RewindMode = 'both' | 'code'
 export const rewindInject = ['slots', 'sessions', 'conversation']
 
 export function rewindApply(ctx: Context): void {
+  rewindContextRef = ctx as unknown as RewindClientContext
   ctx.effect(() => {
     if (document.querySelector(`style[data-plugin-css="${STYLE_ID}"]`) !== null) return () => {}
     const tag = document.createElement('style')
@@ -164,8 +180,131 @@ export function rewindApply(ctx: Context): void {
       openRestoredSession: async (sessionId: string, promptText: string) => {
         await openSessionWithDraft(ctx as unknown as RewindClientContext, sessionId, promptText)
       },
+      sessionScopeOf: (sessionId: string): SessionScopeLike | undefined =>
+        (ctx as unknown as RewindClientContext).sessions.scope(sessionId) as SessionScopeLike | undefined,
     }),
   }, RewindPortals))
+}
+
+// ── pending steering 撤回（抄 dsh-rewind 的 pending 管道）────────────────
+
+/** pending steering 气泡行（宿主权威的 pre-admission 投影）。 */
+const PENDING_SEAT_SELECTOR = '[data-pending-steering]'
+
+/**
+ * 定位 pending 行的操作按钮容器（copy 等 IconActions 行）：取行内最后一个
+ * 非本插件按钮的 parentElement——操作行恒在最后，跳过自身的 ↶/↺ 防止
+ * 刷新时把按钮挂到自己身上。DOM 形状不匹配就拒绝挂载（绝不挂错）。
+ */
+function actionsContainerOf(row: HTMLElement | undefined): HTMLElement | undefined {
+  const buttons = Array.from(row?.querySelectorAll<HTMLButtonElement>('button') ?? [])
+  const lastButton = buttons.filter((button) => !button.classList.contains('srw-trigger')).at(-1)
+  const structural = lastButton?.parentElement
+  if (structural instanceof HTMLElement && structural.querySelector('button') !== null) return structural
+  return undefined
+}
+
+/**
+ * pending 气泡的文本（克隆行读 textContent，并剔除末尾的操作容器——宿主
+ * copy 按钮的 Tooltip 悬浮文本会让整行 textContent 在鼠标悬停时抖动，
+ * 克隆读取保持 matchPendingRows 严格相等的稳定性；活行绝不被触碰）。
+ */
+function bubbleTextOf(row: HTMLElement): string {
+  const clone = row.cloneNode(true) as HTMLElement
+  clone.lastElementChild?.remove()
+  return clone.textContent ?? ''
+}
+
+/** 从会话镜像收集 pending 撤回目标（子代理队列宿主侧拒绝变更，直接跳过）。 */
+function collectPendingTargets(sessionScope: SessionScopeLike | undefined): readonly PendingTarget[] {
+  if (sessionScope === undefined) return []
+  const snapshot = sessionScope.getSnapshot() as {
+    readonly subagent?: unknown
+    readonly queue?: readonly { readonly id?: unknown; readonly placement?: unknown; readonly preview?: unknown; readonly text?: unknown }[]
+  }
+  if (snapshot?.queue === undefined || !Array.isArray(snapshot.queue)) return []
+  if (snapshot.subagent !== null) return [] // 队列可变性闸（queueMutable = subagent === null）
+  const steering = snapshot.queue
+    .filter((item) => item.placement === 'steering')
+    .map((item): SteeringItemLike & { readonly preview: string } | null => {
+      if (typeof item.id !== 'string' || item.id === '') return null
+      return {
+        id: item.id,
+        text: typeof item.text === 'string' ? item.text : null,
+        preview: typeof item.preview === 'string' ? item.preview : '',
+      }
+    })
+    .filter((item): item is SteeringItemLike & { readonly preview: string } => item !== null)
+  if (steering.length === 0) return []
+  const rows = Array.from(document.querySelectorAll<HTMLElement>(PENDING_SEAT_SELECTOR))
+  const matched = matchPendingRows(
+    rows.map((row) => ({ text: bubbleTextOf(row) })),
+    steering.map((item) => ({ id: item.id, text: item.text })),
+  )
+  const targets: PendingTarget[] = []
+  for (let i = 0; i < matched.length; i++) {
+    const itemId = matched[i]
+    if (itemId === null || itemId === undefined) continue
+    const row = rows[i]
+    const actions = actionsContainerOf(row)
+    if (actions === undefined) continue
+    const item = steering[i]
+    if (item === undefined) continue
+    targets.push({ key: `pending:${itemId}`, container: actions, itemId, text: item.text, preview: item.preview })
+  }
+  return targets
+}
+
+/** 往 pending 行的操作容器注入撤回按钮（命令式 DOM，同消息回退按钮）。 */
+function createPendingPortalButton(container: HTMLElement, onOpen: () => void): null {
+  let holder = container.querySelector<HTMLElement>(':scope > .srw-tail')
+  if (holder === null) {
+    holder = document.createElement('span')
+    holder.className = 'srw-tail'
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'srw-trigger'
+    button.title = '撤回这条未发送的消息'
+    button.setAttribute('aria-label', '撤回这条未发送的消息')
+    button.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4.75h8M4 8h5.5M4 11.25h3.5" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/></svg>'
+    button.addEventListener('click', (event) => {
+      event.stopPropagation()
+      event.preventDefault()
+      onOpen()
+    })
+    holder.appendChild(button)
+    container.appendChild(holder)
+  }
+  return null
+}
+
+/** 撤回执行（抄 dsh-rewind retractPending）：先暂停回合 → 目标及其后全部
+ * steering 逐个 remove → composer 为空时回填被撤回的文本。remove 失败
+ * 静默忽略（典型 queue-item-not-found：消息刚被领取，此时走常规回退）。 */
+async function retractPending(
+  sessionScope: SessionScopeLike,
+  ctx: RewindClientContext,
+  sessionId: string,
+  itemId: string,
+  text: string | null,
+): Promise<void> {
+  await sessionScope.cancel().catch(() => undefined)
+  const snapshot = sessionScope.getSnapshot() as {
+    readonly queue?: readonly { readonly id?: unknown; readonly placement?: unknown }[]
+  }
+  const steering = (snapshot?.queue ?? [])
+    .filter((item): item is { readonly id: string; readonly placement: string; readonly text: string | null } =>
+      typeof item.id === 'string' && item.placement === 'steering')
+  for (const id of retractSpan(steering, itemId)) {
+    await sessionScope.updateQueue(id, { kind: 'remove' }).catch(() => undefined)
+  }
+  if (text !== null && text !== '') {
+    const composer = document.querySelector('[data-composer-input]')
+    if (composer !== null && (composer.textContent ?? '').trim() === '') {
+      const scope = ctx.sessions.scope(sessionId)
+      if (scope !== undefined) ctx.conversation.input.for(scope).setDraft(text)
+    }
+  }
 }
 
 /** 从一条会话节点提取「可回退的直发用户消息」锚点。 */
@@ -185,12 +324,26 @@ function selectRewindMessage(node: RewindNodeLike): RewindMatched | null {
 interface RewindPortalsProps {
   readonly sessionId: string
   readonly openRestoredSession: (sessionId: string, promptText: string) => Promise<void>
+  readonly sessionScopeOf: (sessionId: string) => SessionScopeLike | undefined
   readonly useSession: UseSession
 }
 
-function RewindPortals({ sessionId, openRestoredSession, useSession }: RewindPortalsProps) {
+/**
+ * 恢复屏障取值：恢复成功那一刻会话快照的最大节点 seq（rewound-changes 的
+ * 遮蔽判别基准）。
+ */
+function rewindBarrier(useSession: UseSession): number {
+  let max = -1
+  for (const node of useSession((snapshot) => nodesOf(snapshot))) {
+    if (typeof node.seq === 'number' && node.seq > max) max = node.seq
+  }
+  return max
+}
+
+function RewindPortals({ sessionId, openRestoredSession, sessionScopeOf, useSession }: RewindPortalsProps) {
   const nodes = useSession((snapshot) => nodesOf(snapshot))
   const [targets, setTargets] = React.useState<RewindTarget[]>([])
+  const [pendingTargets, setPendingTargets] = React.useState<PendingTarget[]>([])
   React.useLayoutEffect(() => {
     let active = true
     let queued = false
@@ -198,35 +351,73 @@ function RewindPortals({ sessionId, openRestoredSession, useSession }: RewindPor
       if (!active) return
       const next = collectTargets(nodes)
       setTargets((current) => sameTargets(current, next) ? current : next)
+      const nextPending = collectPendingTargets(sessionScopeOf(sessionId))
+      setPendingTargets((current) => samePendingTargets(current, nextPending) ? current : [...nextPending])
     }
     // DOM 行可能晚于会话快照出现；MutationObserver + 微任务去重足够。
+    // 首轮收集同样走微任务：commit 阶段绝不 setState，杜绝嵌套更新
+    // （React #185 Maximum update depth exceeded）。
     const queue = () => {
       if (queued || !active) return
       queued = true
       queueMicrotask(() => { queued = false; refresh() })
     }
-    refresh()
+    queue()
     const observer = new MutationObserver(queue)
     observer.observe(document.body, { childList: true, subtree: true })
     return () => { active = false; observer.disconnect() }
-  }, [nodes])
-  return targets.map((target) => React.createElement(RewindAction, {
-    key: `${sessionId}:${String(target.matched.messageSeq)}`,
-    matched: target.matched,
-    container: target.container,
-    sessionId,
-    openRestoredSession,
-  }))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodes, sessionId])
+  return [
+    ...targets.map((target) => React.createElement(RewindAction, {
+      key: `${sessionId}:${String(target.matched.messageSeq)}`,
+      matched: target.matched,
+      container: target.container,
+      sessionId,
+      openRestoredSession,
+      sessionScopeOf,
+      useSession,
+    })),
+    ...pendingTargets.map((target) => React.createElement(RetractAction, {
+      key: target.key,
+      target,
+      sessionId,
+      sessionScopeOf,
+    })),
+  ]
 }
 
-/** 兼容不同 dsh 版本的快照形态：优先 chat.nodes（Map），回退顶层 nodes。 */
+/** 两组 pending 目标是否等价（顺序敏感；无变化就不触发 React 重渲染）。 */
+function samePendingTargets(left: readonly PendingTarget[], right: readonly PendingTarget[]): boolean {
+  return left.length === right.length && left.every((target, index) => {
+    const other = right[index]
+    return other !== undefined && target.key === other.key && target.container === other.container
+  })
+}
+
+/** nodesOf 的快照同一性缓存：选择器每次调用都必须返回**同一引用**——
+ * `map.values()` 迭代器与 `[]` 字面量每次都是新对象，useSession 据此判定
+ * store 在抖动，陷入「渲染 → 快照又变 → 再渲染」的无限循环，正是 React
+ * #185（Maximum update depth exceeded）的根因。按不可变快照引用记忆化
+ * （session-changes.ts 的徽标推导同款手法）。 */
+const nodesCache = new WeakMap<object, SessionNodes>()
+
+const EMPTY_NODES: SessionNodes = []
+
+/** 兼容不同 dsh 版本的快照形态：优先 chat.nodes（Map，物化成数组以稳定引用），回退顶层 nodes。 */
 function nodesOf(snapshot: unknown): SessionNodes {
-  if (typeof snapshot !== 'object' || snapshot === null) return []
+  if (typeof snapshot !== 'object' || snapshot === null) return EMPTY_NODES
+  const hit = nodesCache.get(snapshot)
+  if (hit !== undefined) return hit
   const record = snapshot as {
     chat?: { nodes?: Map<unknown, RewindNodeLike> }
     nodes?: SessionNodes
   }
-  return record.chat?.nodes?.values() ?? record.nodes ?? []
+  const nodes: SessionNodes = record.chat?.nodes !== undefined
+    ? Array.from(record.chat.nodes.values())
+    : record.nodes ?? EMPTY_NODES
+  nodesCache.set(snapshot, nodes)
+  return nodes
 }
 
 interface RewindActionProps {
@@ -234,9 +425,11 @@ interface RewindActionProps {
   readonly container: HTMLElement
   readonly sessionId: string
   readonly openRestoredSession: (sessionId: string, promptText: string) => Promise<void>
+  readonly sessionScopeOf: (sessionId: string) => SessionScopeLike | undefined
+  readonly useSession: UseSession
 }
 
-function RewindAction({ matched, container, sessionId, openRestoredSession }: RewindActionProps) {
+function RewindAction({ matched, container, sessionId, openRestoredSession, useSession }: RewindActionProps) {
   const [open, setOpen] = React.useState(false)
   return React.createElement(React.Fragment, null,
     createPortalButton(container, matched, () => setOpen(true)),
@@ -244,8 +437,91 @@ function RewindAction({ matched, container, sessionId, openRestoredSession }: Re
       sessionId,
       matched,
       openRestoredSession,
+      useSession,
       onClose: () => setOpen(false),
     }),
+  )
+}
+
+interface RetractActionProps {
+  readonly target: PendingTarget
+  readonly sessionId: string
+  readonly sessionScopeOf: (sessionId: string) => SessionScopeLike | undefined
+}
+
+/** 撤回管道要用的 RewindClientContext（composer 回填）；rewindApply 时绑定。 */
+let rewindContextRef: RewindClientContext | null = null
+
+/** pending 气泡旁的撤回按钮 + 确认对话框。 */
+function RetractAction({ target, sessionId, sessionScopeOf }: RetractActionProps) {
+  const [confirming, setConfirming] = React.useState(false)
+  const [busy, setBusy] = React.useState(false)
+  const onConfirm = async (): Promise<void> => {
+    const sessionScope = sessionScopeOf(sessionId)
+    if (sessionScope === undefined || rewindContextRef === null) {
+      setConfirming(false)
+      return
+    }
+    setBusy(true)
+    try {
+      await retractPending(sessionScope, rewindContextRef, sessionId, target.itemId, target.text)
+    } finally {
+      setBusy(false)
+      setConfirming(false)
+    }
+  }
+  return React.createElement(React.Fragment, null,
+    createPendingPortalButton(target.container, () => setConfirming(true)),
+    confirming && React.createElement(RetractDialog, {
+      text: target.text,
+      preview: target.preview,
+      busy,
+      onConfirm: () => { void onConfirm() },
+      onClose: () => { if (!busy) setConfirming(false) },
+    }),
+  )
+}
+
+interface RetractDialogProps {
+  readonly text: string | null
+  readonly preview: string
+  readonly busy: boolean
+  readonly onConfirm: () => void
+  readonly onClose: () => void
+}
+
+/** 撤回确认对话框：单步确认，无模式选择、无 impact 预览（不涉及文件）。 */
+function RetractDialog({ text, preview, busy, onConfirm, onClose }: RetractDialogProps) {
+  const body = text !== null && text !== ''
+    ? text
+    : preview !== ''
+      ? preview
+      : null
+  return React.createElement('div', {
+    className: 'srw-overlay',
+    role: 'dialog',
+    'aria-modal': 'true',
+    onClick: (event: React.MouseEvent) => {
+      if (event.target === event.currentTarget) onClose()
+    },
+  },
+  React.createElement('div', { className: 'srw-dialog', style: { width: 'min(480px, 100%)' } },
+    React.createElement('div', { className: 'srw-dialog-head' },
+      React.createElement('strong', null, '撤回未发送的消息'),
+      React.createElement('button', { type: 'button', className: 'srw-trigger', onClick: onClose, 'aria-label': '关闭' }, '✕'),
+    ),
+    React.createElement('div', { className: 'srw-content' },
+      React.createElement('p', { className: 'srw-status' },
+        '这条消息还在待执行队列里，撤回后不会发给模型；它之后的排队消息会一并撤回。'),
+      body !== null
+        ? React.createElement('p', { className: 'srw-warning', style: { maxHeight: '160px', overflowY: 'auto', whiteSpace: 'pre-wrap' } }, body)
+        : null,
+    ),
+    React.createElement('div', { className: 'srw-foot' },
+      React.createElement('button', { type: 'button', disabled: busy, onClick: onClose }, '取消'),
+      React.createElement('button', { type: 'button', disabled: busy, onClick: onConfirm }, busy ? '撤回中…' : '撤回'),
+    ),
+  ),
   )
 }
 
@@ -278,10 +554,11 @@ interface RewindDialogProps {
   readonly sessionId: string
   readonly matched: RewindMatched
   readonly openRestoredSession: (sessionId: string, promptText: string) => Promise<void>
+  readonly useSession: UseSession
   readonly onClose: () => void
 }
 
-function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: RewindDialogProps) {
+function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onClose }: RewindDialogProps) {
   const [loading, setLoading] = React.useState(true)
   const [preview, setPreview] = React.useState<RewindPreview | null>(null)
   const [mode, setMode] = React.useState<RewindMode>('both')
@@ -291,6 +568,8 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
   const [completed, setCompleted] = React.useState<string | null>(null)
   // B1 撤销：恢复完成后提供「撤销本次恢复」（进程内单次 undo）。
   const [undoing, setUndoing] = React.useState(false)
+  // EXPECTED-DESIGN 1.2：probe 探到 CAS 冲突时的三选项弹窗清单（null = 不弹）。
+  const [undoConflicts, setUndoConflicts] = React.useState<readonly { path: string; reason: string }[] | null>(null)
   // 对称模式的勾选集（null = 非对称模式，整树恢复）。
   const [selected, setSelected] = React.useState<ReadonlySet<string> | null>(null)
 
@@ -344,27 +623,14 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
 
   const ready = preview !== null && preview.status === 'ready' ? preview : null
   const hasChanges = ready !== null && ready.totalChanges > 0
-  // 阻塞判定：优先用服务端的写入闸分诊（restoreBlocked），旧协议回退到计数。
-  const sharedBlocked = ready !== null
-    && (ready.restoreBlocked ?? ready.activeSessionIds.length > 0)
-
-  // 占用自动重查：blocked 期间每 3s 静默重取预览，占用解除的瞬间按钮就地
-  // 变活——否则 blocked 时的预览不带 planId/confirmation，恢复按钮会一直
-  // 死在禁用态。
-  React.useEffect(() => {
-    if (!sharedBlocked || applying || completed !== null) return
-    const timer = window.setInterval(() => { void load(true) }, 3000)
-    return () => { window.clearInterval(timer) }
-  }, [sharedBlocked, applying, completed, load])
-  const gatedRunning = ready?.gatedSessionIds?.length ?? 0
   const symmetric = ready?.mode === 'symmetric'
   const selectedCount = selected?.size ?? 0
   const allSelected = symmetric && ready !== null && selected !== null
     && selected.size >= ready.changes.length && ready.changes.length > 0
-  const planMissing = hasChanges && ready !== null && !sharedBlocked
-    && (ready.planId === undefined || ready.confirmation === undefined)
+  const planMissing = hasChanges && ready !== null
+    && ready.planId === undefined
   const canApply = ready !== null && !loading && !applying && completed === null
-    && hasChanges && !sharedBlocked && !planMissing && !stale
+    && hasChanges && !planMissing && !stale
     && (!symmetric || selectedCount > 0)
   const canUndo = completed !== null && ready !== null && ready.workspace !== undefined && !undoing && !applying
 
@@ -373,27 +639,63 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
     setUndoing(true)
     setError(null)
     try {
+      // 两段式（EXPECTED-DESIGN 1.2）：先 probe 只读比对 CAS——无冲突直接
+      // 撤销；有冲突弹三选项对话框（拒绝 / 全部回滚 / 只回滚正常部分）。
+      const probeResponse = await fetch(`${PATH}/restore-undo`, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, cwd: ready.workspace, mode: 'probe' }),
+      })
+      const probeBody = await responseJson(probeResponse) as { conflicted?: unknown }
+      const conflicted = Array.isArray(probeBody.conflicted)
+        ? probeBody.conflicted
+          .map((entry) => {
+            const item = typeof entry === 'object' && entry !== null && !Array.isArray(entry)
+              ? entry as Record<string, unknown> : {}
+            return typeof item.path === 'string'
+              ? { path: item.path, reason: typeof item.reason === 'string' ? item.reason : '' }
+              : null
+          })
+          .filter((entry): entry is { path: string; reason: string } => entry !== null)
+        : []
+      if (conflicted.length === 0) {
+        await applyUndo(false)
+        return
+      }
+      setUndoConflicts(conflicted)
+    } catch (undoError) {
+      setError(`撤销失败：${messageOf(undoError)}`)
+    } finally {
+      setUndoing(false)
+    }
+  }
+
+  /** 执行撤销（force = 用户在弹窗授权「全部回滚 / 二次回滚」）。 */
+  const applyUndo = async (force: boolean) => {
+    if (ready?.workspace === undefined) return
+    setUndoing(true)
+    setError(null)
+    try {
       const response = await fetch(`${PATH}/restore-undo`, {
         method: 'POST',
         headers: { accept: 'application/json', 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId, cwd: ready.workspace }),
+        body: JSON.stringify({ sessionId, cwd: ready.workspace, ...(force ? { force: true } : {}) }),
       })
-      const body: unknown = await responseJson(response)
-      if (!response.ok) {
-        const message = typeof body === 'object' && body !== null && typeof (body as Record<string, unknown>).error === 'string'
-          ? (body as Record<string, unknown>).error as string
-          : `HTTP ${String(response.status)}`
-        throw new Error(message)
-      }
-      const record = body as { undonePaths?: unknown; skippedPaths?: unknown }
+      const record = await responseJson(response) as { undonePaths?: unknown; skippedPaths?: unknown }
       const undone = Array.isArray(record.undonePaths) ? record.undonePaths.length : 0
       const skipped = Array.isArray(record.skippedPaths)
         ? record.skippedPaths.filter((item): item is { path: string; reason: string } =>
           typeof item === 'object' && item !== null && typeof (item as Record<string, unknown>).path === 'string')
         : []
-      const lines = [`已撤销本次恢复：${String(undone)} 个路径回到恢复前状态。`]
+      const lines = [force
+        ? `已强制撤销本次恢复：${String(undone)} 个路径回到恢复前状态（冲突修改已被覆盖）。`
+        : `已撤销本次恢复：${String(undone)} 个路径回到恢复前状态。`]
       for (const skip of skipped) lines.push(`跳过 ${skip.path}：${skip.reason}`)
+      if (skipped.length > 0) lines.push('被跳过的文件仍可再次点击「撤销本次恢复」，确认后强制回滚。')
       setCompleted(lines.join('\n'))
+      setUndoConflicts(null)
+      // 撤销成功：弹出最近一次遮蔽标记，live 条恢复显示恢复前的改动。
+      if (undone > 0 || force) popRewound(sessionId)
     } catch (undoError) {
       setError(`撤销失败：${messageOf(undoError)}`)
     } finally {
@@ -453,17 +755,15 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
     setError(null)
     try {
       let planId = ready.planId
-      let confirmation = ready.confirmation
-      // 对称模式且未全选：先铸造只覆盖勾选路径的子集计划（全套安全闸
-      // 原样保留——确认串、TTL、逐路径 CAS 都随新计划走）。
-      if (ready.planId !== undefined && ready.confirmation !== undefined
+      // 对称模式且未全选：先铸造只覆盖勾选路径的子集计划（确认由本弹窗
+      // 承担——确认串已废除，EXPECTED-DESIGN 1.4 #2）。
+      if (ready.planId !== undefined
         && symmetric && selected !== null && selected.size < ready.totalChanges) {
         const paths = ready.changes.filter(change => selected.has(change.path)).map(change => change.path)
         if (paths.length > 0) {
           if (pathsTooLong(paths)) throw new Error('勾选的文件过多，无法构造恢复请求；请减少勾选')
           const subset = await fetchSubsetPlan(`sessionId=${encodeURIComponent(sessionId)}&messageSeq=${String(matched.messageSeq)}`, paths)
           planId = subset.planId
-          confirmation = subset.confirmation
         }
       }
       const response = await fetch(PATH, {
@@ -475,10 +775,19 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
           messageSeq: ready.messageSeq,
           checkpointId: ready.checkpointId,
           planId,
-          confirmation,
         }),
       })
       const result = await responseJson(response)
+      // 恢复成功：打回滚遮蔽标记，live 条的会话累计视图据此扣掉被恢复的条目
+      // （屏障 = 当前快照最大节点 seq；屏障后的再编辑照常显示）。
+      // 对称模式只遮蔽勾选（被恢复）的路径；整树恢复（非对称）遮蔽全部路径。
+      markRewound(
+        sessionId,
+        symmetric && selected !== null
+          ? new Set(ready.changes.filter(change => selected.has(change.path)).map(change => pathKey(change.path)))
+          : null,
+        rewindBarrier(useSession),
+      )
       if (mode === 'code') {
         setCompleted('项目文件已恢复；当前对话保持不变。恢复前的文件已自动备份。')
         return
@@ -492,7 +801,7 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
       }
     } catch (caught) {
       if ((caught instanceof RewindRequestError || caught instanceof SubsetPlanError)
-        && (caught.code === 'PLAN_STALE' || caught.code === 'WORKSPACE_IN_USE')) {
+        && caught.code === 'PLAN_STALE') {
         setStale(true)
       }
       setError(friendlyError(caught))
@@ -503,8 +812,7 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
 
   const radioName = `srw-${sessionId}-${String(matched.messageSeq)}`
   return React.createElement('div', { className: 'srw-overlay', role: 'dialog', 'aria-modal': 'true' },
-    React.createElement('div', { className: 'srw-dialog' },
-      React.createElement('div', { className: 'srw-dialog-head' },
+    React.createElement('div', { className: 'srw-dialog' },      React.createElement('div', { className: 'srw-dialog-head' },
         React.createElement('strong', null, '恢复到发送这条消息之前'),
         React.createElement('button', { type: 'button', className: 'srw-trigger', onClick: onClose, 'aria-label': '关闭' }, '✕'),
       ),
@@ -526,9 +834,7 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
                 : `将恢复 ${String(ready.totalChanges)} 个文件`),
               React.createElement('span', null, mode === 'both' ? '恢复后在新对话里继续' : '当前对话保持不变'),
             ),
-            symmetric && React.createElement('p', { className: 'srw-status', key: 'hint' }, '对称模式：默认只勾选本会话改动的文件；勾选其它文件会把它们一并恢复到该时点。'),
-            sharedBlocked && React.createElement('p', { className: 'srw-error', key: 'shared' }, '这个项目目录还有别的对话正在运行。恢复文件会影响到它们，因此本次操作已被阻止。'),
-            gatedRunning > 0 && React.createElement('p', { className: 'srw-warning', key: 'gated' }, `另有 ${String(gatedRunning)} 个会话正在运行；其文件写入已被写入闸拒绝，不会影响本次恢复。`),
+            symmetric && React.createElement('p', { className: 'srw-status', key: 'hint' }, '默认只勾选本会话改动的文件；勾选其它文件会把它们一并恢复到该时点。'),
             ready.skippedPaths.length > 0 && React.createElement('div', { className: 'srw-skipped', key: 'skipped' }, [
               React.createElement('div', { key: 'title' }, '以下文件未纳入快照，恢复不会改动它们：'),
               ...ready.skippedPaths.map((skip) => React.createElement('div', { key: skip.path },
@@ -565,7 +871,7 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
             onClick: () => { void undoRestore() }, disabled: undoing,
           }, undoing ? '正在撤销…' : '撤销本次恢复'),
           error !== null && React.createElement('p', { className: 'srw-error' }, error),
-          !loading && (preview === null || preview.status !== 'ready' || stale || planMissing || sharedBlocked) && completed === null
+          !loading && (preview === null || preview.status !== 'ready' || stale || planMissing) && completed === null
             && React.createElement('button', { type: 'button', className: 'srw-retry', onClick: () => { void load() } }, '重新检查'),
         ),
       ),
@@ -573,6 +879,56 @@ function RewindDialog({ sessionId, matched, openRestoredSession, onClose }: Rewi
         React.createElement('button', { type: 'button', onClick: onClose, disabled: applying }, '取消'),
         React.createElement('button', { type: 'button', onClick: () => { void applyRestore() }, disabled: !canApply },
           applying ? '正在恢复…' : completed === null ? (mode === 'both' ? '恢复并从这里继续' : '恢复文件') : '已完成'),
+      ),
+    ),
+    undoConflicts !== null && React.createElement(UndoConflictDialog, {
+      conflicts: undoConflicts,
+      busy: undoing,
+      onAbort: () => { setUndoConflicts(null) },
+      onPartial: () => { void applyUndo(false) },
+      onForce: () => { void applyUndo(true) },
+    }),
+  )
+}
+
+/**
+ * 撤销冲突三选项弹窗（EXPECTED-DESIGN 1.2）：列出 CAS 失配（恢复之后又被
+ * 修改过）的文件，用户三选一——拒绝回滚 / 全部回滚（覆盖修改）/
+ * 只回滚正常部分（跳过后可对剩余文件做确认的二次回滚）。
+ */
+function UndoConflictDialog({ conflicts, busy, onAbort, onPartial, onForce }: {
+  readonly conflicts: readonly { path: string; reason: string }[]
+  readonly busy: boolean
+  readonly onAbort: () => void
+  readonly onPartial: () => void
+  readonly onForce: () => void
+}) {
+  return React.createElement('div', {
+    className: 'srw-overlay', role: 'dialog', 'aria-modal': 'true',
+    style: { zIndex: 2147483300 },
+  },
+    React.createElement('div', { className: 'srw-dialog' },
+      React.createElement('div', { className: 'srw-dialog-head' },
+        React.createElement('strong', null, '部分文件无法正常回滚'),
+        React.createElement('button', { type: 'button', className: 'srw-trigger', onClick: onAbort, 'aria-label': '关闭' }, '✕'),
+      ),
+      React.createElement('div', { className: 'srw-content' },
+        React.createElement('div', { className: 'srw-body' },
+          React.createElement('p', { className: 'srw-warning' },
+            '以下文件在恢复之后又被修改过（可能与你的手动修改有关）。「全部回滚」会覆盖这些修改；',
+            '「只回滚正常部分」会跳过它们，之后可对剩余文件再次确认回滚。'),
+          React.createElement('div', { className: 'srw-files' },
+            conflicts.map((conflict) => React.createElement('div', { className: 'srw-file', key: conflict.path },
+              React.createElement('code', null, conflict.path),
+              React.createElement('span', { className: 'srw-kind' }, '恢复后又被修改'),
+            )),
+          ),
+        ),
+      ),
+      React.createElement('div', { className: 'srw-foot' },
+        React.createElement('button', { type: 'button', onClick: onAbort, disabled: busy }, '拒绝回滚'),
+        React.createElement('button', { type: 'button', onClick: onPartial, disabled: busy }, '只回滚正常部分'),
+        React.createElement('button', { type: 'button', onClick: onForce, disabled: busy }, busy ? '正在回滚…' : '全部回滚'),
       ),
     ),
   )
@@ -732,12 +1088,9 @@ function decodePreview(value: unknown): RewindPreview {
     }),
     truncated: record.truncated === true,
     activeSessionIds,
-    ...(typeof record.restoreBlocked === 'boolean' ? { restoreBlocked: record.restoreBlocked } : {}),
-    ...(Array.isArray(record.gatedSessionIds) ? { gatedSessionIds: record.gatedSessionIds } : {}),
     skippedPaths,
     ...(typeof record.workspace === 'string' ? { workspace: record.workspace } : {}),
     ...(typeof record.planId === 'string' ? { planId: record.planId } : {}),
-    ...(typeof record.confirmation === 'string' ? { confirmation: record.confirmation } : {}),
     ...(typeof record.offset === 'number' ? { offset: record.offset } : {}),
   }
 }
@@ -767,8 +1120,6 @@ function friendlyError(error: unknown): string {
   if (error instanceof RewindRequestError) {
     switch (error.code) {
       case 'PLAN_STALE': return '项目文件在检查后又发生了变化。为避免覆盖新修改，请重新检查后再恢复。'
-      case 'WORKSPACE_IN_USE': return '这个项目目录还有别的对话正在运行。请等那些对话结束或停止后，再重新检查。'
-      case 'WORKSPACE_LOCKED': return '另一个恢复操作正在处理这个项目目录。请等待它完成后重新检查。'
       case 'RESTORE_POINT_NOT_FOUND': return '没有找到对应的文件状态，可能已被清理。'
       case 'NO_CHANGES': return '项目文件已经是这条消息发送前的状态，无需恢复。'
       case 'RESTORE_FAILED_ROLLED_BACK': return '恢复未能完成，项目文件已自动还原到操作前的状态。'
@@ -794,11 +1145,22 @@ function collectTargets(nodes: SessionNodes): RewindTarget[] {
     if (matched === null) continue
     const anchorKey = typeof node.key === 'string' ? node.key : `node:${String(node.seq)}`
     const row = rows.get(anchorKey)
-    const actions = row?.querySelector('[data-time-hover-root="true"]')?.lastElementChild
+    // 容器必须是宿主操作行的最后一个**宿主**子元素——跳过本插件自己注入的
+    // .srw-tail。取裸 lastElementChild 会把上一轮注入的按钮当成容器，再往里
+    // 嵌套注入；MutationObserver → refresh → 再渲染 正反馈成无限循环
+    // （React #185 Maximum update depth exceeded 即来源于此）。
+    const actions = lastHostAction(row?.querySelector('[data-time-hover-root="true"]'))
     if (!(actions instanceof HTMLElement)) continue
     targets.push({ container: actions, matched })
   }
   return targets
+}
+
+/** `root` 里最后一个非 `.srw-tail` 的子元素（本插件注入的按钮行不算宿主内容）。 */
+function lastHostAction(root: Element | null | undefined): Element | null {
+  let child = root?.lastElementChild ?? null
+  while (child !== null && child.classList.contains('srw-tail')) child = child.previousElementSibling
+  return child
 }
 
 function sameTargets(left: readonly RewindTarget[], right: readonly RewindTarget[]): boolean {

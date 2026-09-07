@@ -12,38 +12,23 @@
  * `meta`（dsh-tool-fs 落地的 presentationMeta.diffs）。
  */
 import type { ChatSnapshot, ToolResultNode } from '@deepseek-ai/dsh-client-ui-chat/client'
-import type { ProducedFileDiff, RecordedMutation } from '../file-review/change-types.ts'
-import { deletedPathsFromCall } from './deleted-paths.ts'
-import { diffsFromBeforeAfter } from './recorded-diffs.ts'
+import type { ProducedFileDiff, ProducedFileReview, RecordedMutation } from '../file-review/change-types.ts'
+import { coalesceCreatedFileDiffs, diffsFromBeforeAfter } from './recorded-diffs.ts'
+import { isToolEntryRewound, type RewoundMark } from './rewound-changes.ts'
 
-/** 写盘归因关联到的命令执行窗口（闸关归因命令级时附带）。 */
-export interface FsCommandRef {
-  readonly tool: string
-  readonly callId?: string
-  readonly sessionId: string
-  readonly startedAt: number
-  readonly endedAt: number
-}
-
-/** 写盘归因字段（仅闸关时宿主提供；开闸/旧宿主全部缺省）：
+/** 窗口归属字段（检查点网格推导，勾选清单的建议标签）：
  * 'target' = 本会话，'multi' = 多会话，'unknown' = 不可知，其它 = 会话 id。 */
 export interface FsAttributionFields {
   readonly owner?: string
   /** 归属本会话 → true（默认勾选）；其它/歧义 → false（须显式勾选）。 */
   readonly autoSelect?: boolean
-  /** 归因置信层级：命令级 / 歧义 / 外部写入 / 窗口级 / 不可知。 */
-  readonly attribution?: 'command' | 'ambiguous' | 'external' | 'window' | 'unknown'
-  /** 归因到的命令执行窗口（仅 attribution === 'command' 时附带）。 */
-  readonly command?: FsCommandRef
-  /** 当前内容的写入时间（快照 mtime，ms epoch；旧清单无此字段则缺省）。 */
-  readonly writtenAt?: number
 }
 
 /** 一轮里被改过的一个文件，hunks 按结算顺序追加。 */
 export interface SessionFileChange extends FsAttributionFields {
   readonly path: string
   readonly diffs: readonly ProducedFileDiff[]
-  /** 本轮的终端命令删掉了这个路径（仅展示用，不能撤销）。 */
+  /** fs 删除条目（检查点对比 kind='deleted'）：展示为全红，撤销=写回旧内容。 */
   readonly deleted?: true
   /** 条目来源：'fs' = 检查点对比派生（终端写盘）；缺省 = 工具结果视图。 */
   readonly origin?: 'fs'
@@ -51,6 +36,8 @@ export interface SessionFileChange extends FsAttributionFields {
   readonly dir?: true
   /** 服务端预算的行数（fs 条目懒加载全文前的显示用；缺省按 diffs 汇总）。 */
   readonly counts?: { readonly added: number; readonly removed: number }
+  /** 条目内最后一个工具结果节点的事件 seq（回滚遮蔽的判别基准；录制条目缺省）。 */
+  readonly lastSeq?: number
 }
 
 /** 一轮的产出文件，按首次出现顺序。 */
@@ -61,10 +48,12 @@ export interface TurnFileChanges {
   readonly files: readonly SessionFileChange[]
 }
 
-/** 内部按路径累积器：hunk 列表 + 最后一次删除状态。 */
+/** 内部按路径累积器：展示路径（首次出现形态）+ hunk 列表 + 最新事件 seq。 */
 interface FileAccumulator {
+  path: string
   diffs: ProducedFileDiff[]
-  deleted?: true
+  /** 条目内最新工具结果节点 seq；录制合入的纯录制条目缺省（不参与回滚遮蔽）。 */
+  lastSeq?: number
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -212,10 +201,7 @@ function derive(snapshot: ChatSnapshot): TurnFileChanges[] {
     const call = node.call
     if (call === null) continue
     const paths = producedPathsOfCall(call.name, call.argsRaw)
-    // dsh 没有「删除文件」工具：删除发生在终端里，一次成功终端调用的字面
-    // rm 系列参数就是它唯一的记录。它们以「无 hunk、不可撤销」的条目呈现。
-    const deletions = paths.length === 0 ? deletedPathsFromCall(call.name, call.argsRaw) : []
-    if (paths.length === 0 && deletions.length === 0) continue
+    if (paths.length === 0) continue
     const diffs = reviewDiffs(node)
     const { turn, live } = attribute(node.seq)
     let group = byTurn.get(turn)
@@ -224,18 +210,14 @@ function derive(snapshot: ChatSnapshot): TurnFileChanges[] {
       byTurn.set(turn, group)
     }
     for (const path of paths) {
-      const own = diffs.filter(diff => diff.path === path)
-      const existing = group.files.get(path)
-      if (existing === undefined) group.files.set(path, { diffs: [...own] })
+      const own = diffs.filter(diff => pathKey(diff.path) === pathKey(path))
+      const key = pathKey(path)
+      const existing = group.files.get(key)
+      if (existing === undefined) group.files.set(key, { path, diffs: [...own], lastSeq: node.seq })
       else {
         existing.diffs.push(...own)
-        delete existing.deleted
+        existing.lastSeq = Math.max(existing.lastSeq ?? node.seq, node.seq)
       }
-    }
-    for (const path of deletions) {
-      const existing = group.files.get(path)
-      if (existing === undefined) group.files.set(path, { diffs: [], deleted: true })
-      else existing.deleted = true
     }
   }
   return [...byTurn.entries()]
@@ -243,10 +225,11 @@ function derive(snapshot: ChatSnapshot): TurnFileChanges[] {
     .map(([turn, group]) => ({
       turn,
       live: group.live,
-      files: [...group.files.entries()].map(([path, own]) => ({
-        path,
-        diffs: own.diffs,
-        ...(own.deleted === true ? { deleted: true as const } : {}),
+      // 「新建后同轮又修改」收敛成单条 added（净内容），与轮尾卡片同语义。
+      files: [...group.files.values()].map(own => ({
+        path: own.path,
+        diffs: coalesceCreatedFileDiffs(own.diffs),
+        lastSeq: own.lastSeq,
       })),
     }))
 }
@@ -325,9 +308,12 @@ export function mergeRecordedTurns(
   for (const turn of turns) {
     const files = new Map<string, FileAccumulator>()
     for (const file of turn.files) {
-      files.set(file.path, {
+      files.set(pathKey(file.path), {
+        path: file.path,
         diffs: [...file.diffs],
-        ...(file.deleted === true ? { deleted: true as const } : {}),
+        // 录制合并不改既有条目的 seq 基准；录制条目自身无 seq（回滚遮蔽
+        // 按已有 lastSeq 缺省放行——录制变更的遮蔽精度见 rewound-changes 的 TODO）。
+        ...(file.lastSeq !== undefined ? { lastSeq: file.lastSeq } : {}),
       })
     }
     groups.set(turn.turn, { live: turn.live, files })
@@ -343,8 +329,9 @@ export function mergeRecordedTurns(
     for (const mutation of mutations) {
       const diffs = diffsFromBeforeAfter(mutation.path, mutation.before, mutation.after)
       if (diffs.length === 0) continue
-      const existing = group.files.get(mutation.path)
-      if (existing === undefined) group.files.set(mutation.path, { diffs: [...diffs] })
+      const key = pathKey(mutation.path)
+      const existing = group.files.get(key)
+      if (existing === undefined) group.files.set(key, { path: mutation.path, diffs: [...diffs] })
       else existing.diffs.push(...diffs)
     }
   }
@@ -353,27 +340,97 @@ export function mergeRecordedTurns(
     .map(([turn, group]) => ({
       turn,
       live: group.live,
-      files: [...group.files.entries()].map(([path, own]) => ({
-        path,
-        diffs: own.diffs,
-        ...(own.deleted === true ? { deleted: true as const } : {}),
+      files: [...group.files.values()].map(own => ({
+        path: own.path,
+        diffs: coalesceCreatedFileDiffs(own.diffs),
+        ...(own.lastSeq !== undefined ? { lastSeq: own.lastSeq } : {}),
       })),
     }))
+}
+
+/**
+ * 回滚遮蔽过滤：把「磁盘上已不存在」的条目从轮列表里扣掉（live 条的会话
+ * 累计视图与徽标共用）。规则见 rewound-changes.ts——条目 lastSeq ≤ 标记
+ * 屏障且路径被恢复即遮蔽；没有 lastSeq 的条目（纯录制合入）一律放行。
+ */
+export function filterRewoundTurns(
+  turns: readonly TurnFileChanges[],
+  marks: readonly RewoundMark[],
+): readonly TurnFileChanges[] {
+  if (marks.length === 0) return turns
+  const result: TurnFileChanges[] = []
+  for (const turn of turns) {
+    const files = turn.files.filter(file =>
+      file.lastSeq === undefined
+      || !isToolEntryRewound(marks, pathKey(file.path), file.lastSeq))
+    if (files.length > 0) result.push({ ...turn, files })
+  }
+  return result
 }
 
 /** 统计跨所有轮的被改路径去重数（侧边栏徽标就是这个数）。 */
 export function countChangedFiles(turns: readonly TurnFileChanges[]): number {
   const paths = new Set<string>()
   for (const turn of turns) {
-    for (const file of turn.files) paths.add(file.path)
+    for (const file of turn.files) paths.add(pathKey(file.path))
   }
   return paths.size
+}
+
+/**
+ * 单一「可撤销」判定（H1 归一）：轮尾卡片与侧栏 tab 共用同一份条件集，
+ * 不再各自维护——mode-only fs 条目、fs 整文件形状（added/deleted）、目录
+ * 条目、完整可回放的 hunk 序列，四种可逆形态只在这里写一遍。
+ */
+export function reversibleOf(file: {
+  readonly path: string
+  readonly diffs: readonly ProducedFileDiff[]
+  readonly origin?: 'fs'
+  readonly dir?: boolean
+}): boolean {
+  // 目录条目天生可逆（mkdir/rmdir 互逆），占位形态即可判定。
+  if (file.dir === true) return true
+  // mode-only fs 条目：内容两侧相同、权限位不同——开关动作是一次裸 chmod。
+  if (file.origin === 'fs' && file.diffs.length === 1) {
+    const only = file.diffs[0]
+    if (only !== undefined && only.path === file.path
+      && only.oldText !== null && only.oldText === only.newText
+      && only.oldMode !== undefined && only.newMode !== undefined
+      && only.oldMode !== only.newMode) {
+      return true
+    }
+  }
+  // fs 整文件形状：单条 diff，要么新增（无旧侧），要么删除（新侧为空）。
+  if (file.diffs.length === 1) {
+    const only = file.diffs[0]
+    if (only !== undefined && only.path === file.path
+      && (only.oldText === null || (only.newText === '' && only.oldText !== ''))) {
+      return true
+    }
+  }
+  // 通用：hunks 完整可逆（宿主按行锚点回放）。
+  return file.diffs.length > 0 && file.diffs.every(diff =>
+    diff.path === file.path
+    && diff.oldText !== null
+    && diff.oldText !== diff.newText
+    && (diff.oldText !== '' || diff.oldStart !== undefined)
+    && (diff.newText !== '' || diff.newStart !== undefined))
 }
 
 /** 路径末段——一眼就能认出文件的那一部分。 */
 export function basename(path: string): string {
   const at = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
   return at === -1 ? path : path.slice(at + 1)
+}
+
+/**
+ * J4：列表层路径比较键——反斜杠统一成正斜杠。工具参数可能是 Windows
+ * 反斜杠相对路径，fs 条目恒为正斜杠（服务端 path-utils 语义）；裸 ===
+ * 会把同一文件劈成两行、+/− 统计减半。大小写不折叠：POSIX 区分大小写，
+ * 误并两个文件比漏并一个更危险。
+ */
+export function pathKey(path: string): string {
+  return path.replace(/\\/g, '/')
 }
 
 /** 绝对路径判定：POSIX 根、盘符根或 UNC 前缀，分隔符无关。 */
@@ -388,4 +445,33 @@ export function resolveSessionPath(cwd: string | undefined, path: string): strin
   if (base === '') return path
   const separator = base.includes('\\') ? '\\' : '/'
   return `${base.replace(/[\\/]+$/, '')}${separator}${path}`
+}
+
+/**
+ * 合并工具侧条目与检查点 fs 条目为「每路径一行」，轮尾卡片与 live 条共用。
+ *
+ * 路径键用 pathKey 归一（J4：Windows 反斜杠与 fs 正斜杠是同一文件）。工具
+ * 条目优先——它带着精确 hunk，也是「回滚本轮 AI 更改」的范围来源；仅当工具
+ * 条目不可逆（典型：本轮新建 write(oldText=null) 后同轮又被 edit 修改，混合
+ * hunk 宿主无法回放、+/− 也虚增成 +6 −3）而存在检查点 fs 条目时，改用 fs
+ * 净条目：它的计数是「本轮相对轮起的净变化」（新建 = 最终行数而非 hunk 累加），
+ * 撤销语义也正确（新建撤销 = 删除文件）。
+ */
+export function mergeToolFsEntries(
+  tool: readonly ProducedFileReview[],
+  fs: readonly ProducedFileReview[],
+): readonly ProducedFileReview[] {
+  if (fs.length === 0) return tool
+  const byKey = new Map<string, ProducedFileReview>()
+  for (const entry of tool) {
+    const key = pathKey(entry.path)
+    if (!byKey.has(key)) byKey.set(key, entry)
+  }
+  for (const entry of fs) {
+    const key = pathKey(entry.path)
+    const existing = byKey.get(key)
+    if (existing === undefined) { byKey.set(key, entry); continue }
+    if (!reversibleOf(existing)) byKey.set(key, entry)
+  }
+  return [...byKey.values()]
 }

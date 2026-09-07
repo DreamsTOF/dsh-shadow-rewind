@@ -29,6 +29,8 @@ export declare function writeCaptureCache(path: string, cache: CaptureCache): Pr
  * 影子仓库被外部清理。缺失即无操作。
  */
 export declare function clearCaptureCache(path: string): Promise<void>;
+/** 缓存校验和的唯一实现（capture.ts 写侧共用，K8 归一）。 */
+export declare function checksumOf(paths: Record<string, CacheEntry>): string;
 /** 从扫描事实生成缓存记录（blob 由调用方在实际读到内容后补充）。 */
 export declare function cacheEntryOf(file: ScannedPath, blob?: string, target?: string): CacheEntry;
 /** stat 指纹比对：缓存记录 vs 扫描事实。 */

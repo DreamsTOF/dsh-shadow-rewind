@@ -3,10 +3,8 @@
  * `ctx.shadowRewind`，供其它插件消费。
  */
 import { ShadowRewindEngine } from './engine.js';
-import { CommandWindowRegistry } from './command-windows.js';
 import type { AgentFace, HostContext } from './rewind-host.js';
 import type { RestorePointSummary, ShadowRewindConfig } from './types.js';
-import { WorkspaceWriteGate } from './write-gate.js';
 export * from './char-highlight.js';
 export * from './engine.js';
 export * from './errors.js';
@@ -50,13 +48,13 @@ interface PluginContext {
 export declare class ShadowRewindService {
     readonly engine: ShadowRewindEngine;
     private readonly coordinator;
-    /** 写入闸（「以当前为准」）；恒常构造，config.writeGate 只决定初始开关。 */
-    readonly writeGate: WorkspaceWriteGate;
-    /** 命令窗口注册表（写盘归因）：窗口持久化到存储目录，重启归因不降级。 */
-    readonly commandWindows: CommandWindowRegistry;
+    /** 设置卡片桥：异步装配（schemasty/settings 服务经宿主解析），到位前为
+     * undefined——HTTP handler 闭包运行时读取，桥缺席时 config 端点按只读
+     * 降级（ABSORB-RECALL 1.2）。 */
+    private settingsBridge?;
     constructor(ctx: PluginContext, config?: ShadowRewindConfig);
-    /** 等待启动恢复完成。 */
-    initialize(): Promise<number>;
+    /** 等待启动装配完成。 */
+    initialize(): Promise<void>;
     /** 手动创建恢复点。 */
     create(options: Parameters<ShadowRewindEngine['create']>[0]): Promise<RestorePointSummary>;
     /** 手动触发一个回合检查点（通常由协调器自动完成）。 */
@@ -73,9 +71,7 @@ export declare class ShadowRewindService {
     applyRestore(options: Parameters<ShadowRewindEngine['applyRestore']>[0]): ReturnType<ShadowRewindEngine['applyRestore']>;
     /** 撤销该工作区最近一次恢复（进程内单次 undo，重启失效）。 */
     undoLastRestore(options: Parameters<ShadowRewindEngine['undoLastRestore']>[0]): ReturnType<ShadowRewindEngine['undoLastRestore']>;
-    /** 删除恢复点（confirmation 必须逐字等于 `DELETE <id>`）。 */
+    /** 删除恢复点（被进程内 undo 记录引用的 rescue 点拒绝删除）。 */
     delete(options: Parameters<ShadowRewindEngine['delete']>[0]): ReturnType<ShadowRewindEngine['delete']>;
-    /** 列出中断/需人工介入的恢复操作。 */
-    listRecovery(options: Parameters<ShadowRewindEngine['listRecovery']>[0]): ReturnType<ShadowRewindEngine['listRecovery']>;
 }
 export default ShadowRewindService;

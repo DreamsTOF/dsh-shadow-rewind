@@ -3,12 +3,11 @@ import type { ConversationNodeDefinition } from '@deepseek-ai/dsh-client-ui-conv
 import type { MarkdownFileMentions } from '@deepseek-ai/dsh-client-ui-primitives';
 import type { ProducedFileDiff, ProducedFileReview } from '../file-review/change-types.ts';
 export type { ProducedFileDiff, ProducedFileReview } from '../file-review/change-types.ts';
-/** 同轮内的终端命令删掉了这个路径（仅展示，不能撤销）。 */
+/** 同轮内产出过的一个路径（按首次出现）。 */
 interface ProducedPath {
     readonly seq: number;
     readonly path: string;
     readonly diffs: readonly ProducedFileDiff[];
-    readonly deleted?: true;
 }
 /** 针对某一 Turn 发布的不可变产出文件事实。 */
 export interface DeliverablesTurnData {
@@ -20,12 +19,11 @@ declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
         deliverables: DeliverablesTurnData;
     }
 }
-/** One `tool/call` 的派生意图：路径 + 意图 hunks + 终端删除路径。 */
+/** One `tool/call` 的派生意图：路径 + 意图 hunks。 */
 interface CallIntent {
     readonly path: string | null;
     /** 结果 meta 缺失时的回退 hunks（write/edit/str_replace_editor 的参数直译）。 */
     readonly intended: readonly ProducedFileDiff[];
-    readonly deletions: readonly string[];
 }
 interface DeliverablesState extends DeliverablesTurnData {
     readonly turn: number;

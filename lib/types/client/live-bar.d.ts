@@ -3,6 +3,7 @@ import type { ISessions, SessionSnapshot } from '@deepseek-ai/dsh-api-session-co
 import type { SessionId } from '@deepseek-ai/dsh-session/types';
 import type { InputState } from '@deepseek-ai/dsh-client-ui-conversation/client';
 import type { UseChat } from '@deepseek-ai/dsh-client-ui-chat/client';
+import type { Context } from '@deepseek-ai/cordis';
 import type { NS } from './chat-locales.ts';
 /**
  * Owner share of the input-zone slot（dsh 0.1.2 `InputZone`：会话生命周期
@@ -22,7 +23,7 @@ export type LiveChangesBarProps = LiveBarOwner & {
 } & PropsLocale<typeof NS>;
 /** 由 applyFileReview 调用一次，让 live 条能解析出会话工作区目录。 */
 export declare function bindLiveBarSessions(sessions: ISessions): void;
-/** 由 applyFileReview 调用一次，让点击行能在侧边栏打开审计。 */
-export declare function bindLiveBarOpenSidebar(opener: (sessionId: string, paths: readonly string[], turn?: number) => void): void;
+/** 由 applyFileReview 调用一次：行内撤销与新界面都经客户端上下文调宿主服务。 */
+export declare function bindLiveBarContext(ctx: Context): void;
 export declare function LiveChangesBar({ session, sessionId, useChat, t }: LiveChangesBarProps): import("react").JSX.Element | null;
 export {};

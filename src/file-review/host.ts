@@ -32,6 +32,9 @@ interface PostExecuteResult {
 type PostExecuteDecision = { readonly kind: string }
 type PostExecuteNext = () => Promise<PostExecuteDecision>
 
+/** 录制白名单：只认真实的文件修改工具，杜绝「返回该形状的非文件工具被误录」。 */
+const FILE_TOOL_NAMES: ReadonlySet<string> = new Set(['write', 'edit', 'str_replace_editor'])
+
 /** systemPrompt 服务注册面（结构类型，避免与具体 dsh 版本的类型包强耦合）。 */
 interface SystemPromptSection {
   section(section: { readonly name: string; readonly order: number; readonly text: string }): unknown
@@ -79,8 +82,10 @@ export function installFileReviewHost(
       const decision = await next()
       if (decision.kind !== 'accept') return decision
       // 模型直接发起的修改已经能通过会话视图审查；只有嵌套派发（run_code
-      // 子调用）需要宿主侧录制。按结果形状识别（{path, before, after}），不认工具名。
+      // 子调用）需要宿主侧录制。按结果形状 {path, before, after} 识别，且
+      // 限定在已知文件工具名内——返回同形状的非文件工具（误录边界）被排除。
       if (exec.parent === undefined || exec.agent === undefined) return decision
+      if (!FILE_TOOL_NAMES.has(exec.name)) return decision
       const value = result.value
       if (typeof value !== 'object' || value === null || Array.isArray(value)) return decision
       const candidate = value as { path?: unknown; before?: unknown; after?: unknown }

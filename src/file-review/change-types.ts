@@ -63,10 +63,14 @@ export interface FileReviewChange {
   readonly dirKind?: 'added' | 'deleted'
 }
 
-/** 对宿主的状态巡检请求，或一次带方向的开关请求。 */
+/** 对宿主的状态巡检请求，或一次带方向的开关请求。
+ * `force`（EXPECTED-DESIGN 1.2）：用户在冲突弹窗显式授权「全部回滚」后的
+ * 强制开关——绕过逐条目 CAS 失配闸（覆盖用户的二次修改），但定位失败
+ * （锚点找不到）仍如实报 conflict，进二次回滚清单。 */
 export interface FileReviewRequest {
   readonly action: FileReviewAction
   readonly files: readonly FileReviewChange[]
+  readonly force?: boolean
 }
 
 /** 一个文件与「本轮录制到的变更」之间的当前关系。

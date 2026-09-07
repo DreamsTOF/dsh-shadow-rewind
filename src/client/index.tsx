@@ -4,9 +4,10 @@
  *
  * 1. 会话回退面（rewind.ts）：每条直发用户消息旁的「恢复到发送之前」按钮、
  *    恢复预览对话框与「恢复并从新会话继续」分叉流程（jj 影子仓库引擎）；
- * 2. 文件审查面（file-review.tsx，自 dsh-file-review-tab 移植）：聊天轮尾的
- *    产物卡片、dsh-better-sidebar 的「文件审查」tab（逐轮 diff + 块级
- *    撤销/保留 + 每轮快照恢复）、以及最终回复里的行内文件提及。
+ * 2. 文件审查面（file-review.tsx，自 dsh-file-review-tab 移植）：会话累计
+ *    live 条（行内撤销/重做 + 「审查」入口）、文件审查全屏界面
+ *    （AuditOverlay：逐轮 diff + 块级撤销/保留 + 每轮快照恢复）、
+ *    以及最终回复里的行内文件提及。
  *
  * 两个面互相独立、语义互补：hunk 撤销/重做提供块级粒度，会话回退提供
  * 「回到任意消息之前」的整树恢复。
@@ -15,6 +16,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { applyFileReview } from './file-review.tsx'
 import { rewindApply } from './rewind.ts'
 import { timelineApply } from './timeline-panel.tsx'
+import { settingsApply } from './settings-card.tsx'
 
 /**
  * 两个子面的 inject 并集：sessions（会话快照）、locale（词典）、remote
@@ -32,9 +34,10 @@ export const inject = [
   'conversation',
 ]
 
-/** 客户端插件主体：挂载 rewind 面、时间线面板与文件审查面。 */
+/** 客户端插件主体：挂载 rewind 面、时间线面板、文件审查面与设置卡片。 */
 export function apply(ctx: Context): void {
   rewindApply(ctx)
   timelineApply(ctx)
   applyFileReview(ctx)
+  settingsApply(ctx)
 }

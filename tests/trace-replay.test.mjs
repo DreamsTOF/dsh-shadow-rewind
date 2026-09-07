@@ -16,6 +16,7 @@ import {
   contentOps,
   MUTATING_CONTENT_TOOLS,
   toolResultError,
+  traceBaselinePaths,
   traceNodes,
   traceRangeDiff,
   traceSpans,
@@ -309,4 +310,37 @@ test('trace 端点：时间线面（节点 + 检查点摘要）与轨迹区间�
     await rm(workspace, { recursive: true, force: true })
     await rm(storageDir, { recursive: true, force: true })
   }
+})
+
+// ── B1：重放基线——「会话前就存在」的文件不再标成 added ─────────────────────
+
+test('B1：baseline 注入后，区间内写入的既有文件判 modified 而非 added', () => {
+    // edit 既有文件 pre.txt：会话前就存在（基线内容 hello），此前因无基线
+  // 会标 added 且 str_replace 无法命中锚点。
+  const events = [
+    { type: 'turn/start', seq: 10, data: { turn: 1 } },
+    call(11, 'str_replace_editor', { path: 'pre.txt', command: 'str_replace', old_str: 'hello', new_str: 'world' }),
+    result(12, 'c11'),
+  ]
+  const baseline = new Map([['pre.txt', 'hello\n']])
+  const withBaseline = traceRangeDiff(events, 11, 12, { baseline })
+  assert.equal(withBaseline.changes.length, 1)
+  const change = withBaseline.changes[0]
+  assert.equal(change.path, 'pre.txt')
+  assert.equal(change.kind, 'modified', '既有文件的区间内写入必须是 modified')
+  assert.equal(change.before, 'hello\n', '基线内容作为旧侧（此前为 null）')
+  // 无基线时保持原语义：str_replace 在空重放图上无法命中锚点 →
+  // 「漂移跳过」，区间 diff 为空——这正是 B1 要消除的盲区。
+  const withoutBaseline = traceRangeDiff(events, 11, 12)
+  assert.equal(withoutBaseline.changes.length, 0, '无基线时 str_replace 漂移跳过')
+  assert.ok(withoutBaseline.notes.some(note => note.includes('漂移')), '漂移必须记 notes')
+})
+
+test('B1：traceBaselinePaths 只收集内容型工具触碰过的路径', () => {
+    const events = [
+    { type: 'tool/call', seq: 1, data: { name: 'write', arguments: JSON.stringify({ file_path: 'a.txt', content: 'x' }) } },
+    { type: 'tool/call', seq: 2, data: { name: 'read', arguments: JSON.stringify({ path: 'b.txt' }) } },
+    { type: 'tool/call', seq: 3, data: { name: 'bash', arguments: JSON.stringify({ command: 'rm c.txt' }) } },
+  ]
+  assert.deepEqual(traceBaselinePaths(events), ['a.txt'])
 })

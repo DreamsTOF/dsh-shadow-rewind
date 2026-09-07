@@ -15,16 +15,16 @@ import type {
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { MarkdownFileMentions } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ProducedFileDiff, ProducedFileReview } from '../file-review/change-types.ts'
-import { deletedPathsFromCall } from './deleted-paths.ts'
+import { coalesceCreatedFileDiffs } from './recorded-diffs.ts'
+import { pathKey } from './session-changes.ts'
 
 export type { ProducedFileDiff, ProducedFileReview } from '../file-review/change-types.ts'
 
-/** 同轮内的终端命令删掉了这个路径（仅展示，不能撤销）。 */
+/** 同轮内产出过的一个路径（按首次出现）。 */
 interface ProducedPath {
   readonly seq: number
   readonly path: string
   readonly diffs: readonly ProducedFileDiff[]
-  readonly deleted?: true
 }
 
 /** 针对某一 Turn 发布的不可变产出文件事实。 */
@@ -39,12 +39,11 @@ declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
   }
 }
 
-/** One `tool/call` 的派生意图：路径 + 意图 hunks + 终端删除路径。 */
+/** One `tool/call` 的派生意图：路径 + 意图 hunks。 */
 interface CallIntent {
   readonly path: string | null
   /** 结果 meta 缺失时的回退 hunks（write/edit/str_replace_editor 的参数直译）。 */
   readonly intended: readonly ProducedFileDiff[]
-  readonly deletions: readonly string[]
 }
 
 interface DeliverablesState extends DeliverablesTurnData {
@@ -81,7 +80,7 @@ function mutationIntent(name: string, argsRaw: string): CallIntent | null {
       const path = pathValue(args.file_path)
       const content = args.content
       if (path === null || typeof content !== 'string') return null
-      return { path, intended: [{ path, oldText: null, newText: content }], deletions: [] }
+      return { path, intended: [{ path, oldText: null, newText: content }] }
     }
     case 'edit': {
       const path = pathValue(args.file_path)
@@ -90,13 +89,13 @@ function mutationIntent(name: string, argsRaw: string): CallIntent | null {
         || oldString === '' || oldString === newString) {
         return null
       }
-      return { path, intended: [{ path, oldText: oldString, newText: newString }], deletions: [] }
+      return { path, intended: [{ path, oldText: oldString, newText: newString }] }
     }
     case 'str_replace_editor': {
       const path = pathValue(args.path)
       if (path === null) return null
       if (args.command === 'create' && typeof args.file_text === 'string') {
-        return { path, intended: [{ path, oldText: null, newText: args.file_text }], deletions: [] }
+        return { path, intended: [{ path, oldText: null, newText: args.file_text }] }
       }
       if (args.command === 'str_replace'
         && typeof args.old_str === 'string' && typeof args.new_str === 'string'
@@ -104,14 +103,12 @@ function mutationIntent(name: string, argsRaw: string): CallIntent | null {
         return {
           path,
           intended: [{ path, oldText: args.old_str, newText: args.new_str }],
-          deletions: [],
         }
       }
-      return { path, intended: [], deletions: [] }
+      return { path, intended: [] }
     }
     default:
-      // 终端工具：rm 族参数的字面删除路径（display-only，无 hunks）。
-      return { path: null, intended: [], deletions: deletedPathsFromCall(name, argsRaw) }
+      return null
   }
 }
 
@@ -160,27 +157,28 @@ export function reviewsForClosing(
   seq = Number.POSITIVE_INFINITY,
 ): readonly ProducedFileReview[] {
   if (data === undefined) return []
-  const reviews: Array<{ path: string; diffs: ProducedFileDiff[]; deleted?: true }> = []
-  const byPath = new Map<string, { path: string; diffs: ProducedFileDiff[]; deleted?: true }>()
+  const reviews: Array<{ path: string; diffs: ProducedFileDiff[] }> = []
+  const byPath = new Map<string, { path: string; diffs: ProducedFileDiff[] }>()
   for (const produced of data.produced) {
     if (produced.seq > seq) continue
-    const review = byPath.get(produced.path)
+    // J4：路径键归一（同轮工具调用路径拼写不一致也只留一行，展示取首次形态）。
+    const key = pathKey(produced.path)
+    const review = byPath.get(key)
     if (review === undefined) {
       const created = {
         path: produced.path,
         diffs: [...produced.diffs],
-        ...(produced.deleted === true ? { deleted: true as const } : {}),
       }
-      byPath.set(produced.path, created)
+      byPath.set(key, created)
       reviews.push(created)
     } else {
       review.diffs.push(...produced.diffs)
-      // 以最后一个状态为准：删除把条目标成 deleted，之后同轮内又被写回
-      // （文件被重建）则清掉该标记。
-      if (produced.deleted === true) review.deleted = true
-      else delete review.deleted
     }
   }
+  // 「新建后同轮又修改」收敛成单条 added（净内容）：混合 hunk 序列既把 +/−
+  // 虚增成编辑毛量（write +3 后 3 次 edit 各 −1 +1 → +6 −3），又因含
+  // oldText=null 的创建 hunk 而不可逆（宿主无法回放）。
+  for (const review of reviews) review.diffs = [...coalesceCreatedFileDiffs(review.diffs)]
   return reviews
 }
 
@@ -206,17 +204,13 @@ export function producedForClosing(
   if (data === undefined) return []
   const paths: string[] = []
   const seen = new Set<string>()
-  const lastDeleted = new Map<string, boolean>()
   for (const produced of data.produced) {
     if (produced.seq > seq) continue
-    lastDeleted.set(produced.path, produced.deleted === true)
     if (seen.has(produced.path)) continue
     seen.add(produced.path)
     paths.push(produced.path)
   }
-  // 删除路径没有可打开的文件：即使同轮早些时候的 write 记过它，也不进提及
-  // 词汇。
-  return paths.filter(path => lastDeleted.get(path) !== true)
+  return paths
 }
 
 /**
@@ -259,28 +253,17 @@ export const deliverablesDefinition: ConversationNodeDefinition<DeliverablesStat
     const intent = context.state.calls.get(callId)
     if (intent === undefined || intent === null) return context.state
     // 落地 hunks 优先（meta.diffs = 工具执行时的真实前后文），意图 hunks 兜底
-    // （旧日志/无 meta 工具）；两者都没有但有删除路径时只记 deleted 条目。
+    // （旧日志/无 meta 工具）。
     const applied = producedDiffs(match.event.data.meta)
     const diffs = applied.length > 0 ? applied : intent.intended
     const seq = match.event.seq
-    const additions: ProducedPath[] = []
-    if (intent.path !== null) {
-      additions.push({
-        seq,
-        path: intent.path,
-        diffs: diffs.filter(diff => diff.path === intent.path),
-      })
+    if (intent.path === null) return context.state
+    const addition: ProducedPath = {
+      seq,
+      path: intent.path,
+      diffs: diffs.filter(diff => diff.path === intent.path),
     }
-    // dsh 只通过终端删文件；一次成功终端调用里字面 rm 系列参数就是唯一的
-    // 删除记录（dsh 没有「删除文件」工具）。它们与带 hunks 的路径进入同一套
-    // produced 词汇：无 diffs，永不撤销。
-    for (const path of intent.deletions) {
-      if (additions.some(addition => addition.path === path)) continue
-      additions.push({ seq, path, diffs: [], deleted: true })
-    }
-    return additions.length === 0
-      ? context.state
-      : { ...context.state, produced: [...context.state.produced, ...additions] }
+    return { ...context.state, produced: [...context.state.produced, addition] }
   },
   buildLocationData: (context, scope, previous) => {
     if (scope !== 'turn' || context.state === undefined) return null

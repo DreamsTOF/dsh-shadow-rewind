@@ -13,6 +13,13 @@ import { diffContentLines } from './diff-text.ts'
 /** 每个改动run 前后保留的未变更行数（对齐 unified diff 的观感）。 */
 const CONTEXT_LINES = 3
 
+/** 与宿主 hunk 数学同一基准的换行归一（file-review-service 的 normalizeNewlines
+ * 语义）：录制的 before/after 是原始文件字节，CRLF 文件不归一会让每一行行尾
+ * 带 \r 进入 hunk，宿主在 LF 文本上做锚点匹配永远失配（表现为假「内容冲突」）。 */
+function normalizeLf(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+}
+
 /** 重建中的 hunk：两侧各自的行数组 + 各自的起始行号。 */
 interface Hunk {
   readonly oldStart: number
@@ -37,12 +44,17 @@ function trailingContext(hunk: Hunk): number {
  * 条目（与 write 工具的 null 内容卡片同形）。变更没有实际改动文件时返回 []。
  */
 export function diffsFromBeforeAfter(
-  path: string,
-  before: string | null,
-  after: string,
+  rawPath: string,
+  rawBefore: string | null,
+  rawAfter: string,
 ): readonly ProducedFileDiff[] {
+  const path = rawPath
+  const before = rawBefore === null ? null : normalizeLf(rawBefore)
+  const after = normalizeLf(rawAfter)
   if (before === null) {
-    return after === '' ? [] : [{ path, oldText: null, newText: after }]
+    // 空文件也是一次真实变更：与 write 工具的 null + '' 同形（added，
+    // 撤销=删除），不得静默丢弃。
+    return [{ path, oldText: null, newText: after }]
   }
   const oldLines = diffContentLines(before)
   const newLines = diffContentLines(after)
@@ -128,4 +140,66 @@ export function diffsFromBeforeAfter(
       oldStart: hunkEntry.oldStart,
       newStart: hunkEntry.newStart,
     }))
+}
+
+/** 第 `line` 行（1-based）在文本中的起始偏移；越界返回 null。 */
+function offsetAtLine(text: string, line: number): number | null {
+  if (!Number.isInteger(line) || line < 1) return null
+  if (line === 1) return 0
+  let offset = 0
+  for (let current = 1; current < line; current += 1) {
+    const next = text.indexOf('\n', offset)
+    if (next === -1) return null
+    offset = next + 1
+  }
+  return offset
+}
+
+/** 在 `text` 上正向回放一个编辑 hunk（oldText → newText，与宿主 replaceHunk
+ * 同一锚点语义）；定位失败返回 null，调用方保守回退，绝不猜。 */
+function replayHunkOnText(text: string, diff: ProducedFileDiff): string | null {
+  const { oldText, newText } = diff
+  if (oldText === null) return null
+  let offset: number
+  if (diff.oldStart !== undefined) {
+    const located = offsetAtLine(text, diff.oldStart)
+    if (located === null || text.slice(located, located + oldText.length) !== oldText) return null
+    offset = located
+  } else {
+    if (oldText === '') return null
+    const at = text.indexOf(oldText)
+    if (at === -1 || text.indexOf(oldText, at + 1) !== -1) return null
+    offset = at
+  }
+  return text.slice(0, offset) + newText + text.slice(offset + oldText.length)
+}
+
+/**
+ * 「本轮新建 + 同轮又被修改」的 hunk 收敛：序列里含创建 hunk（oldText=null）
+ * 时，文件相对轮起的净变化就是「以最终内容新建」——从**最后一个**创建 hunk
+ * 出发（更早的历史被整体覆盖，无关紧要），把后续编辑 hunk 顺序回放，收敛成
+ * 单条 added 整文件形状：统计 = 最终行数（而非 hunk 累加的 +6 −3），撤销
+ * 语义恢复为「删除文件」（混合 hunk 宿主无法回放，原本连撤销按钮都没有）。
+ * 回放失配（锚点对不上）保守返回原序列——宁可保持现状，绝不猜出一个错误内容。
+ * TODO: 天花板是「失配条目只能原样保留」；升级路径是把失配标注 degraded，
+ * 交给检查点 fs 条目兜底（若该轮有捕获）。
+ */
+export function coalesceCreatedFileDiffs(diffs: readonly ProducedFileDiff[]): readonly ProducedFileDiff[] {
+  if (diffs.length <= 1) return diffs
+  let baseIndex = -1
+  for (let index = diffs.length - 1; index >= 0; index -= 1) {
+    if (diffs[index]?.oldText === null) { baseIndex = index; break }
+  }
+  if (baseIndex === -1) return diffs
+  const base = diffs[baseIndex]
+  if (base === undefined) return diffs
+  let text = base.newText
+  for (let index = baseIndex + 1; index < diffs.length; index += 1) {
+    const diff = diffs[index]
+    if (diff === undefined) return diffs
+    const next = replayHunkOnText(text, diff)
+    if (next === null) return diffs
+    text = next
+  }
+  return [{ path: base.path, oldText: null, newText: text }]
 }

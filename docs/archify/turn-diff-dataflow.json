@@ -1,0 +1,347 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "每轮 diff 数据流：从事件信号到轮尾卡片",
+    "locale": "zh-CN",
+    "output": "C:/code/dsh-shadow-rewind/docs/src/diagrams/turn-diff-dataflow.html",
+    "viewBox": [
+      1080,
+      520
+    ],
+    "quality_profile": "showcase"
+  },
+  "stages": [
+    {
+      "label": "触发"
+    },
+    {
+      "label": "捕获"
+    },
+    {
+      "label": "持久化"
+    },
+    {
+      "label": "对比"
+    },
+    {
+      "label": "呈现"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "prestep",
+      "type": "messagebus",
+      "label": "轮起信号",
+      "sublabel": "agent/pre-step · step 1",
+      "stage": 0,
+      "row": 0,
+      "tag": "start",
+      "width": 150
+    },
+    {
+      "id": "turnend",
+      "type": "messagebus",
+      "label": "轮末信号",
+      "sublabel": "session/event · turn/end",
+      "stage": 0,
+      "row": 1,
+      "tag": "end",
+      "width": 150
+    },
+    {
+      "id": "scan",
+      "type": "backend",
+      "label": "目录扫描",
+      "sublabel": "scanWorkspace · 排除规则",
+      "stage": 1,
+      "row": 0,
+      "width": 150
+    },
+    {
+      "id": "capture",
+      "type": "backend",
+      "label": "稳定读取 + 增量判定",
+      "sublabel": "captureSnapshot · 稳定读取",
+      "stage": 1,
+      "row": 1,
+      "tag": "核心",
+      "width": 150
+    },
+    {
+      "id": "statcache",
+      "type": "database",
+      "label": "stat 指纹缓存",
+      "sublabel": "stat-cache.json · 未变零重读",
+      "stage": 1,
+      "row": 2,
+      "width": 150
+    },
+    {
+      "id": "jjcommit",
+      "type": "database",
+      "label": "影子 jj commit",
+      "sublabel": "镜像 + 40 位 commitId",
+      "stage": 2,
+      "row": 0,
+      "width": 150
+    },
+    {
+      "id": "manifest",
+      "type": "database",
+      "label": "manifest 清单",
+      "sublabel": "entries · treeHash",
+      "stage": 2,
+      "row": 1,
+      "width": 150
+    },
+    {
+      "id": "sqlitedb",
+      "type": "database",
+      "label": "content.db blob",
+      "sublabel": "node:sqlite 内容寻址",
+      "stage": 2,
+      "row": 2,
+      "tag": "降级",
+      "width": 150
+    },
+    {
+      "id": "pairdiff",
+      "type": "backend",
+      "label": "轮配对 + diffTrees",
+      "sublabel": "轮起↔轮末 · live-tail",
+      "stage": 3,
+      "row": 0,
+      "tag": "核心",
+      "width": 150
+    },
+    {
+      "id": "attrib",
+      "type": "backend",
+      "label": "窗口归因",
+      "sublabel": "attributePaths · 会话网格",
+      "stage": 3,
+      "row": 2,
+      "width": 150
+    },
+    {
+      "id": "http",
+      "type": "backend",
+      "label": "/shadow-rewind 端点",
+      "sublabel": "fs-changes · trace · 预览",
+      "stage": 4,
+      "row": 0,
+      "width": 150
+    },
+    {
+      "id": "client",
+      "type": "frontend",
+      "label": "轮尾卡片 / 侧边栏",
+      "sublabel": "行数先行 · 全文懒取",
+      "stage": 4,
+      "row": 2,
+      "width": 150
+    }
+  ],
+  "flows": [
+    {
+      "id": "start-trigger",
+      "from": "prestep",
+      "to": "scan",
+      "label": "轮起",
+      "classification": "自动检查点",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        168,
+        214
+      ]
+    },
+    {
+      "id": "end-trigger",
+      "from": "turnend",
+      "to": "scan",
+      "label": "轮末",
+      "classification": "自动检查点",
+      "route": "vertical-channel",
+      "channelX": 222,
+      "labelAt": [
+        244,
+        222
+      ]
+    },
+    {
+      "id": "paths-fact",
+      "from": "scan",
+      "to": "capture",
+      "label": "路径事实",
+      "classification": "lstat 指纹",
+      "labelAt": [
+        330,
+        210
+      ]
+    },
+    {
+      "id": "cache-sync",
+      "from": "capture",
+      "to": "statcache",
+      "label": "命中复用·写回",
+      "classification": "persist 模式",
+      "variant": "dashed",
+      "labelAt": [
+        330,
+        324
+      ]
+    },
+    {
+      "id": "new-content-jj",
+      "from": "capture",
+      "to": "jjcommit",
+      "label": "新内容镜像",
+      "classification": "仅 newContent",
+      "variant": "emphasis",
+      "labelAt": [
+        438,
+        200
+      ]
+    },
+    {
+      "id": "entries-manifest",
+      "from": "capture",
+      "to": "manifest",
+      "label": "清单",
+      "classification": "原子写",
+      "labelAt": [
+        430,
+        288
+      ]
+    },
+    {
+      "id": "new-content-sqlite",
+      "from": "capture",
+      "to": "sqlitedb",
+      "label": "blob 入库",
+      "classification": "降级路径",
+      "variant": "dashed",
+      "labelAt": [
+        420,
+        340
+      ],
+      "via": [
+        [
+          398,
+          271
+        ],
+        [
+          398,
+          385
+        ]
+      ],
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "commitid-manifest",
+      "from": "jjcommit",
+      "to": "manifest",
+      "label": "commitId",
+      "classification": "读回地址",
+      "labelAt": [
+        545,
+        210
+      ]
+    },
+    {
+      "id": "manifest-pair",
+      "from": "manifest",
+      "to": "pairdiff",
+      "label": "两侧 entries",
+      "classification": "轮配对",
+      "labelAt": [
+        652,
+        214
+      ]
+    },
+    {
+      "id": "manifest-attrib",
+      "from": "manifest",
+      "to": "attrib",
+      "label": "后续快照",
+      "classification": "listSnapshotsAfter",
+      "variant": "dashed",
+      "labelAt": [
+        650,
+        324
+      ]
+    },
+    {
+      "id": "changes-http",
+      "from": "pairdiff",
+      "to": "http",
+      "label": "changes",
+      "classification": "计数先行",
+      "variant": "emphasis",
+      "labelAt": [
+        852,
+        105
+      ]
+    },
+    {
+      "id": "owner-http",
+      "from": "attrib",
+      "to": "http",
+      "label": "归属标签",
+      "classification": "建议标签",
+      "variant": "dashed",
+      "route": "vertical-channel",
+      "channelX": 847,
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        852,
+        300
+      ]
+    },
+    {
+      "id": "json-client",
+      "from": "http",
+      "to": "client",
+      "label": "同源 JSON",
+      "classification": "fetch",
+      "variant": "emphasis",
+      "labelAt": [
+        960,
+        250
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "轮配对语义",
+      "items": [
+        "第 N 轮 = diff(轮起, 轮末)",
+        "无轮末回退下一轮轮起",
+        "live-tail 覆盖进行中回合"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "增量与去重",
+      "items": [
+        "stat 指纹未变零重读",
+        "命中前校验内容仍存在",
+        "缓存损坏整体作废"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "诚实标注",
+      "items": [
+        "skippedPaths 显式记录",
+        "degraded 抽样标注",
+        "归属仅建议标签"
+      ]
+    }
+  ]
+}

@@ -1,50 +1,18 @@
-import { WorkspaceStore } from './store.js';
-import type { TurnIntent } from './types.js';
-import { type ResolvedShadowRewindConfig, type RestorePlan, type RestorePointKind, type RestorePointSummary, type RestoreResult, type RestoreUndoResult, type ShadowRewindConfig, type SkippedPath, type SnapshotEntry, type WorkspaceChange } from './types.js';
-/** 默认排除清单：VCS 目录、依赖、构建产物与常见缓存（自用取向：宁多勿漏）。 */
-export declare const DEFAULT_EXCLUDES: readonly string[];
-/** 解析配置：全部字段落定；非法值直接抛错（宁可拒绝启动也不带病运行）。 */
-export declare function resolveConfig(config: ShadowRewindConfig): ResolvedShadowRewindConfig;
+import type { LineageEntry } from './store.js';
+import type { WorkspaceChange } from './types.js';
+import { type RestorePlan, type RestorePointKind, type RestorePointSummary, type RestoreResult, type RestoreUndoProbe, type RestoreUndoResult, type ShadowRewindConfig, type SkippedPath, type TurnIntent, type RestorePlanId } from './types.js';
+import { ShadowRewindEngineBase } from './engine-base.js';
+export { DEFAULT_EXCLUDES, resolveConfig } from './engine-config.js';
+export { isCheckpointSkipCode } from './engine-helpers.js';
 /** 引擎实例：一个插件进程共享一个（配置驱动，无隐藏全局状态）。 */
-export declare class ShadowRewindEngine {
-    readonly config: ResolvedShadowRewindConfig;
-    readonly store: WorkspaceStore;
-    /** 启动恢复完成后的信号（恢复条数）。 */
-    readonly ready: Promise<number>;
-    /**
-     * 实际生效的内容后端：配置为 jj 但宿主机缺 CLI 时自动降级为内置
-     * SQLite 内容库（自动检查点不断档）；显式配置 sqlite/off 不受影响。
-     */
-    readonly effectiveBackend: 'jj' | 'sqlite';
-    /** 降级原因（未降级时为 undefined）。 */
-    readonly downgradeReason?: string;
-    private readonly excludes;
+export declare class ShadowRewindEngine extends ShadowRewindEngineBase {
     private readonly plans;
     private readonly applying;
-    private readonly shadowRepos;
     /** 恢复后单次撤销（B1）：workspace → 最近一次恢复的逐路径 before/after。
-     * 进程内记录，重启即失效；每次 applyRestore 替换上一次（无 redo）。 */
+     * 进程内记录，重启即失效；每次 applyRestore 替换上一次（无 redo）。
+     * 部分撤销时按成功路径收缩，全部撤销完才销毁。 */
     private readonly undoRecords;
     constructor(config?: ShadowRewindConfig);
-    /** 自动检查点是否被配置关闭（与降级区分）。 */
-    get turnCheckpointsDisabled(): boolean;
-    private assertReady;
-    private shadowRepo;
-    /**
-     * 扫描 + 捕获当前树（共用 stat 缓存增量，sqlite 与 jj 后端同路径）。
-     *  - mode = 'inspect'：只构建 entries（供对比/计划）；缓存只读不写回，
-     *    避免把对比时刻的 stat 事实污染成下一次持久捕获的增量依据；
-     *  - mode = 'persist'：新读内容写入内容后端（sqlite 批量入库 / jj 镜像提交），
-     *    并写回缓存，返回 commitId。
-     */
-    private captureTree;
-    /**
-     * jj 持久化：仓库丢失（JJ_REPO_LOST）时删残骸 + 清缓存 + 重试一次。
-     * 关键不变量：仓库丢失时 verifyContent 必然拒绝所有命中项（镜像文件已
-     * 随仓库消失），因此首轮捕获已是全量重读——newContent 完整，重试无需
-     * 重新扫描读取，直接用首轮内容重建仓库即可。
-     */
-    private persistJj;
     /** 创建一个持久化恢复点（user / rescue）。 */
     create(options: {
         readonly cwd: string;
@@ -66,68 +34,6 @@ export declare class ShadowRewindEngine {
         readonly intent?: readonly TurnIntent[];
         readonly signal?: AbortSignal;
     }): Promise<RestorePointSummary>;
-    /** 查找一个回合的轮起检查点（可选校验 turnStartSeq；轮末相位不参与恢复点查找）。 */
-    findTurnCheckpoint(options: {
-        readonly cwd: string;
-        readonly sessionId: string;
-        readonly turn: number;
-        readonly turnStartSeq?: number;
-    }): Promise<RestorePointSummary | undefined>;
-    /** 持久化一次检查点跳过（UI 重启后仍可见）。 */
-    recordTurnCheckpointSkip(options: {
-        readonly cwd: string;
-        readonly sessionId: string;
-        readonly turn: number;
-        readonly turnStartSeq: number;
-        readonly reason: string;
-    }): Promise<void>;
-    /** 读取持久化的检查点跳过记录。 */
-    findTurnCheckpointSkip(options: {
-        readonly cwd: string;
-        readonly sessionId: string;
-        readonly turn: number;
-        readonly turnStartSeq: number;
-    }): Promise<{
-        reason: string;
-    } | undefined>;
-    /** 列出某会话的所有 turn 检查点（轮起+轮末，按 turn 升序；摘要带 phase）。 */
-    listTurnCheckpoints(options: {
-        readonly cwd: string;
-        readonly sessionId: string;
-    }): Promise<readonly RestorePointSummary[]>;
-    /**
-     * 对比两个检查点的 entries，生成文件系统级别的变更列表。
-     * 用于捕获 PowerShell 等终端命令创建/修改/删除的文件（这些没有工具结果节点）。
-     * 返回的 changes 结构与 diffTrees 一致，但来源是快照间对比而非当前树。
-     */
-    diffCheckpoints(options: {
-        readonly cwd: string;
-        readonly prevCheckpointId: string;
-        readonly currCheckpointId: string;
-    }): Promise<{
-        readonly changes: readonly WorkspaceChange[];
-        readonly skippedPaths: readonly SkippedPath[];
-    }>;
-    /**
-     * 从指定检查点读取文件内容。用于为文件系统变更生成完整 diff。
-     * 返回 null 表示文件在该检查点不存在（新增或删除）。
-     */
-    getFileContentFromCheckpoint(options: {
-        readonly cwd: string;
-        readonly checkpointId: string;
-        readonly path: string;
-    }): Promise<Buffer | null>;
-    /**
-     * 降级标注（degraded）：检查点的快照内容是否仍可读。抽样「最小的文件条目」
-     * 走真实读取路径探测两个后端（jj 影子仓库 / sqlite blob）；清单不存在或
-     * 抽样读取失败 = 不可读。只读探测，绝不写任何数据。
-     * 借鉴 dsh-checkpoint-diff 的 degraded 标注思路：丢失节点诚实标注，
-     * 而不是等到恢复/读取时才响亮报错。
-     */
-    checkpointContentReadable(options: {
-        readonly cwd: string;
-        readonly restorePointId: string;
-    }): Promise<boolean>;
     /** 实际创建 manifest 的内部路径：调用方必须已持有工作区锁。 */
     private createLocked;
     /** 列出恢复点（默认不含 turn 与 rescue；调用方按需打开）。 */
@@ -147,28 +53,6 @@ export declare class ShadowRewindEngine {
         changes: readonly WorkspaceChange[];
         skippedPaths: readonly SkippedPath[];
     }>;
-    /** 生成限时恢复计划（确认串必须逐字回显）。 */
-    /**
-     * 对称模式路径归因的数据源：晚于目标恢复点的全部快照（其它会话的 turn
-     * 检查点、rescue 点等），按时间升序，entries 投影到给定路径集。检查点在
-     * 回合开始时捕获，因此窗口 [S_j, S_{j+1}) 的写者就是 S_j 的会话。
-     * 上限 64 个：归因只是预览里的建议标签（勾选权在用户），更早的时间线
-     * 不再细分。
-     */
-    listSnapshotsAfter(options: {
-        readonly cwd: string;
-        readonly restorePointId: string;
-        readonly paths: readonly string[];
-        readonly signal?: AbortSignal;
-    }): Promise<{
-        readonly targetSessionId: string | undefined;
-        readonly snapshots: readonly {
-            readonly id: string;
-            readonly sessionId?: string;
-            readonly createdAt: number;
-            readonly entries: Readonly<Record<string, SnapshotEntry | null>>;
-        }[];
-    }>;
     planRestore(options: {
         readonly cwd: string;
         readonly restorePointId: string;
@@ -178,60 +62,122 @@ export declare class ShadowRewindEngine {
         readonly paths?: readonly string[];
         readonly signal?: AbortSignal;
     }): Promise<RestorePlan>;
-    /** 执行一个已批准的恢复计划：rescue → 日志 → 恢复 → 验证（失败自动回滚）。 */
+    /** 查询内存中的恢复计划（不存在返回 undefined；TTL 过期不拒绝——
+     * 软警告字段 `expired` 随计划透出，EXPECTED-DESIGN 1.4 #1）。
+     * 供 HTTP 层核对「计划与所选检查点同源」。 */
+    getRestorePlan(planId: RestorePlanId): (RestorePlan & {
+        expired?: boolean;
+    }) | undefined;
+    /** 执行一个已批准的恢复计划：rescue → 恢复 → 验证（失败自动回滚到状态 A）。
+     * EXPECTED-DESIGN 1.4：确认串（#2）与会话绑定拒绝（#3）已废除——后者降级
+     * 为结果里的软警告；TTL 过期（#1）不阻断；真正的防漂移闸是 assertPlanFresh。
+     * skipUndoRecord：补偿性质的恢复（如 fork 失败的自动回滚）不写 undo 单槽
+     * ——它会把「撤销最近一次恢复」的指向覆盖成补偿自己，语义反转。 */
     applyRestore(options: {
         readonly planId: string;
-        readonly confirmation: string;
         readonly sessionId?: string;
         readonly signal?: AbortSignal;
+        readonly skipUndoRecord?: boolean;
     }): Promise<RestoreResult>;
     /**
-     * 撤销最近一次恢复（B1，借鉴 dsh-checkpoint-diff 的 rollback-undo）。
+     * 撤销最近一次恢复（B1，EXPECTED-DESIGN 1.2 两段式协议）。
      *
-     * 语义：
-     *  - 进程内单次 undo，无 redo——记录随 applyRestore 替换、撤销成功即删除、
-     *    重启失效（真正的兜底是 rescue 备份点本身，它有独立配额与持久化）；
-     *  - 逐路径 CAS：当前磁盘条目必须仍等于「恢复后」的状态（内容寻址等价），
-     *    被后续改动过的路径跳过并如实报告，绝不猜着回退；全部跳过 → 409；
+     * mode = 'probe'：只做逐路径 CAS 只读比对，返回 {clean, conflicted}——
+     * 客户端据此弹三选项对话框（拒绝 / 全部回滚 / 只回滚正常部分），不动磁盘。
+     *
+     * mode = 'apply'（缺省）执行撤销：
+     *  - 逐路径 CAS：当前磁盘条目必须仍等于「恢复后」的状态（内容寻址等价）；
+     *    失配路径跳过并如实报告，绝不猜着回退；全部失配 → 409（UNDO_CONFLICT）；
+     *  - force = true（用户在弹窗显式授权「全部回滚 / 二次回滚」）：对指定
+     *    路径绕过 CAS，直接从 rescue 清单回写——覆盖恢复之后的用户修改；
+     *    before=null 的路径（恢复新建的）强制撤销即删除，即使被改过——这是
+     *    「绝不删除」的第二处用户授权例外；
+     *  - paths：子集撤销（二次回滚按清单来）；成功路径从 undo 记录中收缩，
+     *    记录清空才销毁——部分成功永远可重试；
      *  - 撤销动作复用 rescue 清单的 restorePaths（全套安全路径：围栏断言、
-     *    原子写、空目录回收、非空拒删）；before=null 的路径（恢复新建的）撤销
-     *    即删除——「绝不删除」的唯一例外，删的是恢复操作自己刚创建的文件。
+     *    原子写、空目录回收、非空拒删、跳过项不删）。
      */
     undoLastRestore(options: {
         readonly cwd: string;
+        readonly mode?: 'apply';
+        readonly force?: boolean;
+        readonly paths?: readonly string[];
         readonly signal?: AbortSignal;
     }): Promise<RestoreUndoResult>;
-    /** 删除一个恢复点（确认串必须逐字等于 `DELETE <id>`）。 */
+    undoLastRestore(options: {
+        readonly cwd: string;
+        readonly mode: 'probe';
+        readonly paths?: readonly string[];
+        readonly signal?: AbortSignal;
+    }): Promise<RestoreUndoProbe>;
+    /** 删除一个恢复点（EXPECTED-DESIGN 1.4 #2：确认串废除；被进程内 undo
+     * 记录引用的 rescue 点仍拒绝删除——那是「撤销最近一次恢复」的命脉）。 */
     delete(options: {
         readonly cwd: string;
         readonly restorePointId: string;
-        readonly confirmation: string;
         readonly signal?: AbortSignal;
     }): Promise<{
         restorePointId: string;
         deletedBlobs?: number;
     }>;
-    /** 列出中断/需要人工介入的恢复操作。 */
-    listRecovery(options: {
+    /**
+     * 记录一条写盘前捕获（宿主 tools/execute 瀑布调用）。
+     * 内容内联进 BEFORE 日志；超限文件（maxFileBytes）直接放弃——
+     * 兜底覆盖不到的字节仍有影子整树快照兜着。
+     */
+    recordBeforeEntry(options: {
+        readonly workspace: string;
+        readonly sessionId: string;
+        readonly anchorSeq: number;
+        readonly callId: string;
+        /** 工作区相对路径（'/' 分隔）。 */
+        readonly rel: string;
+        readonly existed: boolean;
+        readonly content: string | null;
+        readonly mode: number;
+    }): Promise<void>;
+    /**
+     * user/message 边界重查（抄 dsh-rewind reconcileTracked）：把本会话全部
+     * 被跟踪路径与最近已知内容比对，变化者（含外部编辑/删除）补一条以本消息
+     * 锚定的 BEFORE 记录。返回补录条数（仅诊断用）。
+     */
+    reconcileTrackedBefore(options: {
+        readonly workspace: string;
+        readonly sessionId: string;
+        readonly anchorSeq: number;
+    }): Promise<number>;
+    /**
+     * 物化「消息 S 之前」的部分树检查点（BEFORE 日志 → kind 'message' 恢复点）。
+     *
+     * 这是检查点缺席（关闭/失败/被修剪）时的兜底：每路径取 anchorSeq >= S 的
+     * 最早 BEFORE（含边界），existed=true 的进 entries（内容入库 sqlite，
+     * id 稳定、重复物化为增量合并）；existed=false（工具创建）进 createdPaths，
+     * 计划按「恢复删除」处理。部分树绝不携带 createdPaths 之外的 added 语义
+     * ——未捕获路径留在磁盘上不动。
+     */
+    ensureMessageRestorePoint(options: {
         readonly cwd: string;
-    }): Promise<readonly {
-        operationId: string;
-        restorePointId: string;
-        rescuePointId: string;
-        state: 'interrupted' | 'recovery-required';
-        paths: readonly string[];
-        startedAt: number;
-        error?: string;
-        rollbackError?: string;
-    }[]>;
-    /** 从 manifest 的后端读取一个路径的快照字节。 */
-    private readSnapshotContent;
-    /** 把一组路径恢复成 manifest 记录的状态（先删后写；目录按需重建/回收）。 */
-    private restorePaths;
-    /** 恢复后验证：每个路径重新落盘读取并与快照条目全等。 */
-    private verifyRestored;
-    private isReferencedByRecovery;
+        readonly sessionId: string;
+        readonly messageSeq: number;
+        readonly turn: number;
+        readonly turnStartSeq: number;
+    }): Promise<RestorePointSummary | undefined>;
+    /** 删除被 prune 掉的 anchor 对应的消息检查点（内容 GC 随后回收独占 blob）。 */
+    pruneMessageRestorePoints(workspace: string, sessionId: string, anchorSeqs: readonly number[]): Promise<number>;
+    /**
+     * 记录 fork 谱系：「恢复并从新会话继续」成功后由宿主端点调用，把
+     * childId ↔ parentId 写进工作区状态的 lineage.json，时间线据此显示
+     * 「v2 · 恢复自 <检查点>」徽标。谱系是展示性增强：工作区无法定位或
+     * 落盘失败都静默吞掉（丢徽标，不丢功能），绝不影响恢复主流程。
+     */
+    recordForkLineage(options: {
+        readonly cwd: string;
+        readonly parentSessionId: string;
+        readonly childSessionId: string;
+        readonly restorePointId: string;
+    }): Promise<void>;
+    /** 读取该工作区的 fork 谱系链（时间线/管理面板用）；工作区无效时为空链。 */
+    loadForkLineage(cwd: string): Promise<readonly LineageEntry[]>;
+    private isReferencedByUndo;
     private expirePlans;
 }
-/** 自动检查点的失败中，哪些属于「可预期跳过」而非故障。 */
-export declare function isCheckpointSkipCode(code: string): boolean;

@@ -15,20 +15,38 @@ import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol'
 
 export const PACKAGE_NAME = 'dsh-shadow-rewind'
 
-/** 单个 hunk 的线上形状；起止行为可选（工具结果不保证给出）。 */
+/** 单个 hunk 的线上形状；起止行为可选（工具结果不保证给出）。
+ * oldMode/newMode 随 fs 条目透传（写回时恢复权限位）——缺失会把 mode-only
+ * 条目误判成 unsupported，故为线上契约的一部分。 */
 const diffSchema = z.object({
   path: z.string(),
   oldText: z.string().nullable(),
   newText: z.string(),
   oldStart: z.number().int().min(1).optional(),
   newStart: z.number().int().min(1).optional(),
+  oldMode: z.number().int().min(0).optional(),
+  newMode: z.number().int().min(0).optional(),
 })
 
-/** 一次开关请求：方向 + 轮内文件清单。 */
-const requestSchema = z.object({
+/** 一次开关请求：方向 + 轮内文件清单。
+ * origin/dirKind 是 fs/目录条目的判别字段：宿主的形状识别依赖它们，剥掉
+ * 会让目录撤销走文件语义报 error、mode-only 永远 unsupported。
+ * request 层 `.strict()`：未知字段直接报错而非静默剥离——判别字段悄悄丢失
+ * 比显式失败更难排查（自用场景两端同仓发布，同步升级可控）。 */
+const requestSchema = z.strictObject({
   action: z.enum(['undo', 'redo']),
-  files: z.array(z.object({ path: z.string(), diffs: z.array(diffSchema) })),
+  files: z.array(z.strictObject({
+    path: z.string(),
+    diffs: z.array(diffSchema),
+    origin: z.enum(['fs']).optional(),
+    dirKind: z.enum(['added', 'deleted']).optional(),
+  })),
+  // 强制开关（EXPECTED-DESIGN 1.2）：用户在冲突弹窗授权「全部回滚」后携带。
+  force: z.boolean().optional(),
 })
+
+/** 线上 schema 的测试出口：编解码往返用例直接驱动同一份 zod 定义。 */
+export const wireSchemas = { diffSchema, requestSchema }
 
 /** 结果侧：逐文件状态；`reason` 承载跳过 / 失败的原因文案。 */
 const resultSchema = z.object({

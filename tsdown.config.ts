@@ -32,7 +32,11 @@ function cssModulesPlugin() {
         minify: true,
       })
       const classes: Record<string, string> = {}
-      for (const [local, value] of Object.entries(exports ?? {})) classes[local] = value.name
+      // lightningcss 的 exports 迭代序不稳定：同一 CSS 两次构建的键序会抖
+      // 动，产物（client.js 的类名映射表）随之非确定——CI 的产物新鲜度门禁
+      // （git diff --exit-code lib/）会假红。按键排序固定生成序。
+      const sortedExports = Object.entries(exports ?? {}).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      for (const [local, value] of sortedExports) classes[local] = value.name
       const styleId = `${PACKAGE_NAME}/${basename(file)}`
       return [
         `const css = ${JSON.stringify(code.toString())};`,
@@ -56,6 +60,11 @@ const config: UserConfig[] = [{
     index: 'src/index.ts',
     'typert.host': 'src/file-review/typert.host.ts',
     remote: 'src/file-review/remote.ts',
+    // 客户端纯逻辑模块（无 DOM 依赖）单发为 node 可加载产物：单元测试直接
+    // 驱动录制 hunk / 清单推导 / diff 工具层的数学，不经浏览器 bundle。
+    'client-recorded-diffs': 'src/client/recorded-diffs.ts',
+    'client-session-changes': 'src/client/session-changes.ts',
+    'client-fs-diff-utils': 'src/client/fs-diff-utils.ts',
   },
   outDir: 'lib',
   format: 'esm',
@@ -84,8 +93,15 @@ const config: UserConfig[] = [{
   clean: false,
   deps: {
     neverBundle: [...CLIENT_EXTERNALS],
-    alwaysBundle: ['diff', 'zod'],
-    onlyBundle: ['diff', 'zod'],
+    // diff/zod 是常规第三方依赖；@deepseek-ai/dsh-session/surface 是官方
+    // 声明的 browser-safe 纯函数子路径（surface.js 自述「web clients consume
+    // this subpath」，其内部仅类型 import），但第三方插件的 client bundle
+    // 不在宿主平台模块表 seed 清单里——external 会在真宿主报
+    // 「client-modules: require("@deepseek-ai/dsh-session/surface") missed
+    // the module table」（活体冒烟实证）。粒度：alwaysBundle 匹配 import
+    // id（写子路径），onlyBundle 匹配内联后的包名（写裸包名）。
+    alwaysBundle: ['diff', 'zod', '@deepseek-ai/dsh-session/surface'],
+    onlyBundle: ['diff', 'zod', '@deepseek-ai/dsh-session'],
   },
   plugins: [cssModulesPlugin()],
   outputOptions: {

@@ -1,31 +1,43 @@
 /**
- * 持久化存储层：工作区目录映射、互斥锁、恢复点清单、操作日志、
- * 自动检查点跳过记录与 SQLite 内容寻址库（jj 缺失时的降级目标）。
+ * 持久化存储层：工作区目录映射、恢复点清单、自动检查点跳过记录与
+ * SQLite 内容寻址库（jj 缺失时的降级目标）。
  *
  * 工作区 key = SHA-256(规范化绝对路径)。工作区改名/移动后得到全新 key，
  * 旧数据原样保留（不迁移、不删除）——全新插件没有历史包袱，隔离即正确。
+ *
+ * EXPECTED-DESIGN 1.4（两态翻转、去锁）：lock.json 工作区互斥与持久操作
+ * 日志状态机均已废除——前者消灭僵尸锁与 PID 复用死锁隐患（并发一致性由
+ * 单实例假设承担），后者在「要么 B 要么回 A」的双态模型下失去意义（失败
+ * 直接退回状态 A，rescue 点是唯一持久兜底）。
  */
-import { createHash, randomUUID } from 'node:crypto'
-import { hostname, platform, arch } from 'node:os'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { mkdir, open, realpath, unlink } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { mkdir, realpath, rm, unlink } from 'node:fs/promises'
+import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
-import { ShadowRewindError, errorMessage } from './errors.js'
+import { ShadowRewindError } from './errors.js'
 import {
   isNodeError,
   pathExists,
-  processExists,
   readJson,
   safeDirectoryNames,
   safeFileNames,
   syncDirectory,
   writeJsonAtomic,
 } from './path-utils.js'
-import { parseManifest, parseOperation, sha256Hex } from './manifest.js'
-import type { RestoreOperation, ResolvedShadowRewindConfig } from './types.js'
+import { parseManifest, sha256Hex } from './manifest.js'
+import type { ResolvedShadowRewindConfig } from './types.js'
 
 const ID_PATTERN = /^rp_[0-9a-z]+_[0-9a-f]{12}$/
+
+/** fork 谱系条目（ABSORB-RECALL 四）：childId 是 fork 出的新会话。 */
+export interface LineageEntry {
+  readonly childId: string
+  readonly parentId: string
+  /** 触发 fork的恢复点（「恢复并从新会话继续」的时点）。 */
+  readonly restorePointId?: string
+  readonly time: number
+}
 
 /** 每个工作区的全部持久化状态。 */
 export class WorkspaceStore {
@@ -35,31 +47,10 @@ export class WorkspaceStore {
     this.config = config
   }
 
-  /** 启动恢复：把遗留的 running 操作标记为 interrupted，返回处理条数。 */
-  async initialize(): Promise<number> {
+  /** 启动装配：确保存储根存在。历史遗留的操作日志文件不再读取——
+   * 下一次 GC / 清理时自然过期，不做启动期迁移。 */
+  async initialize(): Promise<void> {
     await mkdir(join(this.config.storageDir, 'workspaces'), { recursive: true, mode: 0o700 })
-    let reconciled = 0
-    for (const key of await safeDirectoryNames(join(this.config.storageDir, 'workspaces'))) {
-      const workspaceDir = join(this.config.storageDir, 'workspaces', key)
-      for (const filename of await safeFileNames(join(workspaceDir, 'operations'))) {
-        const path = join(workspaceDir, 'operations', filename)
-        let operation: RestoreOperation
-        try {
-          operation = parseOperation(await readJson(path))
-        } catch {
-          // 无法解析的日志留给人工处理；启动恢复绝不因单条损坏而拒启。
-          continue
-        }
-        if (operation.state !== 'running' && operation.state !== 'rollback-running') continue
-        await writeJsonAtomic(path, {
-          ...operation,
-          state: 'interrupted',
-          error: operation.error ?? 'DSH 在恢复操作完成前停止',
-        })
-        reconciled += 1
-      }
-    }
-    return reconciled
   }
 
   /** 规范工作区 → 状态目录（binding 校验通过后）。 */
@@ -79,60 +70,6 @@ export class WorkspaceStore {
     await mkdir(dir, { recursive: true, mode: 0o700 })
     await writeJsonAtomic(bindingPath, { version: 1, workspace })
     return dir
-  }
-
-  // ── 互斥锁 ──────────────────────────────────────────────────────────────
-
-  /**
-   * 获取工作区互斥锁（单机自用简化版）：
-   * O_EXCL 独占创建 lock.json；持有者进程已死且超过 staleLockMs 才允许回收。
-   * 同机多实例靠 pid 判活；跨机共享存储不在设计范围内。
-   */
-  async acquire(workspace: string, signal?: AbortSignal): Promise<() => Promise<void>> {
-    const dir = await this.workspaceDir(workspace)
-    const lockPath = join(dir, 'lock.json')
-    await mkdir(dir, { recursive: true, mode: 0o700 })
-    const nonce = randomUUID()
-    const record = { pid: process.pid, hostId: hostIdentity(), createdAt: Date.now(), nonce }
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      signal?.throwIfAborted()
-      if (await writeLockExclusive(lockPath, `${JSON.stringify(record)}\n`)) {
-        await syncDirectory(dir)
-        return async () => {
-          // nonce 校验：只有仍持有锁的实例才能释放（防止误删后来者的锁）。
-          try {
-            const current = await readJson(lockPath) as { nonce?: unknown }
-            if (current.nonce !== nonce) return
-            await unlink(lockPath)
-            await syncDirectory(dir)
-          } catch (error) {
-            if (!isNodeError(error, 'ENOENT')) throw error
-          }
-        }
-      }
-      let lock: { pid?: unknown; createdAt?: unknown }
-      try {
-        lock = await readJson(lockPath) as typeof lock
-      } catch (error) {
-        if (isMissingStateRead(error)) continue
-        if (error instanceof ShadowRewindError && error.code === 'STATE_CORRUPT') {
-          // 锁文件损坏：超过 stale 窗口就直接回收，否则等下一次尝试。
-          throw new ShadowRewindError('WORKSPACE_LOCKED', `工作区锁损坏且无法立即回收：${errorMessage(error)}`)
-        }
-        throw error
-      }
-      const pid = typeof lock.pid === 'number' ? lock.pid : 0
-      const createdAt = typeof lock.createdAt === 'number' ? lock.createdAt : 0
-      const ownerAlive = pid > 0 && processExists(pid)
-      const staleFor = Date.now() - createdAt
-      if (!ownerAlive && staleFor >= this.config.staleLockMs) {
-        await unlink(lockPath).catch(() => undefined)
-        await syncDirectory(dir)
-        continue
-      }
-      throw new ShadowRewindError('WORKSPACE_LOCKED', `另一个影子回退操作正在处理 ${JSON.stringify(workspace)}`)
-    }
-    throw new ShadowRewindError('WORKSPACE_LOCKED', `无法获取 ${JSON.stringify(workspace)} 的工作区锁`)
   }
 
   // ── 恢复点清单 ──────────────────────────────────────────────────────────
@@ -192,21 +129,63 @@ export class WorkspaceStore {
     await syncDirectory(join(dir, 'manifests'))
   }
 
-  // ── 操作日志 ────────────────────────────────────────────────────────────
-
-  async writeOperation(operation: RestoreOperation): Promise<void> {
-    const dir = await this.workspaceDir(operation.workspace)
-    await writeJsonAtomic(join(dir, 'operations', `${operation.id}.json`), parseOperation(operation))
+  /**
+   * 影子仓库丢失重建后（K1）：旧 manifest 引用的 commit 已全部死亡——
+   * 整目录清除全部清单。决策语义是「重建即清」：列表不再展示内容已失、
+   * 恢复必败的恢复点（与其逐个标 degraded，不如诚实清空）。
+   * 跳过记录不在此列：它只是提示。
+   */
+  async purgeManifests(workspace: string): Promise<void> {
+    const dir = await this.workspaceDir(workspace)
+    await rm(join(dir, 'manifests'), { recursive: true, force: true })
   }
 
-  async listOperations(workspace: string): Promise<readonly RestoreOperation[]> {
+  // ── fork 谱系（ABSORB-RECALL 四）──────────────────────────────────────────
+
+  /** 追加一条 fork 谱系（childId ↔ parentId）到工作区状态目录的
+   * lineage.json。缺失/损坏按空表处理（谱系是展示性增强，不致命）；
+   * 同一 (childId, parentId) 只记一次（fork 幂等）。 */
+  async appendLineage(workspace: string, entry: LineageEntry): Promise<void> {
     const dir = await this.workspaceDir(workspace)
-    const result = []
-    for (const filename of await safeFileNames(join(dir, 'operations'))) {
-      const operation = parseOperation(await readJson(join(dir, 'operations', filename)))
-      result.push(operation)
+    const existing = await this.readLineage(workspace)
+    if (existing.some((item) => item.childId === entry.childId && item.parentId === entry.parentId)) return
+    existing.push(entry)
+    await writeJsonAtomic(join(dir, 'lineage.json'), existing)
+  }
+
+  /** 读取 fork 谱系链；缺失/损坏返回空数组（按无谱系展示）。 */
+  async readLineage(workspace: string): Promise<LineageEntry[]> {
+    const dir = await this.workspaceDir(workspace)
+    try {
+      const raw = await readJson(join(dir, 'lineage.json')) as unknown
+      if (!Array.isArray(raw)) return []
+      return raw.filter((item): item is LineageEntry =>
+        typeof item === 'object' && item !== null
+        && typeof (item as LineageEntry).childId === 'string'
+        && typeof (item as LineageEntry).parentId === 'string'
+        && typeof (item as LineageEntry).time === 'number')
+    } catch {
+      return []
     }
-    return result.sort((left, right) => right.startedAt - left.startedAt || right.id.localeCompare(left.id))
+  }
+
+  // ── GC 双闸节流戳（ABSORB-RECALL 六）──────────────────────────────────────
+
+  /** 读上次 GC 时刻（gc.stamp，跨重启续存）；缺失/损坏返回 0（视为很久前）。 */
+  async readGcStamp(workspace: string): Promise<number> {
+    const dir = await this.workspaceDir(workspace)
+    try {
+      const raw = await readJson(join(dir, 'gc.stamp')) as { lastRunAt?: unknown }
+      return typeof raw?.lastRunAt === 'number' && Number.isFinite(raw.lastRunAt) ? raw.lastRunAt : 0
+    } catch {
+      return 0
+    }
+  }
+
+  /** 记录本次 GC 时刻。失败上抛由调用方静默（节流退化为每次都跑，不损正确性）。 */
+  async writeGcStamp(workspace: string, lastRunAt: number): Promise<void> {
+    const dir = await this.workspaceDir(workspace)
+    await writeJsonAtomic(join(dir, 'gc.stamp'), { version: 1, lastRunAt })
   }
 
   // ── 自动检查点跳过记录（重启后 UI 仍可见）─────────────────────────────────
@@ -357,11 +336,6 @@ export class WorkspaceStore {
     return { deletedBlobs, retainedBlobs }
   }
 
-  /** 启动恢复用：列出全部工作区状态目录（key 形式）。 */
-  async listWorkspaceKeys(): Promise<readonly string[]> {
-    return safeDirectoryNames(join(this.config.storageDir, 'workspaces'))
-  }
-
   /** 关闭全部打开的 SQLite 句柄（受控关闭/测试清理用；幂等）。 */
   async closeAll(): Promise<void> {
     for (const [dir, db] of this.sqliteDbs) {
@@ -397,46 +371,11 @@ async function realpathOf(path: string): Promise<string> {
   return realpath(path)
 }
 
-/** O_EXCL 独占创建并写入锁文件；已存在返回 false。 */
-async function writeLockExclusive(path: string, body: string): Promise<boolean> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
-  try {
-    const handle = await open(path, 'wx', 0o600)
-    try {
-      await handle.writeFile(body)
-      await handle.sync()
-    } finally {
-      await handle.close()
-    }
-    return true
-  } catch (error) {
-    if (isNodeError(error, 'EEXIST')) return false
-    throw error
-  }
-}
-
 function isMissingStateRead(error: unknown): boolean {
   return error instanceof ShadowRewindError
     && error.code === 'STATE_READ_FAILED'
     && error.cause instanceof Error
     && isNodeError(error.cause, 'ENOENT')
-}
-
-let hostId: string | undefined
-
-/** 主机身份（锁判活用）：hostname/platform/arch 派生；可用环境变量覆盖。 */
-function hostIdentity(): string {
-  if (hostId !== undefined) return hostId
-  const configured = process.env.DSH_SHADOW_REWIND_HOST_ID
-  if (configured !== undefined) {
-    if (!/^[0-9a-f]{64}$/.test(configured)) {
-      throw new ShadowRewindError('HOST_ID_UNAVAILABLE', 'DSH_SHADOW_REWIND_HOST_ID 必须是 64 位小写 hex')
-    }
-    hostId = configured
-    return configured
-  }
-  hostId = sha256Hex(Buffer.from(JSON.stringify({ host: hostname(), platform: platform(), arch: arch() })))
-  return hostId
 }
 
 let sqliteModule: typeof import('node:sqlite') | 'missing' | undefined

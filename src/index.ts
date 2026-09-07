@@ -3,14 +3,12 @@
  * `ctx.shadowRewind`，供其它插件消费。
  */
 import { ShadowRewindEngine } from './engine.js'
+import { installBeforeCapture } from './host/before-capture.ts'
 import { installFileReviewHost } from './file-review/host.ts'
-import { CommandWindowRegistry, installCommandWindowRecorder } from './command-windows.js'
+import { installSettingsNamespace, type SettingsBridge } from './rewind-host.js'
 import { installShadowRewindCommands, installShadowRewindHttp, TurnCheckpointCoordinator } from './rewind-host.js'
 import type { AgentFace, HostContext } from './rewind-host.js'
 import type { RestorePointSummary, ShadowRewindConfig } from './types.js'
-import { installWriteGateHost, WorkspaceWriteGate } from './write-gate.js'
-import type { WriteGateDeps } from './write-gate.js'
-import { canonicalDirectory } from './path-utils.js'
 
 export * from './char-highlight.js'
 export * from './engine.js'
@@ -52,52 +50,20 @@ interface PluginContext {
 export class ShadowRewindService {
   readonly engine: ShadowRewindEngine
   private readonly coordinator: TurnCheckpointCoordinator
-  /** 写入闸（「以当前为准」）；恒常构造，config.writeGate 只决定初始开关。 */
-  readonly writeGate: WorkspaceWriteGate
-  /** 命令窗口注册表（写盘归因）：窗口持久化到存储目录，重启归因不降级。 */
-  readonly commandWindows: CommandWindowRegistry
+  /** 设置卡片桥：异步装配（schemasty/settings 服务经宿主解析），到位前为
+   * undefined——HTTP handler 闭包运行时读取，桥缺席时 config 端点按只读
+   * 降级（ABSORB-RECALL 1.2）。 */
+  private settingsBridge?: SettingsBridge
 
   constructor(ctx: PluginContext, config: ShadowRewindConfig = {}) {
     ctx.provide('shadowRewind', this)
     this.engine = new ShadowRewindEngine(config)
     this.coordinator = new TurnCheckpointCoordinator(this.engine)
 
-    // 写入闸：恒常构造——所有权登记永远进行（即使拒绝裁决关闭），保证
-    // 运行时中途开启闸时立刻有据可依。插件 ctx 自身没有 inject
-    // agents/sessions，直接属性访问会触发 cordis 的访问保护（抛
-    // "cannot get property ... without inject"，闸一开所有工具裁决即报错），
-    // 因此 deps 经注入作用域惰性读取（与 HTTP 端点同机制）：inject 回调把
-    // scope 上的服务摘进闭包，闸在每次裁决时读取当时的存活面。注入完成前
-    // 两者为空实现，按 WriteGateDeps 的可选语义降级（agents 缺失 → 所有者
-    // 视为存活；谱系上溯停止）。
-    //
-    // 谱系上溯与命令窗口顶层会话解析的「会话查找面」在 0.1.2 以 agents
-    // 注册表承担（AgentRegistry.get → Agent.session.header.parentSession）：
-    // ctx.sessions（SessionStore）返回的是核心 Session，没有 agent 包装层。
-    const gateLookup: WriteGateDeps['sessions'] & WriteGateDeps['agents'] = {
-      get: () => undefined,
-      list: () => [],
-    }
-    this.writeGate = new WorkspaceWriteGate({
-      canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
-      get sessions() { return gateLookup },
-      get agents() { return gateLookup },
-      logger: ctx.logger,
-    }, {
-      enabled: config.writeGate ?? true,
-      allow: config.writeGateAllow,
-    })
-
-    // 命令窗口注册表（写盘归因）：与闸同一工作区键语义；窗口持久化到本插件
-    // 存储目录（重启归因不降级；降级语义与天花板见模块注释）。
-    this.commandWindows = new CommandWindowRegistry({
-      canonicalDirectory: (path) => canonicalDirectory(path).catch(() => undefined),
-      storageDir: this.engine.config.storageDir,
-      flushMs: this.engine.config.commandWindowFlushMs,
-      retentionMs: this.engine.config.commandWindowRetentionMs,
-      maxPerWorkspace: this.engine.config.commandWindowMaxPerWorkspace,
-      detailBytes: this.engine.config.commandWindowDetailBytes,
-    })
+    // BEFORE 捕获管道（主路捕获，Claude Code 式）：tools/execute 写盘前抓
+    // 目标文件全文，锚定 user message seq；user/message 边界重查外部编辑。
+    // 影子整树快照保留为兜底——检查点在位时恢复仍走全树检查点。
+    installBeforeCapture(ctx, this.engine)
 
     // 文件审查半边（dsh-file-review-tab 融合）：Typert `fileReview` 服务 +
     // 最终回复文件引用引导 + Code Mode 录制器；录制记录持久化到本插件存储。
@@ -106,31 +72,22 @@ export class ShadowRewindService {
       { storageDir: this.engine.config.storageDir },
     )
 
-    // 写入闸的拒绝裁决挂在工具瀑布上（关闭时裁决直接放行，监听器常驻）。
-    installWriteGateHost(ctx as unknown as Parameters<typeof installWriteGateHost>[0], this.writeGate)
-
-    // 命令窗口录制器挂在 tools/execute（around-dispatch，包住工具体本身）：
-    // 被闸拒绝的调用在 prepare 阶段（tools/pre-execute）终止、从不进入
-    // dispatch，自然不记录（注册表绝不记录未执行的调用）。会话查找面经注入
-    // 闭包惰性读取，与闸的 gateLookup 同一机制（注入完成前谱系上溯停在
-    // 最深已声明祖先）。
-    installCommandWindowRecorder(
-      ctx as unknown as Parameters<typeof installCommandWindowRecorder>[0],
-      this.commandWindows,
-      () => gateLookup,
-    )
+    // 设置页「插件配置」分区（ABSORB-RECALL 1.2/1.4）：注册 settings
+    // namespace「shadow-rewind」并把用户覆盖经 watch 热更新进引擎。
+    // schemasty/settings 缺席时降级：卡片缺席、config 端点只读。
+    void installSettingsNamespace(
+      ctx as unknown as Parameters<typeof installSettingsNamespace>[0],
+      this.engine,
+      (message) => ctx.logger.warn(`[shadow-rewind] ${message}`),
+    ).then((bridge) => { this.settingsBridge = bridge })
 
     ctx.inject(['agents'], (scope) => {
-      const agents = (scope as unknown as { readonly agents: { get?(id: string): AgentFace | undefined; list(): readonly AgentFace[] } }).agents
-      gateLookup.get = (id) => agents.get?.(id)
-      gateLookup.list = () => agents.list() as AgentFace[]
       this.coordinator.install(scope as unknown as HostContext)
-      // 所有权登记与快照共用 agent/pre-step 瀑布（step 1 抢占）。
-      this.writeGate?.install(scope as unknown as HostContext)
     })
     ctx.inject(['webServer', 'sessions', 'sessionQuery', 'sessionController', 'agents'], (scope) => {
       const s = scope as unknown as Parameters<typeof installShadowRewindHttp>[0]
-      installShadowRewindHttp(s, this.engine, this.coordinator, this.writeGate, this.commandWindows)
+      // bridge 传解析函数：settings 桥异步装配，端点 handler 每请求时读取。
+      installShadowRewindHttp(s, this.engine, this.coordinator, () => this.settingsBridge)
     })
     // headless 命令面（/shadow-diff、/shadow-undo）：commands 服务缺失的宿主
     // 上该 inject 挂起即可，不影响其余装配（与 webServer 同一降级模型）。
@@ -138,19 +95,15 @@ export class ShadowRewindService {
       installShadowRewindCommands(scope as unknown as Parameters<typeof installShadowRewindCommands>[0], this.engine)
     })
 
-    void this.engine.ready.then((reconciled) => {
-      if (reconciled > 0) {
-        ctx.logger.warn(`[shadow-rewind] 启动恢复完成：处理了 ${String(reconciled)} 个中断的恢复操作`)
-      } else {
-        ctx.logger.info(`[shadow-rewind] 就绪；存储=${this.engine.config.storageDir} 后端=${this.engine.effectiveBackend}`)
-      }
+    void this.engine.ready.then(() => {
+      ctx.logger.info(`[shadow-rewind] 就绪；存储=${this.engine.config.storageDir} 后端=${this.engine.effectiveBackend}`)
     }).catch((error: unknown) => {
       ctx.logger.error(`[shadow-rewind] 启动失败：${error instanceof Error ? error.message : String(error)}`)
     })
   }
 
-  /** 等待启动恢复完成。 */
-  initialize(): Promise<number> {
+  /** 等待启动装配完成。 */
+  initialize(): Promise<void> {
     return this.engine.ready
   }
 
@@ -194,14 +147,9 @@ export class ShadowRewindService {
     return this.engine.undoLastRestore(options)
   }
 
-  /** 删除恢复点（confirmation 必须逐字等于 `DELETE <id>`）。 */
+  /** 删除恢复点（被进程内 undo 记录引用的 rescue 点拒绝删除）。 */
   delete(options: Parameters<ShadowRewindEngine['delete']>[0]): ReturnType<ShadowRewindEngine['delete']> {
     return this.engine.delete(options)
-  }
-
-  /** 列出中断/需人工介入的恢复操作。 */
-  listRecovery(options: Parameters<ShadowRewindEngine['listRecovery']>[0]): ReturnType<ShadowRewindEngine['listRecovery']> {
-    return this.engine.listRecovery(options)
   }
 }
 

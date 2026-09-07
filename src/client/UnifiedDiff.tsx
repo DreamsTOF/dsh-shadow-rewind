@@ -424,7 +424,7 @@ export function UnifiedDiff({
             {showFileHeaders && firstForPath
               ? (
                 <header className={css.unifiedHeader}>
-                  <span className={css.unifiedStatus}>M</span>
+                  <span className={css.unifiedStatus}>{diff.oldText === null ? 'A' : diff.newText === '' ? 'D' : 'M'}</span>
                   <span className={css.unifiedPath}>{diff.path}</span>
                   <span className={css.unifiedAdded}>+{total.added}</span>
                   <span className={css.unifiedRemoved}>-{total.removed}</span>

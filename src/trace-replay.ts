@@ -330,6 +330,15 @@ export function contentOps(events: readonly TraceEvent[]): { ops: readonly Trace
   return { ops, notes }
 }
 
+/**
+ * B1：会话内所有内容型工具触碰过的路径。重放基线只需要这些路径的内容——
+ * 基线里未被区间触碰的文件在 diff 中自然抵消，逐个读全文是纯浪费。
+ */
+export function traceBaselinePaths(events: readonly TraceEvent[]): readonly string[] {
+  const { ops } = contentOps(events)
+  return [...new Set(ops.map(op => op.path))]
+}
+
 /** LF 归一：与宿主行数统计同一基准（CRLF 不产生幽灵差异）。 */
 function normalizeLf(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
@@ -360,8 +369,15 @@ function replayUntil(
   ops: readonly TraceContentOp[],
   untilSeqExcl: number,
   notes: string[],
+  baseline?: ReadonlyMap<string, string>,
 ): Map<string, string> {
   const state = new Map<string, string>()
+  // B1：基线初始化——最近轮起检查点的文件内容先入图，「会话前就存在、
+  // 区间内被写入」的文件不再标成 added，str_replace 也能在真实旧内容上
+  // 命中锚点（漂移 notes 随之减少）。
+  if (baseline !== undefined) {
+    for (const [path, content] of baseline) state.set(path, content)
+  }
   for (const op of ops) {
     if (op.seq >= untilSeqExcl) break
     if (op.kind === 'write') {
@@ -398,12 +414,17 @@ function replayUntil(
  * 任意两个轨迹节点 (fromSeq, toSeq] 的内容区间 diff（同一 LCS 引擎语义：
  * chronologically from → to，del = 会被带走的行，add = 会出现的行）。
  */
-export function traceRangeDiff(events: readonly TraceEvent[], fromSeq: number, toSeq: number): TraceRangeResult {
+export function traceRangeDiff(
+  events: readonly TraceEvent[],
+  fromSeq: number,
+  toSeq: number,
+  options?: { readonly baseline?: ReadonlyMap<string, string> },
+): TraceRangeResult {
   const { ops } = contentOps(events)
   // 漂移只记一遍：to 侧重放覆盖 (0, toSeq) 全部操作，from 侧是其前缀子集。
-  const beforeState = replayUntil(ops, fromSeq, [])
+  const beforeState = replayUntil(ops, fromSeq, [], options?.baseline)
   const drift: string[] = []
-  const afterState = replayUntil(ops, toSeq, drift)
+  const afterState = replayUntil(ops, toSeq, drift, options?.baseline)
   const paths = [...new Set([...beforeState.keys(), ...afterState.keys()])].sort()
   const changes: TraceChange[] = []
   let truncated = false

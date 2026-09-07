@@ -71,6 +71,8 @@ export declare class FileReviewService extends TypertRemoteService {
      * 在接收方 Agent 空闲时逐个开关「各自独立安全」的文件。
      * 逐文件串行而非并行：同一路径的两个动作交错会让 CAS 闸门失去意义。
      * 单个文件失败不影响其余文件——结果里逐条如实报告。
+     * force（EXPECTED-DESIGN 1.2）：冲突弹窗授权「全部回滚」后为 true——
+     * CAS 失配的条目强制覆盖（详见 applyOne / applyFsChange）。
      */
     apply(agent: Agent, request: FileReviewRequest): Promise<FileReviewResult>;
 }

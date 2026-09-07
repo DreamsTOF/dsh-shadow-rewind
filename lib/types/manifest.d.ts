@@ -1,4 +1,4 @@
-import type { Manifest, RestoreOperation, SnapshotEntry, WorkspaceChange } from './types.js';
+import type { Manifest, SnapshotEntry, WorkspaceChange } from './types.js';
 /** 生成形如 `rp_<timeBase36>_<rand12>` 的持久化 id。 */
 export declare function makeId(prefix: 'rp' | 'op' | 'plan'): string;
 /** 内容寻址：文件字节 → SHA-256 hex。 */
@@ -21,5 +21,3 @@ export declare function entriesEqual(left: SnapshotEntry | undefined, right: Sna
 export declare function diffTrees(before: Readonly<Record<string, SnapshotEntry>>, after: Readonly<Record<string, SnapshotEntry>>): WorkspaceChange[];
 /** 解析并全量校验一份不受信任的 manifest JSON。 */
 export declare function parseManifest(value: unknown): Manifest;
-/** 解析并校验一份恢复操作日志。 */
-export declare function parseOperation(value: unknown): RestoreOperation;

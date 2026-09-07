@@ -71,11 +71,15 @@ export declare function cachedFsTurnFor(turnStartSeq: number): FsChangeTurn | un
 export declare function warmFsChanges(sessionId: string): void;
 /** 按「会话 + 轮」同步读取（live 条的查找键；缓存条目都带 sessionId）。 */
 export declare function cachedFsTurnForSessionTurn(sessionId: string, turn: number): FsChangeTurn | undefined;
+/** 某会话缓存的全部 fs 轮条目（按轮升序；live 条的会话累计视图用）。 */
+export declare function cachedFsTurnsForSession(sessionId: string): readonly FsChangeTurn[];
 /**
  * 一个 fs 条目的占位形态：零全文、带服务端行数。卡片/侧边栏/live 条先用它
  * 渲染行与 +/−，内容在悬停、展开或撤销时经 ensureFsFileDiff 按需补齐。
  */
-export declare function fsTurnReviews(fsTurn: FsChangeTurn): readonly ProducedFileReview[];
+export declare function fsTurnReviews(fsTurn: FsChangeTurn, 
+/** 可选的条目级过滤（回滚遮蔽按轮近似剔除已恢复的写盘）。 */
+keep?: (change: FsChange) => boolean): readonly ProducedFileReview[];
 /**
  * 取一个 fs 条目的完整全文条目（撤销/展示 diff 用）。同一 (turn, path) 的
  * 并发与后续调用复用同一个请求；该轮缓存条目被 warm 替换时记忆自动失效
