@@ -1,93 +1,60 @@
 /**
- * mergeToolFsEntries 的合并语义测试（轮尾卡片 / live 条的「每路径一行」）：
- * 工具条目与检查点 fs 条目按 pathKey 归一合并；仅当工具条目不可逆
- * （本轮新建后同轮又修改）时，改用 fs 净条目。
+ * 变更模型（session-changes）的共享原语测试：路径键归一 + fs 条目的可逆形状判定。
+ * 变更事实的唯一来源是检查点 diff，客户端不再有任何推导/合并数学。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mergeToolFsEntries, pathKey } from '../lib/client-session-changes.js'
-import { fsTurnReviews } from '../lib/client-fs-diff-utils.js'
+import { canonicalKey, pathKey, reversibleOf, resolveSessionPath } from '../lib/client-session-changes.js'
 
-const P = '文件工具测试.txt'
+const P = 'dir/file.txt'
 
-/** 工具写盘：write 创建（oldText=null）后同轮又被 edit 修改 → 混合 hunk，不可逆。 */
-function createThenEditEntry() {
-  return {
+test('pathKey：反斜杠与正斜杠归一为同一键', () => {
+  assert.equal(pathKey('dir\\file.txt'), pathKey('dir/file.txt'))
+})
+
+test('canonicalKey：工作区绝对路径折成相对键', () => {
+  assert.equal(canonicalKey('D:\\ws\\dir\\file.txt', 'D:\\ws'), 'dir/file.txt')
+  assert.equal(canonicalKey('./dir/file.txt', undefined), 'dir/file.txt')
+  assert.equal(canonicalKey('dir/file.txt', undefined), 'dir/file.txt')
+})
+
+test('resolveSessionPath：相对路径按会话工作区解析成展示路径', () => {
+  assert.equal(resolveSessionPath('D:\\ws', 'a.txt'), 'D:\\ws\\a.txt')
+  assert.equal(resolveSessionPath('/ws', 'a.txt'), '/ws/a.txt')
+  assert.equal(resolveSessionPath('/ws', '/abs/a.txt'), '/abs/a.txt')
+})
+
+test('可逆判定：目录条目（mkdir/rmdir 互逆）', () => {
+  assert.equal(reversibleOf({ path: P, diffs: [], dir: true }), true)
+})
+
+test('可逆判定：整文件新增（oldText=null）与删除（newText 为空）', () => {
+  assert.equal(reversibleOf({ path: P, diffs: [{ path: P, oldText: null, newText: 'a\n' }] }), true)
+  assert.equal(reversibleOf({ path: P, diffs: [{ path: P, oldText: 'a\n', newText: '' }] }), true)
+})
+
+test('可逆判定：mode-only 条目（内容两侧相同、权限位不同）', () => {
+  assert.equal(reversibleOf({
     path: P,
-    diffs: [
-      { path: P, oldText: null, newText: 'line1\nline2\nline3\n' },
-      { path: P, oldText: 'line1', newText: 'line1-x' },
-      { path: P, oldText: 'line2', newText: 'line2-x' },
-      { path: P, oldText: 'line3', newText: 'line3-x' },
-    ],
-  }
-}
-
-test('新建后同轮又修改：工具条目不可逆，改用 fs 净条目（计数 = 最终行数）', () => {
-  const fs = { path: P, diffs: [], origin: 'fs', counts: { added: 3, removed: 0 } }
-  const merged = mergeToolFsEntries([createThenEditEntry()], [fs])
-  assert.equal(merged.length, 1, '同一文件只保留一行')
-  assert.equal(merged[0].origin, 'fs', '改用检查点 fs 条目')
-  assert.deepEqual(merged[0].counts, { added: 3, removed: 0 }, '计数是净变化 +3')
+    diffs: [{ path: P, oldText: 'a\n', newText: 'a\n', oldMode: 0o644, newMode: 0o755 }],
+  }), true)
+  // 内容相同但权限位相同 → 没有可执行的动作。
+  assert.equal(reversibleOf({
+    path: P,
+    diffs: [{ path: P, oldText: 'a\n', newText: 'a\n', oldMode: 0o644, newMode: 0o644 }],
+  }), false)
 })
 
-test('纯编辑（文件已存在）：工具条目可逆，保持工具优先', () => {
-  const tool = { path: P, diffs: [{ path: P, oldText: 'a', newText: 'b' }] }
-  const fs = { path: P, diffs: [], origin: 'fs', counts: { added: 1, removed: 1 } }
-  const merged = mergeToolFsEntries([tool], [fs])
-  assert.equal(merged.length, 1)
-  assert.equal(merged[0].origin, undefined, '保持工具条目')
-  assert.deepEqual(merged[0].diffs, tool.diffs)
+test('可逆判定：带行锚点的普通编辑 hunk 可逆', () => {
+  assert.equal(reversibleOf({
+    path: P,
+    diffs: [{ path: P, oldText: 'a\n', newText: 'b\n', oldStart: 1, newStart: 1 }],
+  }), true)
 })
 
-test('纯新建（write 单 hunk）：工具条目可逆，保持工具优先', () => {
-  const tool = { path: P, diffs: [{ path: P, oldText: null, newText: 'a\nb\nc\n' }] }
-  const fs = { path: P, diffs: [], origin: 'fs', counts: { added: 3, removed: 0 } }
-  const merged = mergeToolFsEntries([tool], [fs])
-  assert.equal(merged.length, 1)
-  assert.equal(merged[0].origin, undefined, '保持工具条目')
-})
-
-test('反斜杠 / 正斜杠同路径：归一后只保留一行', () => {
-  const tool = { path: 'dir\\file.txt', diffs: [{ path: 'dir\\file.txt', oldText: 'a', newText: 'b' }] }
-  const fs = { path: 'dir/file.txt', diffs: [], origin: 'fs', counts: { added: 1, removed: 1 } }
-  const merged = mergeToolFsEntries([tool], [fs])
-  assert.equal(merged.length, 1)
-  assert.equal(pathKey(tool.path), pathKey(fs.path))
-})
-
-test('仅 fs 条目（终端写盘）：原样保留', () => {
-  const fs = { path: P, diffs: [], origin: 'fs', counts: { added: 3, removed: 0 } }
-  const merged = mergeToolFsEntries([], [fs])
-  assert.equal(merged.length, 1)
-  assert.equal(merged[0].origin, 'fs')
-})
-
-test('无 fs 条目：工具条目原样返回（含不可逆的新建+修改）', () => {
-  const tool = createThenEditEntry()
-  const merged = mergeToolFsEntries([tool], [])
-  assert.equal(merged.length, 1)
-  assert.equal(merged[0], tool, '无 fs 兜底时保留工具条目')
-})
-
-test('fs 条目归属过滤：其它会话的写盘不进轮尾卡片 / live 条', () => {
-  const turn = {
-    turn: 1,
-    turnStartSeq: 10,
-    checkpointId: 'cp-a',
-    nextCheckpointId: 'cp-b',
-    changes: [
-      { path: 'mine.txt', kind: 'added', added: 3, removed: 0, owner: 'target', autoSelect: true },
-      { path: 'other-session.txt', kind: 'added', added: 5, removed: 0, owner: 'session-A', autoSelect: false },
-      { path: 'manual.txt', kind: 'modified', added: 1, removed: 1, owner: 'unknown' },
-      { path: 'both.txt', kind: 'modified', added: 2, removed: 2, owner: 'multi' },
-      { path: 'legacy.txt', kind: 'added', added: 1, removed: 0 },
-    ],
-  }
-  const reviews = fsTurnReviews(turn)
-  assert.deepEqual(
-    reviews.map(review => review.path),
-    ['mine.txt', 'manual.txt', 'both.txt', 'legacy.txt'],
-    '仅隐藏 owner = 其它会话 id 的条目',
-  )
+test('可逆判定：空侧缺锚点的 hunk 不可回放（宿主会拒绝）', () => {
+  assert.equal(reversibleOf({
+    path: P,
+    diffs: [{ path: P, oldText: '', newText: 'b\n' }],
+  }), false)
 })

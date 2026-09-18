@@ -11,7 +11,7 @@ export const FORMAT_VERSION = 1 as const
 /** 恢复点 id（形如 rp_<time>_<rand12>）。 */
 export type RestorePointId = string
 
-/** 内存中的限时恢复计划 id（形如 plan_<time>_<rand12>）。 */
+/** 内存中的恢复计划 id（形如 plan_<time>_<rand12>）。 */
 export type RestorePlanId = string
 
 /** 单个普通文件的快照条目。`blob` 是文件内容的 SHA-256。 */
@@ -74,8 +74,6 @@ export type RestorePointKind =
   | 'rescue'
   /** 回合检查点（轮起/轮末自动捕获）。 */
   | 'turn'
-  /** 消息检查点（写盘前 BEFORE 捕获的兜底恢复点，partial 部分树）。 */
-  | 'message'
 
 /** 一条意图记录：本轮内触发文件变更的内容型工具调用摘要（轮末检查点专用）。
  * 回答「这一轮是谁改的」——工具名 + 目标路径 + 对应 tool/call 事件 seq。
@@ -112,14 +110,6 @@ export interface Manifest {
   readonly intent?: readonly TurnIntent[]
   /** 旧式回合边界 seq（保留字段，当前不写入）。 */
   readonly turnEndSeq?: number
-  /** 消息检查点（kind 'message'）锚定的 user message seq。 */
-  readonly messageSeq?: number
-  /** 部分树标记：entries 只覆盖 BEFORE 捕获到的路径，磁盘上其余路径
-   * 一律「不在恢复范围」——计划绝不把它们当 added 删除。 */
-  readonly partial?: true
-  /** partial 树里记录了「捕获时不存在」的路径（BEFORE=null 的创建）：
-   * 计划把它们当成恢复删除的对象。 */
-  readonly createdPaths?: readonly string[]
   readonly createdAt: number
   /** 全部条目按 path 排序后的确定性哈希；读取时重算校验。 */
   readonly treeHash: string
@@ -159,8 +149,6 @@ export interface RestorePointSummary {
   readonly turn?: number
   readonly turnStartSeq?: number
   readonly phase?: 'start' | 'end'
-  /** 消息检查点锚定的 user message seq（kind 'message' 专用）。 */
-  readonly messageSeq?: number
   /** 本轮的内容型工具调用摘要（轮末检查点才有；旧数据/轮起缺省）。 */
   readonly intent?: readonly TurnIntent[]
   readonly createdAt: number
@@ -172,42 +160,34 @@ export interface RestorePointSummary {
   readonly lastRestoredAt?: number
 }
 
-/** 限时恢复计划：执行前由 applyGuarded 核对计划与检查点同源。
- * TTL 仍计算但只作软警告（EXPECTED-DESIGN 1.4 #1）：过期不阻断执行，
- * 真正的防漂移闸是 apply 时的逐路径计划复核（assertPlanFresh）。 */
+/** 恢复计划：执行前由 applyGuarded 核对计划与检查点同源。
+ * 防漂移闸 = 计划生成时的当前树哈希 + 逐路径计划复核（assertPlanFresh）。 */
 export interface RestorePlan {
   readonly id: RestorePlanId
   readonly restorePointId: RestorePointId
   readonly workspace: string
   readonly sessionId?: string
   readonly createdAt: number
-  readonly expiresAt: number
   readonly changes: readonly WorkspaceChange[]
-  /** 快照中显式跳过的路径（恢复不会碰它们，仅随计划透出展示）。 */
-  readonly skippedPaths: readonly SkippedPath[]
   /** 每个待恢复路径在「计划生成时」的当前条目；apply 时逐路径复核防覆盖新修改。 */
   readonly expected: Readonly<Record<string, SnapshotEntry | null>>
 }
 
-/** 恢复计划是否已超过 TTL（软警告：客户端据此提示，服务端不拒绝）。 */
-export type PlanFreshness = { readonly expired: boolean }
-
-/** 恢复成功的结果。
- * EXPECTED-DESIGN 1.4：操作日志状态机已废除——失败即进程内自动回滚到状态 A
- *（rescue 兜底），不再有持久化的 running/interrupted/recovery-required 中间态；
- * 会话绑定不匹配等流程性检查降级为 `warnings` 软警告字段。 */
+/** 恢复成功的结果：失败即进程内自动回滚到状态 A（rescue 兜底），不留半恢复状态。 */
 export interface RestoreResult {
   readonly restorePointId: RestorePointId
   readonly rescuePointId: RestorePointId
   readonly restoredPaths: readonly string[]
-  /** 软警告（会话绑定不匹配等）：不阻断执行，如实呈现给用户。 */
-  readonly warnings?: readonly string[]
 }
 
-/** 撤销探查结果（EXPECTED-DESIGN 1.2 两段式协议的第一段）：
- * 逐路径 CAS 只读比对，不动磁盘。`conflicted` 是「恢复后又被修改过」的
- * 路径清单，客户端据此弹三选项对话框（拒绝 / 全部回滚 / 只回滚正常部分）。 */
+/** 撤销探查结果（两段式协议的第一段）：逐路径 CAS 只读比对，不动磁盘。
+ * `conflicted` 是「恢复后又被修改过」的路径清单，客户端据此弹三选项对话框
+ * （拒绝 / 全部回滚 / 只回滚正常部分）。 */
 export interface RestoreUndoProbe {
+  /** 本次被撤销恢复的身份（与客户端遮蔽记录对齐用）。 */
+  readonly id: string
+  /** 发起该恢复的会话（多会话共享工作区时用于识别「撤销的是哪次恢复」）。 */
+  readonly sessionId?: string
   readonly restorePointId: RestorePointId
   readonly rescuePointId: RestorePointId
   readonly time: number
@@ -217,10 +197,14 @@ export interface RestoreUndoProbe {
   readonly conflicted: readonly { readonly path: string; readonly reason: string }[]
 }
 
-/** 恢复后撤销的结果（借鉴 dsh-checkpoint-diff 的 rollback-undo）。
+/** 恢复后撤销的结果。
  * 被后续修改过的路径跳过并如实报告；force 回滚（用户授权）可覆盖——
  * before=null 的路径（恢复新建的文件）强制撤销 = 删除，即使被改过。 */
 export interface RestoreUndoResult {
+  /** 本次被撤销恢复的身份（客户端对齐遮蔽记录层，防「弹错层」）。 */
+  readonly id: string
+  /** 发起该恢复的会话（不匹配当前会话时客户端不弹自己的遮蔽标记）。 */
+  readonly sessionId?: string
   readonly restorePointId: RestorePointId
   readonly rescuePointId: RestorePointId
   readonly undonePaths: readonly string[]
@@ -233,7 +217,7 @@ export interface ShadowRewindConfig {
   readonly storageDir?: string
   /** 每工作区保留的 user/rescue 恢复点上限。 */
   readonly maxRestorePoints?: number
-  /** 每会话保留的自动 turn 检查点上限。 */
+  /** 每会话保留的自动 turn 检查点上限（轮起 / 轮末各一份配额）。 */
   readonly maxTurnCheckpointsPerSession?: number
   /** 单个恢复点的文件数上限。 */
   readonly maxFiles?: number
@@ -241,8 +225,6 @@ export interface ShadowRewindConfig {
   readonly maxFileBytes?: number
   /** 单个恢复点的文件总字节上限。 */
   readonly maxSnapshotBytes?: number
-  /** 恢复计划有效期（毫秒）；过期只作软警告，不再阻断执行（EXPECTED-DESIGN 1.4 #1）。 */
-  readonly planTtlMs?: number
   /**
    * 自动 turn 检查点实现：
    *  - `jj`（默认）：写入隐藏影子 jj 仓库；宿主机缺 jj CLI 时自动降级 sqlite；
@@ -271,7 +253,6 @@ export interface ResolvedShadowRewindConfig {
   readonly maxFiles: number
   readonly maxFileBytes: number
   readonly maxSnapshotBytes: number
-  readonly planTtlMs: number
   readonly turnCheckpointMode: 'off' | 'sqlite' | 'jj'
   readonly turnCheckpointTimeoutMs: number
   readonly turnCheckpointMaxNewBytes: number

@@ -36,7 +36,6 @@ import {
 import { compileExcludes, scanWorkspace } from './scan.js'
 import type { ExcludeRule, ScannedPath } from './scan.js'
 import { WorkspaceStore } from './store.js'
-import { BeforeJournal } from './before-journal.js'
 import { resolveConfig } from './engine-config.js'
 import { depthOf, hasDescendantEntry, readFileBounded, summarize } from './engine-helpers.js'
 import { diffTrees, sha256Hex } from './manifest.js'
@@ -71,8 +70,6 @@ export class ShadowRewindEngineBase {
 
   private excludes: readonly ExcludeRule[]
   private readonly shadowRepos = new Map<string, ShadowJj>()
-  /** BEFORE 捕获日志（主路捕获的存储半边；消息检查点的物化数据源）。 */
-  protected readonly beforeJournal: BeforeJournal
 
   constructor(config: ShadowRewindConfig = {}) {
     this.config = resolveConfig(config)
@@ -84,7 +81,6 @@ export class ShadowRewindEngineBase {
     }
     this.excludes = compileExcludes(this.config.excludePatterns)
     this.store = new WorkspaceStore(this.config)
-    this.beforeJournal = new BeforeJournal(this.store, this.config)
     this.ready = this.store.initialize()
   }
 

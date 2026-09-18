@@ -1,25 +1,30 @@
 /**
  * dsh-shadow-rewind —— 浏览器半边的「会话回退」面。
- * （自手写 client.js 等价移植为 TS 模块，行为与文案保持逐行一致。）
  *
- * 职责：给每条直发用户消息挂「恢复到发送之前」入口，打开预览对话框
- * （文件清单 / 快照跳过项 / 两种回退模式），确认后调用宿主 /shadow-rewind
- * 端点执行文件恢复，可选在分叉出的新会话里继续。
+ * 职责：给每条直发用户消息挂「恢复到发送之前」入口，打开统一恢复弹窗
+ * RewindDialog（消息按钮与审计面板「从快照恢复此轮」共用同一份预览数据）。
+ * 唯一语义：**整树恢复到该检查点，丢弃其后的一切写盘**（含终端/外部与手动
+ * 修改）；消息入口同时就地遮蔽该消息及其后的对话行并把文本放回输入框。
  *
  * 全部走客户端公开服务（slots / sessions / conversation），宿主半边不注入
  * 任何上下文；文件恢复的真正执行与安全闸都在引擎侧。
  */
 import * as React from 'react'
 import type { Context } from '@deepseek-ai/cordis'
-import type { ProducedFileDiff } from '../file-review/change-types.ts'
-import { fetchCheckpointFileContent } from './fs-diff-utils.ts'
-import { pathKey } from './session-changes.ts'
-import { markRewound, popRewound } from './rewound-changes.ts'
+// Type-only: pulls the runtime client Context merges（ctx.slots / sessions）。
+import type {} from '@deepseek-ai/dsh-client-runtime/client'
+import type { ChatSnapshot, UseChat } from '@deepseek-ai/dsh-client-ui-chat/client'
+import { forceWarmFsChanges } from './fs-diff-utils.ts'
+import { commitRestore, popRewound, snapshotBarrierOf } from './rewound-changes.ts'
+import { hiddenKeysOf } from './inplace-view.ts'
+import { runInplaceMask, chatSnapshotOf } from './inplace-run.ts'
+import { decodeSharedRewindPreview, fetchSharedRewindPreview, RewindPreviewHttpError } from './preview-http.ts'
+import { REWIND_BASE, rewindErrorText } from './client-http.ts'
+import { skipReasonLabel } from './change-labels.ts'
 import { matchPendingRows, retractSpan, type SteeringItemLike } from './pending.ts'
-import { UnifiedDiff } from './UnifiedDiff.tsx'
-import { fetchSubsetPlan, pathsTooLong, SubsetPlanError } from './subset-plan.ts'
+import { openAuditOverlay } from './audit-open.ts'
 
-const PATH = '/shadow-rewind'
+const PATH = REWIND_BASE
 
 // ── 样式 ────────────────────────────────────────────────────────────────
 
@@ -45,13 +50,16 @@ const styles = `
 .srw-option-description{display:block;margin-top:3px;color:var(--dsw-alias-label-tertiary);font-size:12px}
 .srw-summary{display:flex;flex-wrap:wrap;column-gap:16px;row-gap:4px;color:var(--dsw-alias-label-secondary);font-size:13px}
 .srw-files{max-height:220px;overflow:auto;border:1px solid var(--dsw-alias-border-l2);border-radius:10px}
-.srw-file{display:flex;justify-content:space-between;gap:16px;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12px}
+.srw-file{display:flex;align-items:center;gap:16px;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12px}
 .srw-file[data-expandable="true"]{cursor:pointer}
 .srw-file[data-expandable="true"]:hover{background:var(--dsw-alias-interactive-bg-hover)}
-.srw-file-diff{padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);max-height:300px;overflow:auto;background:var(--dsw-alias-bg-layer-2)}
 .srw-file:last-child{border-bottom:0}
-.srw-file code{min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-secondary)}
+.srw-file code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
 .srw-kind{flex:none;color:var(--dsw-alias-label-tertiary)}
+.srw-stats{display:inline-flex;gap:6px;flex:none;padding:2px 6px;border:0;border-radius:6px;background:transparent;cursor:pointer;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.srw-stats:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.srw-added{color:var(--dsw-alias-state-success-primary)}
+.srw-removed{color:var(--dsw-alias-state-error-primary)}
 .srw-skipped{margin:0;padding:10px 12px;border-radius:10px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
 .srw-status{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}
 .srw-warning,.srw-error{margin:0;padding:10px 12px;border-radius:10px;font-size:12px;line-height:18px;overflow-wrap:anywhere}
@@ -69,6 +77,13 @@ interface RewindMatched {
   readonly messageSeq: number
   readonly promptText: string
 }
+
+/**
+ * 统一恢复弹窗（RewindDialog）的寻址：消息按钮带 messageSeq（三种模式全可用），
+ * 审计面板「从快照恢复此轮」带 turn（宿主约束：只支持只恢复文件）。两种寻址
+ * 共用同一份预览数据（preview-http 共享加载器）。
+ */
+export type RewindDialogTarget = RewindMatched | { readonly turn: number }
 
 /** 一个消息行注入目标：DOM 操作容器 + 匹配的会话节点。 */
 interface RewindTarget {
@@ -100,11 +115,6 @@ interface RewindNodeLike {
   readonly content?: unknown
 }
 
-type SessionNodes = Iterable<RewindNodeLike>
-
-/** slots 系统注入的会话订阅钩子（选择器返回什么组件就拿到什么）。 */
-type UseSession = (selector: (snapshot: unknown) => SessionNodes) => SessionNodes
-
 /** 本面需要的最小客户端服务面。 */
 interface RewindClientContext {
   readonly sessions: {
@@ -119,10 +129,11 @@ interface RewindClientContext {
 interface RewindPreviewChange {
   readonly path: string
   readonly kind: string
-  /** 对称模式归属：'target' | 'multi' | 'unknown' | 其它会话 id。 */
+  /** 服务端预算的净行数（不可得时缺省）。 */
+  readonly added?: number
+  readonly removed?: number
+  /** 归属徽标（信息展示）：'target' | 'multi' | 'unknown' | 其它会话 id。 */
   readonly owner?: string
-  /** 对称模式默认勾选（只属于目标会话的路径）。 */
-  readonly autoSelect?: boolean
 }
 
 interface RewindPreviewSkip {
@@ -138,24 +149,20 @@ type RewindPreview =
   | {
     readonly status: 'ready'
     readonly sessionId: string
-    readonly messageSeq: number
-    readonly turn: number
+    /** 寻址回显：turn 入口（按轮预览）不带 messageSeq；messageSeq 入口两者都可能带。 */
+    readonly messageSeq?: number
+    readonly turn?: number
     readonly checkpointId: string
-    /** 工作区绝对路径（新宿主）：行级预览按需拉全文时的 cwd 参数。 */
+    /** 工作区绝对路径：撤销恢复与「审查界面」定位用。 */
     readonly workspace?: string
-    /** 恢复语义模式：恒为 symmetric（勾选式子集；旧宿主可能缺省）。 */
-    readonly mode?: 'current-wins' | 'symmetric'
     readonly totalChanges: number
     readonly changes: readonly RewindPreviewChange[]
     readonly truncated: boolean
-    readonly activeSessionIds: readonly unknown[]
     readonly skippedPaths: readonly RewindPreviewSkip[]
     readonly planId?: string
     /** 当前页在全部变更中的起始下标（loadAll 分页校验用）。 */
     readonly offset?: number
   }
-
-type RewindMode = 'both' | 'code'
 
 // ── 入口：注册消息操作行的 portal 桥 ─────────────────────────────────────
 
@@ -177,9 +184,6 @@ export function rewindApply(ctx: Context): void {
     id: 'shadow-rewind-portals',
     order: 100,
     inject: () => ({
-      openRestoredSession: async (sessionId: string, promptText: string) => {
-        await openSessionWithDraft(ctx as unknown as RewindClientContext, sessionId, promptText)
-      },
       sessionScopeOf: (sessionId: string): SessionScopeLike | undefined =>
         (ctx as unknown as RewindClientContext).sessions.scope(sessionId) as SessionScopeLike | undefined,
     }),
@@ -190,6 +194,9 @@ export function rewindApply(ctx: Context): void {
 
 /** pending steering 气泡行（宿主权威的 pre-admission 投影）。 */
 const PENDING_SEAT_SELECTOR = '[data-pending-steering]'
+
+/** 所有会话座位行（含用户/助手/工具/命令），锚点 key 在 data-chat-anchor-key。 */
+const CHAT_SEAT_SELECTOR = '[data-chat-anchor-key]'
 
 /**
  * 定位 pending 行的操作按钮容器（copy 等 IconActions 行）：取行内最后一个
@@ -215,12 +222,23 @@ function bubbleTextOf(row: HTMLElement): string {
   return clone.textContent ?? ''
 }
 
-/** 从会话镜像收集 pending 撤回目标（子代理队列宿主侧拒绝变更，直接跳过）。 */
+/**
+ * 从会话镜像收集 pending 撤回目标（子代理队列宿主侧拒绝变更，直接跳过）。
+ * 会话镜像本身是 cordis 服务代理：在未把该服务声明进本插件 inject 的宿主上
+ * `scope.getSnapshot()` 会抛「cannot get property ... without inject」——撤回
+ * 只是可选增强，读不到队列就整组放弃，绝不让它把 durable 回退按钮的刷新
+ * 流程打断（durable 目标在 refresh 里先于它 setState）。
+ */
 function collectPendingTargets(sessionScope: SessionScopeLike | undefined): readonly PendingTarget[] {
   if (sessionScope === undefined) return []
-  const snapshot = sessionScope.getSnapshot() as {
+  let snapshot: {
     readonly subagent?: unknown
     readonly queue?: readonly { readonly id?: unknown; readonly placement?: unknown; readonly preview?: unknown; readonly text?: unknown }[]
+  }
+  try {
+    snapshot = sessionScope.getSnapshot() as typeof snapshot
+  } catch {
+    return []
   }
   if (snapshot?.queue === undefined || !Array.isArray(snapshot.queue)) return []
   if (snapshot.subagent !== null) return [] // 队列可变性闸（queueMutable = subagent === null）
@@ -323,27 +341,24 @@ function selectRewindMessage(node: RewindNodeLike): RewindMatched | null {
 
 interface RewindPortalsProps {
   readonly sessionId: string
-  readonly openRestoredSession: (sessionId: string, promptText: string) => Promise<void>
   readonly sessionScopeOf: (sessionId: string) => SessionScopeLike | undefined
-  readonly useSession: UseSession
+  /** dsh 0.1.2 起会话快照不再携带对话节点：直发消息候选改从 chat 视图快照
+   * （uiConversation chat target）的 legacy.nodes 取 kind='user' 节点。 */
+  readonly useChat: UseChat
 }
 
-/**
- * 恢复屏障取值：恢复成功那一刻会话快照的最大节点 seq（rewound-changes 的
- * 遮蔽判别基准）。
- */
-function rewindBarrier(useSession: UseSession): number {
-  let max = -1
-  for (const node of useSession((snapshot) => nodesOf(snapshot))) {
-    if (typeof node.seq === 'number' && node.seq > max) max = node.seq
-  }
-  return max
-}
-
-function RewindPortals({ sessionId, openRestoredSession, sessionScopeOf, useSession }: RewindPortalsProps) {
-  const nodes = useSession((snapshot) => nodesOf(snapshot))
+function RewindPortals({ sessionId, sessionScopeOf, useChat }: RewindPortalsProps) {
+  // chat 目标快照按不可变发布：useChat 每次渲染取同一引用，派生数组按引用
+  // 记忆化，避免「渲染 → 数组新引用 → effect 重跑」死循环。
+  const chat = useChat((value) => value)
+  const nodes = React.useMemo<readonly RewindNodeLike[]>(
+    () => chatUserNodes(chat as ChatSnapshot | undefined),
+    [chat],
+  )
   const [targets, setTargets] = React.useState<RewindTarget[]>([])
   const [pendingTargets, setPendingTargets] = React.useState<PendingTarget[]>([])
+  // M3 就地遮蔽：本次渲染中我们动手隐藏过的座位行（恢复显示时只动自己的）。
+  const hiddenSeats = React.useRef<WeakSet<HTMLElement>>(new WeakSet())
   React.useLayoutEffect(() => {
     let active = true
     let queued = false
@@ -353,6 +368,7 @@ function RewindPortals({ sessionId, openRestoredSession, sessionScopeOf, useSess
       setTargets((current) => sameTargets(current, next) ? current : next)
       const nextPending = collectPendingTargets(sessionScopeOf(sessionId))
       setPendingTargets((current) => samePendingTargets(current, nextPending) ? current : [...nextPending])
+      applyHiddenSeats(sessionId, chat, hiddenSeats.current)
     }
     // DOM 行可能晚于会话快照出现；MutationObserver + 微任务去重足够。
     // 首轮收集同样走微任务：commit 阶段绝不 setState，杜绝嵌套更新
@@ -374,9 +390,7 @@ function RewindPortals({ sessionId, openRestoredSession, sessionScopeOf, useSess
       matched: target.matched,
       container: target.container,
       sessionId,
-      openRestoredSession,
       sessionScopeOf,
-      useSession,
     })),
     ...pendingTargets.map((target) => React.createElement(RetractAction, {
       key: target.key,
@@ -395,49 +409,86 @@ function samePendingTargets(left: readonly PendingTarget[], right: readonly Pend
   })
 }
 
-/** nodesOf 的快照同一性缓存：选择器每次调用都必须返回**同一引用**——
- * `map.values()` 迭代器与 `[]` 字面量每次都是新对象，useSession 据此判定
- * store 在抖动，陷入「渲染 → 快照又变 → 再渲染」的无限循环，正是 React
- * #185（Maximum update depth exceeded）的根因。按不可变快照引用记忆化
- * （session-changes.ts 的徽标推导同款手法）。 */
-const nodesCache = new WeakMap<object, SessionNodes>()
+/** chatUserNodes 的快照同一性缓存：chat 快照按不可变发布，派生数组必须按
+ * 快照引用记忆化，否则每次渲染都是新引用，把 layout effect 拖进无限循环。 */
+const chatNodesCache = new WeakMap<object, readonly RewindNodeLike[]>()
 
-const EMPTY_NODES: SessionNodes = []
+const EMPTY_CHAT_NODES: readonly RewindNodeLike[] = []
 
-/** 兼容不同 dsh 版本的快照形态：优先 chat.nodes（Map，物化成数组以稳定引用），回退顶层 nodes。 */
-function nodesOf(snapshot: unknown): SessionNodes {
-  if (typeof snapshot !== 'object' || snapshot === null) return EMPTY_NODES
-  const hit = nodesCache.get(snapshot)
-  if (hit !== undefined) return hit
-  const record = snapshot as {
-    chat?: { nodes?: Map<unknown, RewindNodeLike> }
-    nodes?: SessionNodes
+/** 从 view 节点里探测用户消息的事件 seq（legacy 记录无 key，锚点 key 靠 seq
+ * 对齐——宿主对同一个 user 消息会同时给出 legacy 记录与 chat view 节点）。 */
+function probeUserSeq(node: unknown): number | undefined {
+  if (typeof node !== 'object' || node === null) return undefined
+  const record = node as {
+    readonly anchorSeq?: unknown
+    readonly seq?: unknown
+    readonly kind?: unknown
+    readonly data?: { readonly node?: { readonly seq?: unknown }; readonly seq?: unknown }
   }
-  const nodes: SessionNodes = record.chat?.nodes !== undefined
-    ? Array.from(record.chat.nodes.values())
-    : record.nodes ?? EMPTY_NODES
-  nodesCache.set(snapshot, nodes)
-  return nodes
+  const candidates = [
+    record.anchorSeq,
+    record.seq,
+    record.data?.seq,
+    record.data?.node?.seq,
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number' && Number.isSafeInteger(candidate) && candidate >= 0) return candidate
+  }
+  return undefined
+}
+
+/** 从 chat 视图快照（uiConversation chat target）取直发用户消息节点：
+ * 内容/seq 来自 legacy.user 记录，data-chat-anchor-key 锚点来自同 seq 的
+ * chat view 节点（legacy 记录本身没有 key）。 */
+function chatUserNodes(chat: ChatSnapshot | null | undefined): readonly RewindNodeLike[] {
+  if (chat === null || chat === undefined) return EMPTY_CHAT_NODES
+  const hit = chatNodesCache.get(chat)
+  if (hit !== undefined) return hit
+  const legacyNodes = chat.legacy?.nodes
+  const legacyUsers = Array.isArray(legacyNodes)
+    ? legacyNodes.filter((node): node is RewindNodeLike =>
+      typeof node === 'object' && node !== null
+      && (node as { readonly kind?: unknown }).kind === 'user')
+    : []
+  // seq → chat view key（用户座位行的 data-chat-anchor-key）。
+  const keyBySeq = new Map<number, string>()
+  let viewNodes: readonly unknown[] = []
+  try {
+    viewNodes = chat.nodes?.values?.() ?? []
+  } catch {
+    viewNodes = []
+  }
+  for (const viewNode of viewNodes) {
+    const record = viewNode as { readonly key?: unknown; readonly kind?: unknown }
+    if (record.kind !== 'user') continue
+    const seq = probeUserSeq(viewNode)
+    if (typeof seq === 'number' && typeof record.key === 'string') keyBySeq.set(seq, record.key)
+  }
+  const users: readonly RewindNodeLike[] = legacyUsers.length > 0
+    ? legacyUsers.map((node) => {
+      const seq = typeof node.seq === 'number' && Number.isSafeInteger(node.seq) ? node.seq : undefined
+      const key = seq === undefined ? undefined : keyBySeq.get(seq)
+      return { ...node, ...(key === undefined ? {} : { key }) }
+    })
+    : EMPTY_CHAT_NODES
+  chatNodesCache.set(chat, users)
+  return users
 }
 
 interface RewindActionProps {
   readonly matched: RewindMatched
   readonly container: HTMLElement
   readonly sessionId: string
-  readonly openRestoredSession: (sessionId: string, promptText: string) => Promise<void>
   readonly sessionScopeOf: (sessionId: string) => SessionScopeLike | undefined
-  readonly useSession: UseSession
 }
 
-function RewindAction({ matched, container, sessionId, openRestoredSession, useSession }: RewindActionProps) {
+function RewindAction({ matched, container, sessionId }: RewindActionProps) {
   const [open, setOpen] = React.useState(false)
   return React.createElement(React.Fragment, null,
     createPortalButton(container, matched, () => setOpen(true)),
     open && React.createElement(RewindDialog, {
       sessionId,
-      matched,
-      openRestoredSession,
-      useSession,
+      target: matched,
       onClose: () => setOpen(false),
     }),
   )
@@ -550,18 +601,22 @@ function createPortalButton(container: HTMLElement, _matched: RewindMatched, onO
 
 // ── 回退对话框 ──────────────────────────────────────────────────────────
 
-interface RewindDialogProps {
+export interface RewindDialogProps {
   readonly sessionId: string
-  readonly matched: RewindMatched
-  readonly openRestoredSession: (sessionId: string, promptText: string) => Promise<void>
-  readonly useSession: UseSession
+  /** 统一寻址：消息按钮 = RewindMatched；审计面板「从快照恢复此轮」= { turn }。 */
+  readonly target: RewindDialogTarget
+  /** 点某行的 +/- 就地跳到该文件 diff（审计面板内打开时提供）；缺省经
+   * audit-open 总线交给 live 条开全屏审查并深链。 */
+  readonly onJumpToDiff?: (path: string) => void
   readonly onClose: () => void
 }
 
-function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onClose }: RewindDialogProps) {
+export function RewindDialog({ sessionId, target, onJumpToDiff, onClose }: RewindDialogProps) {
+  // 消息入口才有 messageSeq 寻址（就地遮蔽以该消息为界）；轮入口只恢复文件。
+  const targetMessageSeq = 'messageSeq' in target ? target.messageSeq : undefined
+  const promptText = 'messageSeq' in target ? target.promptText : ''
   const [loading, setLoading] = React.useState(true)
   const [preview, setPreview] = React.useState<RewindPreview | null>(null)
-  const [mode, setMode] = React.useState<RewindMode>('both')
   const [applying, setApplying] = React.useState(false)
   const [stale, setStale] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
@@ -570,8 +625,29 @@ function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onC
   const [undoing, setUndoing] = React.useState(false)
   // EXPECTED-DESIGN 1.2：probe 探到 CAS 冲突时的三选项弹窗清单（null = 不弹）。
   const [undoConflicts, setUndoConflicts] = React.useState<readonly { path: string; reason: string }[] | null>(null)
-  // 对称模式的勾选集（null = 非对称模式，整树恢复）。
-  const [selected, setSelected] = React.useState<ReadonlySet<string> | null>(null)
+
+  // Esc 关闭（manual §1.1：Esc / 点遮罩 / ✕ 三种关闭，与 AuditOverlay /
+  // timeline 同一交互约定）。恢复执行中或冲突三选项子对话框打开时不响应，
+  // 防止误关整个恢复流程。
+  React.useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return
+      if (applying || undoing || undoConflicts !== null) return
+      onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => { window.removeEventListener('keydown', onKey) }
+  }, [onClose, applying, undoing, undoConflicts])
+
+  /** 点某行的 +/-：就地跳转（面板内）或开全屏审查（消息旁，弹窗随之关闭）。 */
+  const jumpToDiff = (path: string): void => {
+    if (onJumpToDiff !== undefined) {
+      onJumpToDiff(path)
+      return
+    }
+    openAuditOverlay([path])
+    onClose()
+  }
 
   const load = React.useCallback(async (silent = false) => {
     if (!silent) {
@@ -581,57 +657,34 @@ function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onC
       setCompleted(null)
     }
     try {
-      const response = await fetch(`${PATH}?sessionId=${encodeURIComponent(sessionId)}&messageSeq=${String(matched.messageSeq)}`, {
-        headers: { accept: 'application/json' }, cache: 'no-store',
-      })
-      const first = decodePreview(await responseJson(response))
-      // 对称模式：勾选清单必须覆盖全部变更——自动按页拉全后初始化默认勾选
-      // （只属于目标会话的路径）。
-      if (first.status === 'ready' && first.mode === 'symmetric' && first.truncated) {
-        const collected = [...first.changes]
-        let offset = collected.length
-        while (first.totalChanges > offset) {
-          const pageResponse = await fetch(`${PATH}?sessionId=${encodeURIComponent(sessionId)}&messageSeq=${String(matched.messageSeq)}&details=1&offset=${String(offset)}&limit=200`, {
-            headers: { accept: 'application/json' }, cache: 'no-store',
-          })
-          const page = decodePreview(await responseJson(pageResponse))
-          if (page.status !== 'ready' || page.checkpointId !== first.checkpointId || page.offset !== offset) {
-            throw new RewindRequestError('PLAN_STALE', '项目文件在展开列表时发生了变化。')
-          }
-          collected.push(...page.changes)
-          offset += page.changes.length
-          if (page.changes.length === 0) break
-        }
-        const merged: RewindPreview = { ...first, changes: collected, truncated: false }
-        setPreview(merged)
-        setSelected(new Set(merged.changes.filter(change => change.autoSelect === true).map(change => change.path)))
-        return
-      }
-      setPreview(first)
-      setSelected(first.status === 'ready' && first.mode === 'symmetric'
-        ? new Set(first.changes.filter(change => change.autoSelect === true).map(change => change.path))
-        : null)
+      // 共享加载器（preview-http）：GET + 分页拉全 + 解码一次做完。
+      // 统一寻址：turn / messageSeq 二选一，与端点 query 对应。
+      const shared = await fetchSharedRewindPreview(sessionId, target)
+      setPreview(decodePreview(shared))
     } catch (caught) {
-      // 静默重查失败不动已有预览（占用未解除是常态，不算错误）。
-      if (!silent) setError(friendlyError(caught))
+      // 静默重查失败不动已有预览。
+      if (caught instanceof RewindPreviewHttpError) {
+        if (caught.code === 'PLAN_STALE') setStale(true)
+        if (!silent) setError(previewHttpMessage(caught))
+      } else if (!silent) {
+        setError(friendlyError(caught))
+      }
     } finally {
       if (!silent) setLoading(false)
     }
-  }, [sessionId, matched.messageSeq])
+  }, [sessionId, target])
 
   React.useEffect(() => { void load() }, [load])
 
   const ready = preview !== null && preview.status === 'ready' ? preview : null
   const hasChanges = ready !== null && ready.totalChanges > 0
-  const symmetric = ready?.mode === 'symmetric'
-  const selectedCount = selected?.size ?? 0
-  const allSelected = symmetric && ready !== null && selected !== null
-    && selected.size >= ready.changes.length && ready.changes.length > 0
-  const planMissing = hasChanges && ready !== null
-    && ready.planId === undefined
+  const planMissing = hasChanges && ready !== null && ready.planId === undefined
+  // 文件可零改动（会话已被该消息之后的内容推进、文件早已同步）——消息入口
+  // 仍允许只做对话就地遮蔽，因此 hasChanges 不作为门槛。
+  const needsFileRestore = targetMessageSeq === undefined || hasChanges
   const canApply = ready !== null && !loading && !applying && completed === null
-    && hasChanges && !planMissing && !stale
-    && (!symmetric || selectedCount > 0)
+    && !planMissing && !stale
+    && (!needsFileRestore || hasChanges)
   const canUndo = completed !== null && ready !== null && ready.workspace !== undefined && !undoing && !applying
 
   const undoRestore = async () => {
@@ -681,7 +734,13 @@ function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onC
         headers: { accept: 'application/json', 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId, cwd: ready.workspace, ...(force ? { force: true } : {}) }),
       })
-      const record = await responseJson(response) as { undonePaths?: unknown; skippedPaths?: unknown }
+      const record = await responseJson(response) as {
+        undonePaths?: unknown
+        skippedPaths?: unknown
+        /** 被撤销恢复的身份（T7：对齐遮蔽记录层，防多会话同工作区弹错层）。 */
+        id?: unknown
+        sessionId?: unknown
+      }
       const undone = Array.isArray(record.undonePaths) ? record.undonePaths.length : 0
       const skipped = Array.isArray(record.skippedPaths)
         ? record.skippedPaths.filter((item): item is { path: string; reason: string } =>
@@ -694,58 +753,18 @@ function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onC
       if (skipped.length > 0) lines.push('被跳过的文件仍可再次点击「撤销本次恢复」，确认后强制回滚。')
       setCompleted(lines.join('\n'))
       setUndoConflicts(null)
-      // 撤销成功：弹出最近一次遮蔽标记，live 条恢复显示恢复前的改动。
-      if (undone > 0 || force) popRewound(sessionId)
+      // 撤销成功：若被撤销的恢复正是本会话发起的（或宿主未回传身份 = 旧宿主，
+      // 维持原行为），弹出最近一次遮蔽标记让 live 条恢复显示恢复前的改动；
+      // 若是**其它会话**在同一工作区的恢复被撤销，绝不弹本会话的遮蔽层
+      // （那层对应的磁盘状态仍有效），避免「弹错层」。fs 缓存任何磁盘变化都刷。
+      const undoneSessionId = typeof record.sessionId === 'string' ? record.sessionId : undefined
+      const poppedThisSession = undoneSessionId === undefined || undoneSessionId === sessionId
+      if ((undone > 0 || force) && poppedThisSession) popRewound(sessionId)
+      if (undone > 0 || force) forceWarmFsChanges(sessionId)
     } catch (undoError) {
       setError(`撤销失败：${messageOf(undoError)}`)
     } finally {
       setUndoing(false)
-    }
-  }
-
-  const togglePath = (path: string) => {
-    setSelected((current) => {
-      if (current === null) return current
-      const next = new Set(current)
-      if (next.has(path)) next.delete(path)
-      else next.add(path)
-      return next
-    })
-  }
-
-  const setAllPaths = (selectAll: boolean) => {
-    setSelected((current) => {
-      if (current === null) return current
-      if (!selectAll) return new Set<string>()
-      const readyNow = preview !== null && preview.status === 'ready' ? preview : null
-      return readyNow === null ? current : new Set(readyNow.changes.map(change => change.path))
-    })
-  }
-
-  const loadAll = async () => {
-    if (ready === null || !ready.truncated) return
-    setLoading(true)
-    try {
-      const collected = [...ready.changes]
-      let offset = collected.length
-      while (offset < ready.totalChanges) {
-        const response = await fetch(`${PATH}?sessionId=${encodeURIComponent(sessionId)}&messageSeq=${String(matched.messageSeq)}&details=1&offset=${String(offset)}&limit=200`, {
-          headers: { accept: 'application/json' }, cache: 'no-store',
-        })
-        const page = decodePreview(await responseJson(response))
-        if (page.status !== 'ready' || page.checkpointId !== ready.checkpointId || page.offset !== offset) {
-          throw new RewindRequestError('PLAN_STALE', '项目文件在展开列表时发生了变化。')
-        }
-        collected.push(...page.changes)
-        offset += page.changes.length
-        if (page.changes.length === 0) break
-      }
-      setPreview({ ...ready, changes: collected, truncated: false })
-    } catch (caught) {
-      if (caught instanceof RewindRequestError && caught.code === 'PLAN_STALE') setStale(true)
-      setError(friendlyError(caught))
-    } finally {
-      setLoading(false)
     }
   }
 
@@ -754,54 +773,59 @@ function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onC
     setApplying(true)
     setError(null)
     try {
-      let planId = ready.planId
-      // 对称模式且未全选：先铸造只覆盖勾选路径的子集计划（确认由本弹窗
-      // 承担——确认串已废除，EXPECTED-DESIGN 1.4 #2）。
-      if (ready.planId !== undefined
-        && symmetric && selected !== null && selected.size < ready.totalChanges) {
-        const paths = ready.changes.filter(change => selected.has(change.path)).map(change => change.path)
-        if (paths.length > 0) {
-          if (pathsTooLong(paths)) throw new Error('勾选的文件过多，无法构造恢复请求；请减少勾选')
-          const subset = await fetchSubsetPlan(`sessionId=${encodeURIComponent(sessionId)}&messageSeq=${String(matched.messageSeq)}`, paths)
-          planId = subset.planId
-        }
-      }
-      const response = await fetch(PATH, {
-        method: 'POST',
-        headers: { accept: 'application/json', 'content-type': 'application/json' },
-        body: JSON.stringify({
-          mode,
+      const filesDone = ready.totalChanges > 0
+      if (filesDone) {
+        // 唯一恢复语义：整树（无子集）——宿主把工作区恢复到该检查点，
+        // 丢弃其后一切写盘。
+        const response = await fetch(PATH, {
+          method: 'POST',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            // 双寻址：消息入口走 messageSeq；轮入口走 turn。
+            ...(targetMessageSeq === undefined
+              ? { turn: 'turn' in target ? target.turn : 0 }
+              : { messageSeq: targetMessageSeq }),
+            checkpointId: ready.checkpointId,
+            planId: ready.planId,
+          }),
+        })
+        await responseJson(response)
+        // 恢复成功：打整树遮蔽标记（paths = null），live 条的会话累计视图据此
+        // 扣掉屏障之前的全部条目；「撤销本次恢复」弹出标记即还原。
+        // 屏障 = 当前 chat 快照全量最大 seq；快照不可得时 barrier=-1。
+        const snapshot = chatSnapshotOf(rewindContextRef, sessionId)
+        const barrier = snapshot === undefined || snapshot === null ? -1 : snapshotBarrierOf(snapshot)
+        commitRestore({
           sessionId,
-          messageSeq: ready.messageSeq,
+          paths: null,
+          barrier,
           checkpointId: ready.checkpointId,
-          planId,
-        }),
-      })
-      const result = await responseJson(response)
-      // 恢复成功：打回滚遮蔽标记，live 条的会话累计视图据此扣掉被恢复的条目
-      // （屏障 = 当前快照最大节点 seq；屏障后的再编辑照常显示）。
-      // 对称模式只遮蔽勾选（被恢复）的路径；整树恢复（非对称）遮蔽全部路径。
-      markRewound(
-        sessionId,
-        symmetric && selected !== null
-          ? new Set(ready.changes.filter(change => selected.has(change.path)).map(change => pathKey(change.path)))
-          : null,
-        rewindBarrier(useSession),
-      )
-      if (mode === 'code') {
-        setCompleted('项目文件已恢复；当前对话保持不变。恢复前的文件已自动备份。')
+          mode: 'inplace',
+          workspace: ready.workspace,
+        })
+        // 磁盘确定性变化：绕过 warm 节流立即刷新 fs 缓存（审计/live 同源）。
+        forceWarmFsChanges(sessionId)
+      }
+      if (targetMessageSeq === undefined) {
+        setCompleted(filesDone
+          ? '项目文件已恢复；当前对话保持不变。恢复前的文件已自动备份。'
+          : '项目文件已经是这一轮开始之前的状态，无需恢复。')
         return
       }
-      setCompleted('项目文件已恢复，并已创建新对话。恢复前的文件已自动备份。')
-      try {
-        await openRestoredSession((result as { sessionId?: string }).sessionId ?? '', matched.promptText)
-        onClose()
-      } catch (navigationError) {
-        setError(`文件已经恢复，新对话也已创建，但没能自动打开：${messageOf(navigationError)}`)
+      const outcome = await runInplaceMask(sessionId, targetMessageSeq)
+      if (outcome.status !== 'ok') {
+        const prefix = filesDone ? '项目文件已恢复；' : ''
+        setError(`${prefix}本对话就地回退失败：${outcome.text}`)
+        return
       }
+      // 目标消息文本放回输入框（仅本会话、输入框为空时，绝不覆盖草稿）。
+      fillComposerIfEmpty(sessionId, promptText)
+      setCompleted(filesDone
+        ? '项目文件已恢复；本对话已就地回退到这条消息之前（目标及之后消息已撤回，文本已在输入框）。'
+        : '本对话已就地回退到这条消息之前（目标及之后消息已撤回，文本已在输入框）；文件无需改动。')
     } catch (caught) {
-      if ((caught instanceof RewindRequestError || caught instanceof SubsetPlanError)
-        && caught.code === 'PLAN_STALE') {
+      if (caught instanceof RewindRequestError && caught.code === 'PLAN_STALE') {
         setStale(true)
       }
       setError(friendlyError(caught))
@@ -810,10 +834,10 @@ function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onC
     }
   }
 
-  const radioName = `srw-${sessionId}-${String(matched.messageSeq)}`
+  const messageEntry = targetMessageSeq !== undefined
   return React.createElement('div', { className: 'srw-overlay', role: 'dialog', 'aria-modal': 'true' },
     React.createElement('div', { className: 'srw-dialog' },      React.createElement('div', { className: 'srw-dialog-head' },
-        React.createElement('strong', null, '恢复到发送这条消息之前'),
+        React.createElement('strong', null, messageEntry ? '恢复到发送这条消息之前' : '恢复到此轮之前'),
         React.createElement('button', { type: 'button', className: 'srw-trigger', onClick: onClose, 'aria-label': '关闭' }, '✕'),
       ),
       React.createElement('div', { className: 'srw-content' },
@@ -824,17 +848,12 @@ function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onC
           preview?.status === 'skipped' && React.createElement('p', { className: 'srw-status' }, '为避免阻塞消息发送，本轮没有自动保存文件：', preview.reason),
           preview?.status === 'failed' && React.createElement('p', { className: 'srw-error' }, '没能保存这条消息发送之前的文件：', preview.error),
           ready !== null && [
-            React.createElement('div', { key: 'options' },
-              optionRadio(radioName, 'both', mode, applying, setMode, '恢复文件并从这里继续', '创建一个从这里开始的新会话（当前对话会保留）'),
-              optionRadio(radioName, 'code', mode, applying, setMode, '只恢复文件', '恢复这条消息发送之前的文件，当前对话保持不变。'),
-            ),
             React.createElement('div', { className: 'srw-summary', key: 'summary' },
-              React.createElement('strong', null, symmetric
-                ? `将恢复 ${String(selectedCount)} / ${String(ready.totalChanges)} 个文件`
-                : `将恢复 ${String(ready.totalChanges)} 个文件`),
-              React.createElement('span', null, mode === 'both' ? '恢复后在新对话里继续' : '当前对话保持不变'),
+              React.createElement('strong', null, `将把整个工作区恢复到该时点（${String(ready.totalChanges)} 个文件受影响）`),
+              React.createElement('span', null, messageEntry ? '本对话就地回退' : '当前对话保持不变'),
             ),
-            symmetric && React.createElement('p', { className: 'srw-status', key: 'hint' }, '默认只勾选本会话改动的文件；勾选其它文件会把它们一并恢复到该时点。'),
+            React.createElement('p', { className: 'srw-status', key: 'hint' },
+              '恢复按检查点整树进行：这之后的一切写盘都会被丢弃——包括终端/外部进程的改动与你自己手动做的修改。'),
             ready.skippedPaths.length > 0 && React.createElement('div', { className: 'srw-skipped', key: 'skipped' }, [
               React.createElement('div', { key: 'title' }, '以下文件未纳入快照，恢复不会改动它们：'),
               ...ready.skippedPaths.map((skip) => React.createElement('div', { key: skip.path },
@@ -843,27 +862,13 @@ function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onC
             planMissing && React.createElement('p', { className: 'srw-error', key: 'plan' }, '恢复信息已经失效，请重新检查。'),
             stale && React.createElement('p', { className: 'srw-error', key: 'stale' }, '项目文件在检查后又发生了变化。为避免覆盖新修改，本次恢复已失效，请重新检查。'),
             ready.totalChanges === 0 && React.createElement('p', { className: 'srw-status', key: 'nochanges' }, '项目文件已经是这条消息发送前的状态，无需恢复。'),
-            ready.changes.length > 0 && React.createElement('div', { className: 'srw-files', key: 'files' }, [
-              symmetric && React.createElement('label', { className: 'srw-select-all', key: 'selectall' },
-                React.createElement('input', {
-                  type: 'checkbox',
-                  checked: allSelected,
-                  onChange: (event) => { setAllPaths(event.target.checked) },
-                }),
-                '全部选中（整树恢复）',
-              ),
-              ...ready.changes.map((change) => React.createElement(PreviewFileRow, {
+            ready.changes.length > 0 && React.createElement('div', { className: 'srw-files', key: 'files' },
+              ready.changes.map((change) => React.createElement(PreviewFileRow, {
                 key: change.path,
                 change,
-                checkpointId: ready.checkpointId,
-                workspace: ready.workspace,
-                symmetric,
-                checked: selected?.has(change.path) ?? false,
-                onTogglePath: () => { togglePath(change.path) },
+                onJump: () => { jumpToDiff(change.path) },
               })),
-            ]),
-            ready.truncated && React.createElement('button', { type: 'button', className: 'srw-retry', key: 'more', onClick: () => { void loadAll() } },
-              `查看全部 ${String(ready.totalChanges)} 个文件`),
+            ),
           ],
           completed !== null && React.createElement('p', { className: 'srw-status', style: { whiteSpace: 'pre-line' } }, completed),
           completed !== null && canUndo && React.createElement('button', {
@@ -878,7 +883,11 @@ function RewindDialog({ sessionId, matched, openRestoredSession, useSession, onC
       React.createElement('div', { className: 'srw-foot' },
         React.createElement('button', { type: 'button', onClick: onClose, disabled: applying }, '取消'),
         React.createElement('button', { type: 'button', onClick: () => { void applyRestore() }, disabled: !canApply },
-          applying ? '正在恢复…' : completed === null ? (mode === 'both' ? '恢复并从这里继续' : '恢复文件') : '已完成'),
+          applying
+            ? '正在恢复…'
+            : completed === null
+              ? messageEntry ? '就地回退' : '恢复文件'
+              : '已完成'),
       ),
     ),
     undoConflicts !== null && React.createElement(UndoConflictDialog, {
@@ -935,118 +944,34 @@ function UndoConflictDialog({ conflicts, busy, onAbort, onPartial, onForce }: {
 }
 
 /**
- * 恢复预览的文件行（A3）：点击展开「当前 → 快照」方向的行级 diff——
- * del = 恢复会带走的当前行，add = 恢复会加回来的快照行。
- * 旧宿主没有 workspace 字段时退化为纯清单行（不展开）。
+ * 恢复预览的文件行：路径 + 服务端预算的净 +/- 行数（与 live 条同一口径）。
+ * 完整的逐处 diff 在审查界面里看——点该行跳过去（深链展开该文件）。
  */
-function PreviewFileRow({ change, checkpointId, workspace, symmetric, checked, onTogglePath }: {
+function PreviewFileRow({ change, onJump }: {
   readonly change: RewindPreviewChange
-  readonly checkpointId: string
-  readonly workspace?: string
-  readonly symmetric: boolean
-  readonly checked: boolean
-  readonly onTogglePath: () => void
+  readonly onJump: () => void
 }): React.ReactElement {
-  const [open, setOpen] = React.useState(false)
-  const badge = change.owner === undefined || change.owner === 'target'
-    ? null
-    : change.owner === 'multi'
-      ? '双方都改过'
-      : change.owner === 'unknown'
-        ? '来源不明'
-        : `会话 ${change.owner.length > 12 ? `${change.owner.slice(0, 12)}…` : change.owner}`
-  const expandable = workspace !== undefined && change.kind !== 'type-changed'
+  const hasStats = change.added !== undefined || change.removed !== undefined
+  const stats = { added: change.added ?? 0, removed: change.removed ?? 0 }
   return React.createElement('div', { key: change.path },
     React.createElement('div', {
       className: 'srw-file',
-      'data-expandable': expandable ? 'true' : undefined,
-      onClick: expandable ? () => setOpen((current) => !current) : undefined,
+      'data-expandable': 'true',
+      onClick: onJump,
     },
-      symmetric && React.createElement('input', {
-        type: 'checkbox',
-        checked,
-        onClick: (event: React.MouseEvent) => { event.stopPropagation() },
-        onChange: onTogglePath,
-      }),
       React.createElement('code', null, change.path),
-      badge !== null && React.createElement('span', { className: 'srw-kind' }, badge),
-      React.createElement('span', { className: 'srw-kind' }, kindLabel(change.kind)),
-      expandable && React.createElement('span', { className: 'srw-kind' }, open ? '收起 ▲' : '对比 ▼'),
-    ),
-    open && expandable && React.createElement(PreviewFileDiff, {
-      path: change.path,
-      kind: change.kind,
-      checkpointId,
-      workspace,
-    }),
-  )
-}
-
-/** 行级预览内容：当前磁盘 vs 快照（方向 当前 → 快照）。 */
-function PreviewFileDiff({ path, kind, checkpointId, workspace }: {
-  readonly path: string
-  readonly kind: string
-  readonly checkpointId: string
-  readonly workspace: string
-}): React.ReactElement {
-  const [diff, setDiff] = React.useState<readonly ProducedFileDiff[] | 'unavailable' | null>(null)
-  React.useEffect(() => {
-    let active = true
-    setDiff(null)
-    // kind 语义来自 inspect（快照 → 当前）：added = 现在才存在（恢复会移除），
-    // deleted = 快照里有、现在没了（恢复会写回）。
-    const isAddedNow = kind === 'added'
-    const isGoneNow = kind === 'deleted'
-    void Promise.all([
-      isGoneNow ? Promise.resolve('') : fetchCheckpointFileContent('live', path, workspace),
-      isAddedNow ? Promise.resolve('') : fetchCheckpointFileContent(checkpointId, path, workspace),
-    ]).then(([current, snapshot]) => {
-      if (!active) return
-      if (current === null && snapshot === null) {
-        setDiff('unavailable')
-        return
-      }
-      // 方向 = 当前 → 快照：del = 恢复会带走的行，add = 恢复会加回来的行。
-      setDiff([{ path, oldText: current ?? '', newText: snapshot ?? '' }])
-    })
-    return () => { active = false }
-  }, [path, kind, checkpointId, workspace])
-  if (diff === null) return React.createElement('div', { className: 'srw-file-diff' }, React.createElement('p', { className: 'srw-status' }, '加载全文…'))
-  if (diff === 'unavailable') return React.createElement('div', { className: 'srw-file-diff' }, React.createElement('p', { className: 'srw-status' }, '内容不可用（二进制文件或读取失败）。'))
-  return React.createElement('div', { className: 'srw-file-diff' },
-    React.createElement(UnifiedDiff, {
-      diffs: diff,
-      contextLines: 3,
-      showCopyButton: true,
-      labels: {
-        copy: '复制差异',
-        copied: '已复制',
-        showUnchanged: (count: number) => `显示 ${String(count)} 行未变更内容`,
-        hideUnchanged: (count: number) => `折叠 ${String(count)} 行未变更内容`,
-        hunkN: (n: number) => `块 ${String(n)}`,
-        hunkInclude: '勾选的块参与撤销/重做',
+      hasStats && React.createElement('button', {
+        type: 'button',
+        className: 'srw-stats',
+        title: '在审查界面查看这个文件的完整 diff',
+        onClick: (event: React.MouseEvent) => {
+          event.stopPropagation()
+          onJump()
+        },
       },
-    }),
-  )
-}
-
-function optionRadio(
-  radioName: string,
-  value: RewindMode,
-  mode: RewindMode,
-  disabled: boolean,
-  setMode: (value: RewindMode) => void,
-  title: string,
-  description: string,
-) {
-  return React.createElement('label', { className: 'srw-option', 'data-selected': mode === value, key: value },
-    React.createElement('input', {
-      type: 'radio', name: radioName, checked: mode === value, disabled,
-      onChange: () => setMode(value),
-    }),
-    React.createElement('span', { className: 'srw-option-content' },
-      React.createElement('strong', null, title),
-      React.createElement('span', { className: 'srw-option-description' }, description),
+        React.createElement('span', { className: 'srw-added' }, `+${String(stats.added)}`),
+        React.createElement('span', { className: 'srw-removed' }, `-${String(stats.removed)}`),
+      ),
     ),
   )
 }
@@ -1054,89 +979,83 @@ function optionRadio(
 // ── 协议解析与文案 ───────────────────────────────────────────────────────
 
 function decodePreview(value: unknown): RewindPreview {
-  const record = recordOf(value)
-  const status = requiredString(record.status, 'status')
-  if (status === 'pending' || status === 'missing') return { status }
-  if (status === 'skipped') return { status, reason: requiredString(record.reason, 'reason') }
-  if (status === 'failed') return { status, error: requiredString(record.error, 'error') }
-  if (status !== 'ready') throw new Error(`未知回退状态：${status}`)
-  if (!Array.isArray(record.changes)) throw new Error('回退预览缺少 changes')
-  const activeSessionIds = Array.isArray(record.activeSessionIds) ? record.activeSessionIds : []
-  // 跳过项明细：[{path, reason}]，逐条渲染给用户看。
-  const skippedPaths = Array.isArray(record.skippedPaths)
-    ? record.skippedPaths.map((entry) => {
-      const skip = recordOf(entry)
-      return { path: requiredString(skip.path, 'path'), reason: requiredString(skip.reason, 'reason') }
-    })
-    : []
+  // 字段解析共用 preview-http 的 decodeSharedRewindPreview；这里只做统一弹窗
+  // 的「就绪必填」严格校验与文案字段映射。寻址回显按入口宽松：turn 入口不带
+  // messageSeq，messageSeq 入口可能不带 turn。
+  const shared = decodeSharedRewindPreview(value)
+  if (shared.status !== 'ready') {
+    if (shared.status === 'skipped') return { status: 'skipped', reason: shared.reason ?? '' }
+    if (shared.status === 'failed') return { status: 'failed', error: shared.error ?? shared.reason ?? '' }
+    return { status: shared.status }
+  }
+  const sessionId = requiredString(shared.sessionId, 'sessionId')
+  const messageSeq = optionalInteger(shared.messageSeq)
+  const turn = optionalInteger(shared.turn)
+  const checkpointId = requiredString(shared.checkpointId, 'checkpointId')
   return {
-    status,
-    sessionId: requiredString(record.sessionId, 'sessionId'),
-    messageSeq: requiredInteger(record.messageSeq, 'messageSeq'),
-    turn: requiredInteger(record.turn, 'turn'),
-    checkpointId: requiredString(record.checkpointId, 'checkpointId'),
-    ...(record.mode === 'symmetric' || record.mode === 'current-wins' ? { mode: record.mode } : {}),
-    totalChanges: requiredInteger(record.totalChanges, 'totalChanges'),
-    changes: record.changes.map((entry) => {
-      const change = recordOf(entry)
-      return {
-        path: requiredString(change.path, 'path'),
-        kind: requiredString(change.kind, 'kind'),
-        ...(typeof change.owner === 'string' ? { owner: change.owner } : {}),
-        ...(change.autoSelect === true ? { autoSelect: true as const } : {}),
-      }
-    }),
-    truncated: record.truncated === true,
-    activeSessionIds,
-    skippedPaths,
-    ...(typeof record.workspace === 'string' ? { workspace: record.workspace } : {}),
-    ...(typeof record.planId === 'string' ? { planId: record.planId } : {}),
-    ...(typeof record.offset === 'number' ? { offset: record.offset } : {}),
+    status: 'ready',
+    sessionId,
+    ...(messageSeq === undefined ? {} : { messageSeq }),
+    ...(turn === undefined ? {} : { turn }),
+    checkpointId,
+    totalChanges: requiredInteger(shared.totalChanges, 'totalChanges'),
+    changes: shared.changes.map((change) => ({
+      path: change.path,
+      kind: change.kind,
+      ...(change.added === undefined ? {} : { added: change.added }),
+      ...(change.removed === undefined ? {} : { removed: change.removed }),
+      ...(change.owner === undefined ? {} : { owner: change.owner }),
+    })),
+    truncated: shared.truncated,
+    skippedPaths: shared.skippedPaths,
+    ...(shared.workspace === undefined ? {} : { workspace: shared.workspace }),
+    ...(shared.planId === undefined ? {} : { planId: shared.planId }),
+    ...(shared.offset === undefined ? {} : { offset: shared.offset }),
   }
 }
 
-/** 跳过原因的用户文案。 */
-function skipReasonLabel(reason: string): string {
-  switch (reason) {
-    case 'too-large': return '超过大小上限'
-    case 'unsupported-type': return '文件类型不支持'
-    case 'read-failed': return '读取失败'
-    default: return reason
-  }
-}
-
-function kindLabel(kind: string): string {
-  switch (kind) {
-    case 'added': return '移除后来新增的文件'
-    case 'deleted': return '找回文件'
-    case 'modified': return '恢复之前的版本'
-    case 'mode-changed': return '恢复文件权限'
-    case 'type-changed': return '恢复之前的文件类型'
-    default: return kind
-  }
+/** 共享加载器抛错的用户文案（单源映射；未覆盖码回落宿主原文）。 */
+function previewHttpMessage(error: RewindPreviewHttpError): string {
+  return rewindErrorText(error.code) ?? error.message
 }
 
 function friendlyError(error: unknown): string {
-  if (error instanceof RewindRequestError) {
-    switch (error.code) {
-      case 'PLAN_STALE': return '项目文件在检查后又发生了变化。为避免覆盖新修改，请重新检查后再恢复。'
-      case 'RESTORE_POINT_NOT_FOUND': return '没有找到对应的文件状态，可能已被清理。'
-      case 'NO_CHANGES': return '项目文件已经是这条消息发送前的状态，无需恢复。'
-      case 'RESTORE_FAILED_ROLLED_BACK': return '恢复未能完成，项目文件已自动还原到操作前的状态。'
-      case 'CONVERSATION_REWIND_FAILED': return '文件已恢复，但无法创建新对话；项目文件已自动还原。'
-      case 'RECOVERY_REQUIRED': return error.message
-      default: return error.message
-    }
-  }
+  // 错误码→文案单源（client-http.rewindErrorText）；未覆盖码回落宿主原文。
+  if (error instanceof RewindRequestError) return rewindErrorText(error.code) ?? error.message
   return messageOf(error)
 }
 
 // ── DOM 收集与会话跳转 ───────────────────────────────────────────────────
 
-function collectTargets(nodes: SessionNodes): RewindTarget[] {
-  const rows = new Map<string, Element>()
-  for (const element of Array.from(document.querySelectorAll('[data-chat-flow-kind="user"][data-chat-anchor-key]'))) {
-    const key = (element as HTMLElement).dataset.chatAnchorKey
+/**
+ * M3 就地遮蔽：按 chat 快照把被撤回区间里的座位行藏起来（display:none + 语义
+ * data-dsh-rewind-hidden），让渲染对话与模型上下文一致；区间外的行恢复可见。
+ * 只恢复「我们藏过的」行（WeakSet 记账），绝不擅自动其它来源的样式。
+ */
+function applyHiddenSeats(sessionId: string, chat: ChatSnapshot | null | undefined, hiddenSeats: WeakSet<HTMLElement>): void {
+  const hiddenKeys = chat === null || chat === undefined ? new Set<string>() : hiddenKeysOf(sessionId, chat)
+  for (const seat of Array.from(document.querySelectorAll<HTMLElement>(CHAT_SEAT_SELECTOR))) {
+    const key = seat.dataset.chatAnchorKey
+    if (key !== undefined && hiddenKeys.has(key)) {
+      if (seat.style.display !== 'none') {
+        seat.style.display = 'none'
+        seat.dataset.dshRewindHidden = 'true'
+        hiddenSeats.add(seat)
+      }
+      continue
+    }
+    if (hiddenSeats.has(seat)) {
+      seat.style.display = ''
+      delete seat.dataset.dshRewindHidden
+      hiddenSeats.delete(seat)
+    }
+  }
+}
+
+function collectTargets(nodes: readonly RewindNodeLike[]): RewindTarget[] {
+  const rows = new Map<string, HTMLElement>()
+  for (const element of Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow-kind="user"][data-chat-anchor-key]'))) {
+    const key = element.dataset.chatAnchorKey
     if (key !== undefined) rows.set(key, element)
   }
   const targets: RewindTarget[] = []
@@ -1145,22 +1064,15 @@ function collectTargets(nodes: SessionNodes): RewindTarget[] {
     if (matched === null) continue
     const anchorKey = typeof node.key === 'string' ? node.key : `node:${String(node.seq)}`
     const row = rows.get(anchorKey)
-    // 容器必须是宿主操作行的最后一个**宿主**子元素——跳过本插件自己注入的
-    // .srw-tail。取裸 lastElementChild 会把上一轮注入的按钮当成容器，再往里
-    // 嵌套注入；MutationObserver → refresh → 再渲染 正反馈成无限循环
-    // （React #185 Maximum update depth exceeded 即来源于此）。
-    const actions = lastHostAction(row?.querySelector('[data-time-hover-root="true"]'))
-    if (!(actions instanceof HTMLElement)) continue
+    // 结构式定位宿主操作行容器（dsh-rewind 同款）：取行内最后一个非本插件
+    // 按钮的 parentElement，即宿主 MessageIconActions 的 .actions 容器。
+    // 宿主当前线上没有 data-time-hover-root；命令式注入只在找到容器时才发生，
+    // 找不到整行跳过（绝不误挂到别的气泡）。
+    const actions = actionsContainerOf(row)
+    if (actions === undefined) continue
     targets.push({ container: actions, matched })
   }
   return targets
-}
-
-/** `root` 里最后一个非 `.srw-tail` 的子元素（本插件注入的按钮行不算宿主内容）。 */
-function lastHostAction(root: Element | null | undefined): Element | null {
-  let child = root?.lastElementChild ?? null
-  while (child !== null && child.classList.contains('srw-tail')) child = child.previousElementSibling
-  return child
 }
 
 function sameTargets(left: readonly RewindTarget[], right: readonly RewindTarget[]): boolean {
@@ -1172,23 +1084,19 @@ function sameTargets(left: readonly RewindTarget[], right: readonly RewindTarget
   })
 }
 
-async function openSessionWithDraft(ctx: RewindClientContext, sessionId: string, promptText: string): Promise<void> {
-  let lastError: unknown = new Error('新对话还没有准备好')
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    try {
-      ctx.sessions.open(sessionId)
-      const scope = ctx.sessions.scope(sessionId)
-      if (scope !== undefined) {
-        ctx.conversation.input.for(scope).setDraft(promptText)
-        return
-      }
-      lastError = new Error('新对话还没有准备好')
-    } catch (error) {
-      lastError = error
-    }
-    await new Promise((resolve) => { setTimeout(resolve, 50) })
+/** 就地回退成功后把目标文本放回输入框：仅当输入框为空且会话 scope 可达时。 */
+function fillComposerIfEmpty(sessionId: string, text: string): void {
+  if (text === '') return
+  const composer = document.querySelector('[data-composer-input]')
+  if (composer === null || (composer.textContent ?? '').trim() !== '') return
+  const ctx = rewindContextRef
+  if (ctx === null) return
+  try {
+    const scope = ctx.sessions.scope(sessionId)
+    if (scope !== undefined) ctx.conversation.input.for(scope).setDraft(text)
+  } catch {
+    // 草稿写失败可忽略：文本仍可手动复制，绝不因此中断就地回退流程。
   }
-  throw lastError
 }
 
 // ── 基础工具 ─────────────────────────────────────────────────────────────
@@ -1228,6 +1136,11 @@ function requiredString(value: unknown, name: string): string {
 function requiredInteger(value: unknown, name: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error(`${name} 无效`)
   return value as number
+}
+
+/** 宽松可选整数（寻址回显按入口可缺席；非法/缺席 → undefined）。 */
+function optionalInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
 function messageOf(error: unknown): string {

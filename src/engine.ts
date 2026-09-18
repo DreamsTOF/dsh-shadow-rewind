@@ -16,14 +16,10 @@
  * 计划 TTL 拒绝（#1）、逐字确认串（#2）、会话绑定拒绝（#3）均已废除/降级；
  * 选择权通过 probe + force（1.2）交给用户。
  */
-import { join } from 'node:path'
-import { lstat, readFile } from 'node:fs/promises'
-import { clearCaptureCache } from './capture-cache.js'
 import { createDeadline } from './deadline.js'
 import { ShadowRewindError, errorMessage } from './errors.js'
-import { canonicalDirectory, isNodeError, resolveWorkspacePath, validateRelativePath } from './path-utils.js'
-import { diffTrees, entriesEqual, hashTree, makeId, sha256Hex } from './manifest.js'
-import type { LineageEntry } from './store.js'
+import { canonicalDirectory } from './path-utils.js'
+import { diffTrees, entriesEqual, makeId } from './manifest.js'
 import type { SnapshotEntry, WorkspaceChange } from './types.js'
 import {
   FORMAT_VERSION,
@@ -50,25 +46,22 @@ export { isCheckpointSkipCode } from './engine-helpers.js'
 /** 撤销记录的单文件条目：before = 恢复前磁盘条目（null = 当时不存在），
  * after = 恢复后条目（null = 恢复把它删了）。 */
 interface RestoreUndoRecord {
+  /** 本次恢复的唯一身份（undo 响应回传，供客户端对齐遮蔽标记层，防弹错层）。 */
+  readonly id: string
+  /** 发起恢复的会话（多会话共享工作区时，undo 据此识别被撤销的是哪次恢复）。 */
+  readonly sessionId?: string
   readonly restorePointId: string
   readonly rescuePointId: string
   readonly time: number
   readonly files: readonly { readonly rel: string; readonly before: SnapshotEntry | null; readonly after: SnapshotEntry | null }[]
 }
 
+/** 每工作区撤销记录小栈深度上限（超过丢最旧；栈顶 = 最近一次恢复）。 */
+const MAX_UNDO_STACK = 8
+
 /** 过期计划的内存保留窗口：TTL 只作软警告，过期计划仍可执行；
  * 只有远超窗口的陈旧计划才从内存淘汰（进程重启天然清零）。 */
 const PLAN_RETENTION_MS = 24 * 60 * 60 * 1_000
-
-/** 工作区相对路径白名单（物化 BEFORE 日志时的 fail-safe 闸）。 */
-function isSafeRelativePath(path: string): boolean {
-  try {
-    validateRelativePath(path)
-    return true
-  } catch {
-    return false
-  }
-}
 
 /** 撤销范围解析：缺省 = 记录里的全部路径；给 paths 时必须是记录成员
  * （未知路径立即拒绝——防止拿错版本的清单拼出半个撤销）。 */
@@ -86,10 +79,12 @@ function resolveUndoScope(record: RestoreUndoRecord, paths: readonly string[] | 
 export class ShadowRewindEngine extends ShadowRewindEngineBase {
   private readonly plans = new Map<RestorePlanId, RestorePlan & { expired?: boolean }>()
   private readonly applying = new Set<RestorePlanId>()
-  /** 恢复后单次撤销（B1）：workspace → 最近一次恢复的逐路径 before/after。
-   * 进程内记录，重启即失效；每次 applyRestore 替换上一次（无 redo）。
-   * 部分撤销时按成功路径收缩，全部撤销完才销毁。 */
-  private readonly undoRecords = new Map<string, RestoreUndoRecord>()
+  /** 恢复后撤销（B1 升级为小栈多槽）：workspace → 最近若干次恢复的逐路径
+   * before/after（栈顶 = 最近一次；默认保留 {@link MAX_UNDO_STACK} 条）。
+   * 进程内记录，重启即失效。部分撤销时按成功路径收缩当前栈顶，清空才弹栈。 */
+  private readonly undoRecords = new Map<string, RestoreUndoRecord[]>()
+  /** undo 记录身份自增。 */
+  private undoSeq = 0
 
   constructor(config: ShadowRewindConfig = {}) {
     super(config)
@@ -315,8 +310,6 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
     readonly restorePointId: string
     readonly sessionId?: string
     readonly expectedCurrentTreeHash?: string
-    /** 对称模式的勾选式子集：计划只覆盖这些路径（必须都是变更清单成员）。 */
-    readonly paths?: readonly string[]
     readonly signal?: AbortSignal
   }): Promise<RestorePlan> {
     await this.assertReady(options.signal)
@@ -332,21 +325,8 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
     // 此后的任何变化都绝不构成恢复动作——否则「新增的大文件」会在恢复时
     // 被误删，违背「恢复不碰跳过项」的承诺。
     const skippedSet = new Set(manifest.skippedPaths.map((skip) => skip.path))
-    let changes = diffAgainstManifest(manifest, current.entries)
+    const changes = diffAgainstManifest(manifest, current.entries)
       .filter((change) => !skippedSet.has(change.path))
-    if (options.paths !== undefined) {
-      // 未知路径立即拒绝：防止客户端拿错版本的清单拼出半个计划。
-      const changePaths = new Set(changes.map((change) => change.path))
-      const unknown = options.paths.filter((path) => !changePaths.has(path))
-      if (unknown.length > 0) {
-        throw new ShadowRewindError('INVALID_ARGUMENTS', `以下路径不在恢复点 ${manifest.id} 的变更清单里：${unknown.slice(0, 5).join(', ')}`)
-      }
-      const wanted = new Set(options.paths)
-      changes = changes.filter((change) => wanted.has(change.path))
-      if (changes.length === 0) {
-        throw new ShadowRewindError('NO_CHANGES', '勾选的路径没有可恢复的变更')
-      }
-    }
     if (changes.length === 0) {
       throw new ShadowRewindError('NO_CHANGES', `工作区已经与恢复点 ${manifest.id} 一致`)
     }
@@ -361,9 +341,7 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
       workspace,
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
       createdAt: now,
-      expiresAt: now + this.config.planTtlMs,
       changes,
-      skippedPaths: manifest.skippedPaths,
       expected,
     }
     this.plans.set(plan.id, plan)
@@ -397,11 +375,6 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
     if (plan === undefined) {
       throw new ShadowRewindError('PLAN_NOT_FOUND', `恢复计划 ${options.planId} 不存在`)
     }
-    const warnings: string[] = []
-    // 会话绑定（1.4 #3）：不匹配降级为软警告，不阻断——选择权在用户。
-    if (plan.sessionId !== undefined && plan.sessionId !== options.sessionId) {
-      warnings.push(`恢复计划属于会话 ${plan.sessionId}，当前调用方是 ${options.sessionId ?? '（未声明）'}；已按你的选择继续执行`)
-    }
     if (this.applying.has(plan.id)) {
       throw new ShadowRewindError('PLAN_IN_PROGRESS', '该恢复计划正在执行')
     }
@@ -434,7 +407,12 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
         // fork 失败的补偿回滚走 skipUndoRecord：补偿本身也是 applyRestore，
         // 若覆盖单槽记录，「撤销恢复」会被静默反转为「重新应用恢复」。
         if (options.skipUndoRecord !== true) {
-          this.undoRecords.set(plan.workspace, {
+          // 入栈（小栈多槽）：每次恢复都保留，默认最多 MAX_UNDO_STACK 条；
+          // 栈顶 = 最近一次恢复，「撤销最近一次」仍只动栈顶。
+          this.undoSeq += 1
+          const record: RestoreUndoRecord = {
+            id: `u${String(this.undoSeq)}`,
+            ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
             restorePointId: manifest.id,
             rescuePointId: rescue.id,
             time: Date.now(),
@@ -443,14 +421,17 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
               before: current.entries[change.path] ?? null,
               after: manifest.entries[change.path] ?? null,
             })),
-          })
+          }
+          const stack = this.undoRecords.get(plan.workspace) ?? []
+          stack.push(record)
+          if (stack.length > MAX_UNDO_STACK) stack.shift()
+          this.undoRecords.set(plan.workspace, stack)
         }
         this.plans.delete(plan.id)
         const result: RestoreResult = {
           restorePointId: manifest.id,
           rescuePointId: rescue.id,
           restoredPaths: paths,
-          ...(warnings.length > 0 ? { warnings } : {}),
         }
         return result
       } catch (error) {
@@ -520,10 +501,12 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
   }): Promise<RestoreUndoProbe | RestoreUndoResult> {
     await this.assertReady(options.signal)
     const workspace = await canonicalDirectory(options.cwd)
-    const record = this.undoRecords.get(workspace)
+    // 小栈多槽：撤销目标 = 栈顶（最近一次恢复）。
+    const stack = this.undoRecords.get(workspace)
+    const record = stack?.[stack.length - 1]
     if (record === undefined) {
       throw new ShadowRewindError('UNDO_NOT_FOUND',
-        '没有可撤销的恢复（进程内只保留最近一次，重启后失效；可从恢复时自动创建的备份点手工恢复）')
+        `没有可撤销的恢复（进程内保留最近 ${String(MAX_UNDO_STACK)} 次，重启后失效；可从恢复时自动创建的备份点手工恢复）`)
     }
     const scope = resolveUndoScope(record, options.paths)
     const rescue = await this.store.readManifest(workspace, record.rescuePointId)
@@ -544,6 +527,8 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
     }
     if (options.mode === 'probe') {
       return {
+        id: record.id,
+        ...(record.sessionId === undefined ? {} : { sessionId: record.sessionId }),
         restorePointId: record.restorePointId,
         rescuePointId: record.rescuePointId,
         time: record.time,
@@ -575,14 +560,20 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
       throw new ShadowRewindError('UNDO_CONFLICT',
         `全部路径都已被后续修改，无法撤销；可在确认后强制回滚，或从备份点 ${record.rescuePointId} 手工恢复`)
     }
-    // 成功路径从记录中收缩：记录清空才销毁——被跳过的路径还有机会重试
+    // 成功路径从栈顶记录中收缩：记录清空才弹栈——被跳过的路径还有机会重试
     // （弹窗二次回滚 = force + 剩余清单），销毁即永久搁浅。
     const remaining = record.files.filter((file) => !undonePaths.includes(file.rel))
-    if (remaining.length === 0) this.undoRecords.delete(workspace)
-    else if (remaining.length !== record.files.length) {
-      this.undoRecords.set(workspace, { ...record, files: remaining })
+    if (stack !== undefined) {
+      if (remaining.length === 0) {
+        stack.pop()
+        if (stack.length === 0) this.undoRecords.delete(workspace)
+      } else if (remaining.length !== record.files.length) {
+        stack[stack.length - 1] = { ...record, files: remaining }
+      }
     }
     return {
+      id: record.id,
+      ...(record.sessionId === undefined ? {} : { sessionId: record.sessionId }),
       restorePointId: record.restorePointId,
       rescuePointId: record.rescuePointId,
       undonePaths,
@@ -611,231 +602,22 @@ export class ShadowRewindEngine extends ShadowRewindEngineBase {
     return { restorePointId: options.restorePointId, ...(gc.deletedBlobs > 0 ? { deletedBlobs: gc.deletedBlobs } : {}) }
   }
 
-  // ── BEFORE 捕获（主路，Claude Code 式）与消息检查点兜底 ─────────────────
-
-  /**
-   * 记录一条写盘前捕获（宿主 tools/execute 瀑布调用）。
-   * 内容内联进 BEFORE 日志；超限文件（maxFileBytes）直接放弃——
-   * 兜底覆盖不到的字节仍有影子整树快照兜着。
-   */
-  async recordBeforeEntry(options: {
-    readonly workspace: string
-    readonly sessionId: string
-    readonly anchorSeq: number
-    readonly callId: string
-    /** 工作区相对路径（'/' 分隔）。 */
-    readonly rel: string
-    readonly existed: boolean
-    readonly content: string | null
-    readonly mode: number
-  }): Promise<void> {
-    await this.assertReady()
-    const size = options.content === null ? 0 : Buffer.byteLength(options.content, 'utf8')
-    if (size > this.config.maxFileBytes) return
-    await this.beforeJournal.record(options.workspace, options.sessionId, {
-      callId: options.callId,
-      anchorSeq: options.anchorSeq,
-      path: options.rel,
-      existed: options.existed,
-      content: options.content,
-      size,
-      mode: options.mode,
-    })
-    // 周期性 prune：被清理的 anchor 对应的消息检查点一并删除，让内容 GC
-    // 回收独占 blob。失败只丢清理时机，不丢正确性。
-    void this.beforeJournal.prune(options.workspace, options.sessionId)
-      .then((pruned) => {
-        if (pruned.length === 0) return
-        return this.pruneMessageRestorePoints(options.workspace, options.sessionId, pruned)
-      })
-      .catch(() => undefined)
-  }
-
-  /**
-   * user/message 边界重查（抄 dsh-rewind reconcileTracked）：把本会话全部
-   * 被跟踪路径与最近已知内容比对，变化者（含外部编辑/删除）补一条以本消息
-   * 锚定的 BEFORE 记录。返回补录条数（仅诊断用）。
-   */
-  async reconcileTrackedBefore(options: {
-    readonly workspace: string
-    readonly sessionId: string
-    readonly anchorSeq: number
-  }): Promise<number> {
-    await this.assertReady()
-    const tracked = await this.beforeJournal.trackedPaths(options.workspace, options.sessionId)
-    let recorded = 0
-    for (const rel of tracked) {
-      const known = this.beforeJournal.lastKnownContent(options.workspace, options.sessionId, rel)
-      const abs = resolveWorkspacePath(options.workspace, rel)
-      let content: string | null
-      let mode = 0o644
-      try {
-        const stat = await lstat(abs)
-        if (!stat.isFile()) continue
-        // 与 scan/capture 同一 mode 口径（原始权限位），undo CAS 不假冲突。
-        mode = Number(stat.mode & 0o7777)
-        content = await readFile(abs, 'utf8')
-      } catch (error) {
-        if (!isNodeError(error, 'ENOENT')) continue
-        content = null
-      }
-      if (known !== undefined && known === content) continue
-      await this.beforeJournal.record(options.workspace, options.sessionId, {
-        callId: `recheck-${String(options.anchorSeq)}-${sha256Hex(Buffer.from(rel, 'utf8')).slice(0, 8)}`,
-        anchorSeq: options.anchorSeq,
-        path: rel,
-        existed: content !== null,
-        content,
-        size: content === null ? 0 : Buffer.byteLength(content, 'utf8'),
-        mode,
-      })
-      recorded += 1
-    }
-    return recorded
-  }
-
-  /**
-   * 物化「消息 S 之前」的部分树检查点（BEFORE 日志 → kind 'message' 恢复点）。
-   *
-   * 这是检查点缺席（关闭/失败/被修剪）时的兜底：每路径取 anchorSeq >= S 的
-   * 最早 BEFORE（含边界），existed=true 的进 entries（内容入库 sqlite，
-   * id 稳定、重复物化为增量合并）；existed=false（工具创建）进 createdPaths，
-   * 计划按「恢复删除」处理。部分树绝不携带 createdPaths 之外的 added 语义
-   * ——未捕获路径留在磁盘上不动。
-   */
-  async ensureMessageRestorePoint(options: {
-    readonly cwd: string
-    readonly sessionId: string
-    readonly messageSeq: number
-    readonly turn: number
-    readonly turnStartSeq: number
-  }): Promise<RestorePointSummary | undefined> {
-    await this.assertReady()
-    const workspace = await canonicalDirectory(options.cwd)
-    const earliest = await this.beforeJournal.earliestAfter(workspace, options.sessionId, options.messageSeq)
-    if (earliest.size === 0) return undefined
-    const manifests = await this.store.listManifests(workspace)
-    const existing = manifests.find((manifest) => manifest.kind === 'message'
-      && manifest.sessionId === options.sessionId
-      && manifest.messageSeq === options.messageSeq)
-    const entries: Record<string, SnapshotEntry> = Object.create(null)
-    if (existing !== undefined) {
-      for (const [path, entry] of Object.entries(existing.entries)) entries[path] = entry
-    }
-    const created = new Set<string>(existing?.createdPaths ?? [])
-    const blobs: { readonly hash: string; readonly content: Buffer }[] = []
-    for (const [rel, entry] of earliest) {
-      // 路径白名单：工作区外（宿主管道本应放弃）或畸形路径 fail-safe 跳过，
-      // 绝不让非法相对路径写进恢复点。
-      if (!isSafeRelativePath(rel)) continue
-      if (entry.existed && entry.content !== null) {
-        const content = Buffer.from(entry.content, 'utf8')
-        const blob = sha256Hex(content)
-        const current = entries[rel]
-        if (current === undefined || current.kind !== 'file' || current.blob !== blob) {
-          entries[rel] = { kind: 'file', blob, size: content.length, mode: entry.mode }
-          blobs.push({ hash: blob, content })
-        }
-        created.delete(rel)
-      } else {
-        delete entries[rel]
-        created.add(rel)
-      }
-    }
-    if (blobs.length > 0) await this.store.putSqliteBlobs(workspace, blobs)
-    await this.store.assertStorageSeparated(workspace)
-    const manifest: Manifest = {
-      version: FORMAT_VERSION,
-      id: existing?.id ?? makeId('rp'),
-      kind: 'message',
-      workspace,
-      storage: 'sqlite',
-      sessionId: options.sessionId,
-      label: `消息 ${String(options.messageSeq)} 之前的 BEFORE 兜底恢复点`,
-      turn: options.turn,
-      turnStartSeq: options.turnStartSeq,
-      messageSeq: options.messageSeq,
-      partial: true,
-      createdPaths: [...created].sort(),
-      createdAt: existing?.createdAt ?? Date.now(),
-      treeHash: hashTree(entries),
-      fileCount: Object.keys(entries).length,
-      totalBytes: Object.values(entries).reduce((total, entry) => total + (entry.kind === 'file' ? entry.size : 0), 0),
-      entries,
-      skippedPaths: [],
-      restoreCount: existing?.restoreCount ?? 0,
-      ...(existing?.lastRestoredAt === undefined ? {} : { lastRestoredAt: existing.lastRestoredAt }),
-    }
-    await this.store.writeManifest(workspace, manifest)
-    return summarize(manifest)
-  }
-
-  /** 删除被 prune 掉的 anchor 对应的消息检查点（内容 GC 随后回收独占 blob）。 */
-  async pruneMessageRestorePoints(workspace: string, sessionId: string, anchorSeqs: readonly number[]): Promise<number> {
-    const canonical = await canonicalDirectory(workspace).catch(() => workspace)
-    const stale = new Set(anchorSeqs)
-    const manifests = await this.store.listManifests(canonical)
-    let deleted = 0
-    for (const manifest of manifests) {
-      if (manifest.kind !== 'message' || manifest.sessionId !== sessionId) continue
-      if (manifest.messageSeq === undefined || !stale.has(manifest.messageSeq)) continue
-      await this.store.deleteManifest(canonical, manifest.id).catch(() => undefined)
-      deleted += 1
-    }
-    if (deleted > 0) await this.garbageCollectAfterDeletion(canonical, deleted)
-    return deleted
-  }
-
-  // ── fork 谱系（ABSORB-RECALL 四）─────────────────────────────────────────
-
-  /**
-   * 记录 fork 谱系：「恢复并从新会话继续」成功后由宿主端点调用，把
-   * childId ↔ parentId 写进工作区状态的 lineage.json，时间线据此显示
-   * 「v2 · 恢复自 <检查点>」徽标。谱系是展示性增强：工作区无法定位或
-   * 落盘失败都静默吞掉（丢徽标，不丢功能），绝不影响恢复主流程。
-   */
-  async recordForkLineage(options: {
-    readonly cwd: string
-    readonly parentSessionId: string
-    readonly childSessionId: string
-    readonly restorePointId: string
-  }): Promise<void> {
-    try {
-      const workspace = await canonicalDirectory(options.cwd)
-      await this.store.appendLineage(workspace, {
-        childId: options.childSessionId,
-        parentId: options.parentSessionId,
-        restorePointId: options.restorePointId,
-        time: Date.now(),
-      })
-    } catch { /* 展示性增强，失败降级为无谱系 */ }
-  }
-
-  /** 读取该工作区的 fork 谱系链（时间线/管理面板用）；工作区无效时为空链。 */
-  async loadForkLineage(cwd: string): Promise<readonly LineageEntry[]> {
-    try {
-      const workspace = await canonicalDirectory(cwd)
-      return await this.store.readLineage(workspace)
-    } catch {
-      return []
-    }
-  }
-
   // ── 引擎内部簿记 ────────────────────────────────────────────────────────
 
   private async isReferencedByUndo(workspace: string, restorePointId: string): Promise<boolean> {
     // 进程内 undo 记录引用的 rescue 点是「活的引用」：被修剪掉的话
     // 「撤销最近一次恢复」会在用户点击时才 409（且 UI 无条件渲染该按钮）。
-    return this.undoRecords.get(workspace)?.rescuePointId === restorePointId
+    // 小栈多槽：任一在栈记录引用即视为活引用（各层都可能被后续撤销到）。
+    const stack = this.undoRecords.get(workspace)
+    return stack !== undefined && stack.some((entry) => entry.rescuePointId === restorePointId)
   }
 
   private expirePlans(): void {
     const now = Date.now()
     for (const [id, plan] of this.plans) {
-      // TTL 只作软警告（1.4 #1）：过期计划保留在内存中仍可执行；
-      // 只有远超保留窗口的陈旧计划才淘汰（防长驻进程缓慢泄漏）。
-      if (plan.expiresAt + PLAN_RETENTION_MS <= now) this.plans.delete(id)
-      else if (plan.expiresAt <= now) plan.expired = true
+      // 陈旧计划淘汰（防长驻进程缓慢泄漏）：新鲜度由 apply 时的树哈希 +
+      // 逐路径复核裁决（assertPlanFresh），不看时间。
+      if (plan.createdAt + PLAN_RETENTION_MS <= now) this.plans.delete(id)
     }
   }
 }

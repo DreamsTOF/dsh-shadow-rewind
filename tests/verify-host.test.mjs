@@ -23,12 +23,12 @@ const ENDPOINT_PATHS = [
   REWIND_HTTP_PATH,
   `${REWIND_HTTP_PATH}/file`,
   `${REWIND_HTTP_PATH}/fs-changes`,
+  `${REWIND_HTTP_PATH}/inplace`,
   `${REWIND_HTTP_PATH}/trace`,
   `${REWIND_HTTP_PATH}/restore-undo`,
   `${REWIND_HTTP_PATH}/status`,
   `${REWIND_HTTP_PATH}/config`,
   `${REWIND_HTTP_PATH}/manage`,
-  `${REWIND_HTTP_PATH}/lineage`,
 ]
 
 function makeStubs(registered) {

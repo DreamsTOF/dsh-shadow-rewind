@@ -5,8 +5,10 @@
  * 任一侧执行 apply 后把结果写进这里，另一侧订阅变化并重查宿主真值，
  * 两侧内容因此保持同步（状态翻转为 undone ↔ applied）。
  *
- * 键 = `${sessionId}\u0000${pathKey}`；只存最近一次结果，不持久化
- * （页面刷新后由审查界面的宿主巡检重建真值）。
+ * 键 = `${sessionId}\0${canonicalKey(path, cwd)}`——物理文件唯一（绝对/相对、
+ * `./`、反斜杠拼写差异在写入方带 cwd 时收敛到同键），消除「同一文件两种
+ * 拼写导致翻转失效」。只存最近一次结果，不持久化（页面刷新后由审查界面的
+ * 宿主巡检重建真值）。
  */
 import type { FileReviewFileState } from '../file-review/change-types.ts';
 /** 一个路径的最新开关状态。 */
@@ -18,13 +20,13 @@ export type ReviewRowState = FileReviewFileState;
 export declare function setReviewRows(sessionId: string, files: readonly {
     readonly path: string;
     readonly state: ReviewRowState;
-}[]): void;
-/** 读一个路径的最新开关状态（缺省 = 未操作过，动作视为 undo）。 */
-export declare function reviewRowOf(sessionId: string, path: string): ReviewRowState | undefined;
-/**
- * 一个路径的下一个动作：已撤销（undone）→ redo，其余 → undo。
- * conflict/unsupported/error 条目保持 undo（真正执行时宿主会再校验）。
- */
-export declare function nextReviewAction(sessionId: string, path: string): 'undo' | 'redo';
+}[], cwd?: string): void;
+/** 读一个路径的最新开关状态（缺省 = 未操作过）。 */
+export declare function reviewRowOf(sessionId: string, path: string, cwd?: string): ReviewRowState | undefined;
+/** 单一方向判定：已撤销（undone）→ redo，其余 → undo。
+ * conflict/unsupported/error 条目保持 undo（真正执行时宿主会再校验）。 */
+export declare function rowActionOf(state: ReviewRowState | undefined): 'undo' | 'redo';
+/** 一个路径的下一个动作（reviewRowOf + rowActionOf 的封装，方便既有调用点）。 */
+export declare function nextReviewAction(sessionId: string, path: string, cwd?: string): 'undo' | 'redo';
 /** 订阅状态变化（live 条 / 审查界面据此刷新）。 */
 export declare function subscribeReviewRows(listener: () => void): () => void;

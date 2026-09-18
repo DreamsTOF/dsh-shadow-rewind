@@ -14,7 +14,8 @@
  */
 import type { ProducedFileDiff, ProducedFileReview } from '../file-review/change-types.ts'
 import type { FsAttributionFields, TurnFileChanges, SessionFileChange } from './session-changes.ts'
-import { diffsFromBeforeAfter } from './recorded-diffs.ts'
+import { diffsFromBeforeAfter } from './diff-build.ts'
+import { REWIND_BASE } from './client-http.ts'
 
 /** 与宿主 hunk 数学同一基准的换行归一（file-review-service 的 normalizeNewlines 语义）。 */
 function normalizeLf(text: string): string {
@@ -34,11 +35,31 @@ export interface FsChange extends FsAttributionFields {
   readonly dir?: boolean
 }
 
+/**
+ * 会话累计的一条变更（服务端按检查点算好的净变化）：同一路径跨多轮时，
+ * prev 侧是最早触碰轮的轮起检查点、next 侧是最后一次触碰的轮末（或 'live'）。
+ * live 条的会话累计视图只消费这一份——不再跨轮拼接工具 hunks 与 fs 占位。
+ */
+export interface FsCumulativeChange extends FsAttributionFields {
+  readonly path: string
+  readonly kind: 'added' | 'modified' | 'deleted'
+  readonly added?: number
+  readonly removed?: number
+  readonly oldMode?: number
+  readonly newMode?: number
+  readonly dir?: boolean
+  readonly checkpointId: string
+  readonly nextCheckpointId: string
+  /** 最早触碰轮的 turn/start seq（回滚遮蔽基准）。 */
+  readonly turnStartSeq: number
+  /** 触碰过该路径的轮号（升序，信息展示用）。 */
+  readonly turns: readonly number[]
+}
+
 /** 归因字段投影（占位/补齐/提交各构造点共用）：全缺省时返回空对象。 */
 export function fsAttributionOf(source: FsAttributionFields): FsAttributionFields {
   return {
     ...(source.owner !== undefined ? { owner: source.owner } : {}),
-    ...(source.autoSelect !== undefined ? { autoSelect: source.autoSelect } : {}),
   }
 }
 
@@ -59,6 +80,8 @@ export interface FsChangeTurn {
 /** /shadow-rewind/fs-changes 响应（含数据版本 rev，见 warmFsChanges）。 */
 export interface FsChangesPayload {
   readonly turns: readonly FsChangeTurn[]
+  /** 会话累计净变化（live 条的唯一数据源；旧宿主缺省 = 空）。 */
+  readonly cumulative: readonly FsCumulativeChange[]
   /** 工作区数据版本：检查点捕获/恢复成功即递增；缺省 = 旧宿主。 */
   readonly rev?: number
 }
@@ -78,7 +101,7 @@ export async function fetchCheckpointFileContent(
       path,
       cwd,
     })
-    const response = await fetch(`/shadow-rewind/file?${params}`, {
+    const response = await fetch(`${REWIND_BASE}/file?${params}`, {
       headers: { accept: 'application/json' },
       cache: 'no-store',
     })
@@ -106,15 +129,15 @@ export async function fetchCheckpointFileContent(
  */
 export async function fetchAllFsChanges(sessionId: string): Promise<FsChangesPayload> {
   try {
-    const response = await fetch(`/shadow-rewind/fs-changes?sessionId=${encodeURIComponent(sessionId)}`, {
+    const response = await fetch(`${REWIND_BASE}/fs-changes?sessionId=${encodeURIComponent(sessionId)}`, {
       headers: { accept: 'application/json' },
       cache: 'no-store',
     })
-    if (!response.ok) return { turns: [] }
+    if (!response.ok) return { turns: [], cumulative: [] }
     const data: unknown = await response.json()
-    if (typeof data !== 'object' || data === null || Array.isArray(data)) return { turns: [] }
+    if (typeof data !== 'object' || data === null || Array.isArray(data)) return { turns: [], cumulative: [] }
     const record = data as Record<string, unknown>
-    if (!Array.isArray(record.turns)) return { turns: [] }
+    if (!Array.isArray(record.turns)) return { turns: [], cumulative: [] }
     const turns: FsChangeTurn[] = []
     for (const entry of record.turns) {
       if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
@@ -139,7 +162,6 @@ export async function fetchAllFsChanges(sessionId: string): Promise<FsChangesPay
             ...(c.dir === true ? { dir: true } : {}),
             // 归属字段宽松解析（旧宿主缺省）。
             ...(typeof c.owner === 'string' && c.owner !== '' ? { owner: c.owner } : {}),
-            ...(typeof c.autoSelect === 'boolean' ? { autoSelect: c.autoSelect } : {}),
           }
         })
         .filter((change): change is FsChange => change !== null)
@@ -154,12 +176,41 @@ export async function fetchAllFsChanges(sessionId: string): Promise<FsChangesPay
         })
       }
     }
+    const cumulative: FsCumulativeChange[] = []
+    if (Array.isArray(record.cumulative)) {
+      for (const entry of record.cumulative) {
+        if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
+        const item = entry as Record<string, unknown>
+        if (typeof item.path !== 'string' || item.path === '') continue
+        if (typeof item.checkpointId !== 'string' || typeof item.nextCheckpointId !== 'string') continue
+        if (typeof item.turnStartSeq !== 'number') continue
+        const kind = item.kind === 'added' || item.kind === 'modified' || item.kind === 'deleted' ? item.kind : null
+        if (kind === null) continue
+        cumulative.push({
+          path: item.path,
+          kind,
+          checkpointId: item.checkpointId,
+          nextCheckpointId: item.nextCheckpointId,
+          turnStartSeq: item.turnStartSeq,
+          turns: Array.isArray(item.turns)
+            ? item.turns.filter((turn): turn is number => typeof turn === 'number')
+            : [],
+          ...(typeof item.added === 'number' ? { added: item.added } : {}),
+          ...(typeof item.removed === 'number' ? { removed: item.removed } : {}),
+          ...(typeof item.oldMode === 'number' ? { oldMode: item.oldMode } : {}),
+          ...(typeof item.newMode === 'number' ? { newMode: item.newMode } : {}),
+          ...(item.dir === true ? { dir: true } : {}),
+          ...(typeof item.owner === 'string' && item.owner !== '' ? { owner: item.owner } : {}),
+        })
+      }
+    }
     return {
       turns,
+      cumulative,
       ...(typeof record.rev === 'number' ? { rev: record.rev } : {}),
     }
   } catch {
-    return { turns: [] }
+    return { turns: [], cumulative: [] }
   }
 }
 
@@ -169,11 +220,18 @@ export async function fetchAllFsChanges(sessionId: string): Promise<FsChangesPay
 const WARM_THROTTLE_MS = 2000
 
 const fsCache = new Map<number, FsChangeTurn>()
+/** 每会话的累计净变化清单（live 条的唯一数据源）。 */
+const cumulativeCache = new Map<string, readonly FsCumulativeChange[]>()
 const warmLastAt = new Map<string, number>()
 const warmInFlight = new Set<string>()
 /** 每会话最近一次 fs-changes 的数据版本；rev 未变则整轮 warm 跳过。 */
 const warmLastRev = new Map<string, number>()
 const cacheListeners = new Set<() => void>()
+
+/** 读某会话的累计净变化（未 warm 时为空；live 条按订阅在 warm 后重渲染）。 */
+export function cachedCumulativeForSession(sessionId: string): readonly FsCumulativeChange[] {
+  return cumulativeCache.get(sessionId) ?? []
+}
 
 /** 订阅缓存刷新（卡片据此重新推导自己的 fs 条目）。 */
 export function subscribeFsCache(listener: () => void): () => void {
@@ -184,11 +242,6 @@ export function subscribeFsCache(listener: () => void): () => void {
 /** 广播缓存变化。 */
 function notifyFsCache(): void {
   for (const listener of cacheListeners) listener()
-}
-
-/** 供轮尾 select() 同步读取的入口：这一轮有 fs 变更吗？ */
-export function cachedFsTurnFor(turnStartSeq: number): FsChangeTurn | undefined {
-  return fsCache.get(turnStartSeq)
 }
 
 /**
@@ -221,10 +274,28 @@ export function warmFsChanges(sessionId: string): void {
         changed = true
       }
     }
+    const previousCumulative = cumulativeCache.get(sessionId)
+    if (previousCumulative === undefined
+      || JSON.stringify(previousCumulative) !== JSON.stringify(payload.cumulative)) {
+      cumulativeCache.set(sessionId, payload.cumulative)
+      // 累计清单换了：全文记忆（含 'live' 终点的磁盘内容）一并失效。
+      lazyCumulative.clear()
+      changed = true
+    }
     if (changed) notifyFsCache()
   }).catch(() => {
     warmInFlight.delete(sessionId)
   })
+}
+
+/**
+ * 强制刷新某会话的 fs 缓存：绕过 2s 节流，立即重新 warm（供「文件恢复 / 撤销」
+ * 这类确定性磁盘变化事件调用——常规 warm 的节流可能让它们被吞掉，审计面板与
+ * live 条的 fs 行数停留在恢复前）。in-flight 去重仍生效（同刻并发调用只拉一次）。
+ */
+export function forceWarmFsChanges(sessionId: string): void {
+  warmLastAt.delete(sessionId)
+  warmFsChanges(sessionId)
 }
 
 /** 按「会话 + 轮」同步读取（live 条的查找键；缓存条目都带 sessionId）。 */
@@ -250,6 +321,8 @@ export function cachedFsTurnsForSession(sessionId: string): readonly FsChangeTur
 
 /** (turnStartSeq, path) → 全文条目的进行中/已完成请求。 */
 const lazyDiffs = new Map<string, Promise<SessionFileChange | null>>()
+/** (最早检查点, 终点检查点, path) → 累计条目的全文请求；warm 换代理清空。 */
+const lazyCumulative = new Map<string, Promise<SessionFileChange | null>>()
 /** 懒加载记忆容量上限；超出淘汰最旧（会话数 × 轮数 × 文件数的防泄漏阀）。 */
 const LAZY_MEMO_CAP = 512
 
@@ -274,7 +347,7 @@ function invalidateLazyTurn(turnStartSeq: number): void {
  * 同路。`nextCheckpointId` 可能是 'live'（= 当前磁盘）。
  */
 async function generateFsDiff(
-  fsChange: FsChange,
+  fsChange: FsChange | FsCumulativeChange,
   checkpointId: string,
   nextCheckpointId: string,
   cwd: string,
@@ -331,25 +404,43 @@ function isOwnSessionChange(change: FsChange): boolean {
 /**
  * 一个 fs 条目的占位形态：零全文、带服务端行数。卡片/侧边栏/live 条先用它
  * 渲染行与 +/−，内容在悬停、展开或撤销时经 ensureFsFileDiff 按需补齐。
+ * 审计面板（FileReviewTab）需要「全量 + 归因徽标」的变体，故底层共用
+ * {@link fsTurnPlaceholders}，这里只施加「本会话写盘」过滤。
  */
 export function fsTurnReviews(
   fsTurn: FsChangeTurn,
   /** 可选的条目级过滤（回滚遮蔽按轮近似剔除已恢复的写盘）。 */
   keep?: (change: FsChange) => boolean,
 ): readonly ProducedFileReview[] {
+  return fsTurnPlaceholders(fsTurn, {
+    keep: change => isOwnSessionChange(change) && (keep?.(change) ?? true),
+  })
+}
+
+/**
+ * 一个 fs 轮的占位条目构造（单一实现）：
+ *  - `keep`：条目级过滤（live 条用它只保留本会话写盘；审计传 undefined=全量）；
+ *  - `attribution`：带上归属徽标字段（owner，审计面板需要展示他会话/歧义归属；
+ *    live 条不需要）。
+ */
+export function fsTurnPlaceholders(
+  fsTurn: FsChangeTurn,
+  options: { readonly keep?: (change: FsChange) => boolean; readonly attribution?: boolean } = {},
+): readonly SessionFileChange[] {
+  const withAttribution = options.attribution === true
   return fsTurn.changes
-    .filter(isOwnSessionChange)
-    .filter(change => keep?.(change) ?? true)
+    .filter(change => options.keep?.(change) ?? true)
     .map((change) => ({
-    path: change.path,
-    diffs: [],
-    origin: 'fs',
-    ...(change.dir === true ? { dir: true as const } : {}),
-    ...(change.added !== undefined || change.removed !== undefined
-      ? { counts: { added: change.added ?? 0, removed: change.removed ?? 0 } }
-      : {}),
-    ...(change.kind === 'deleted' ? { deleted: true as const } : {}),
-  }))
+      path: change.path,
+      diffs: [],
+      origin: 'fs',
+      ...(change.dir === true ? { dir: true as const } : {}),
+      ...(change.added !== undefined || change.removed !== undefined
+        ? { counts: { added: change.added ?? 0, removed: change.removed ?? 0 } }
+        : {}),
+      ...(change.kind === 'deleted' ? { deleted: true as const } : {}),
+      ...(withAttribution ? fsAttributionOf(change) : {}),
+    }))
 }
 
 /**
@@ -388,6 +479,54 @@ export function ensureFsFileDiff(
       diffs,
       origin: 'fs',
       ...(change.kind === 'deleted' ? { deleted: true as const } : {}),
+      ...attribution,
+    }
+  })()
+  if (lazyCumulative.size >= LAZY_MEMO_CAP) {
+    const oldest = lazyCumulative.keys().next().value
+    if (oldest !== undefined) lazyCumulative.delete(oldest)
+  }
+  lazyCumulative.set(key, task)
+  return task
+}
+
+/**
+ * 取一条会话累计条目的完整全文（悬停浮层 / 行内撤销 / 打开 diff 前补齐）。
+ * 记忆键 = 最早检查点 + 终点检查点 + 路径——同一净变化的并发与后续调用复用
+ * 同一个请求；warm 换代会话时记忆随缓存条目变化失效。
+ */
+export function ensureCumulativeFileDiff(
+  item: FsCumulativeChange,
+  cwd: string,
+): Promise<SessionFileChange | null> {
+  const key = `${item.checkpointId}\u0000${item.nextCheckpointId}\u0000${item.path}`
+  const cached = lazyCumulative.get(key)
+  if (cached !== undefined) return cached
+  const task = (async (): Promise<SessionFileChange | null> => {
+    const attribution = fsAttributionOf(item)
+    const counts = item.added === undefined && item.removed === undefined
+      ? {}
+      : { counts: { added: item.added ?? 0, removed: item.removed ?? 0 } }
+    if (item.dir === true) {
+      // 目录条目没有全文可拉：静态标记即可，宿主按 dirKind 走 mkdir/rmdir。
+      return {
+        path: item.path,
+        diffs: [{ path: item.path, oldText: null, newText: '' }],
+        origin: 'fs',
+        dir: true,
+        ...(item.kind === 'deleted' ? { deleted: true as const } : {}),
+        ...counts,
+        ...attribution,
+      }
+    }
+    const diffs = await generateFsDiff(item, item.checkpointId, item.nextCheckpointId, cwd)
+    if (diffs === null) return null
+    return {
+      path: item.path,
+      diffs,
+      origin: 'fs',
+      ...(item.kind === 'deleted' ? { deleted: true as const } : {}),
+      ...counts,
       ...attribution,
     }
   })()

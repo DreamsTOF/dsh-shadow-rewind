@@ -30,15 +30,6 @@ import type { ResolvedShadowRewindConfig } from './types.js'
 
 const ID_PATTERN = /^rp_[0-9a-z]+_[0-9a-f]{12}$/
 
-/** fork 谱系条目（ABSORB-RECALL 四）：childId 是 fork 出的新会话。 */
-export interface LineageEntry {
-  readonly childId: string
-  readonly parentId: string
-  /** 触发 fork的恢复点（「恢复并从新会话继续」的时点）。 */
-  readonly restorePointId?: string
-  readonly time: number
-}
-
 /** 每个工作区的全部持久化状态。 */
 export class WorkspaceStore {
   private readonly config: ResolvedShadowRewindConfig
@@ -106,6 +97,10 @@ export class WorkspaceStore {
     const dir = await this.workspaceDir(workspace)
     const result = []
     for (const filename of await safeFileNames(join(dir, 'manifests'))) {
+      // 跳过原子写的瞬态临时文件（.{uuid}.tmp，与清单同目录）：与并发落盘
+      // （轮末检查点 / 恢复写 manifest）赛跑时读到它会把清单目录误判为
+      // 损坏（STATE_CORRUPT）。清单文件名恒以 .json 结尾。
+      if (!filename.endsWith('.json')) continue
       const manifest = parseManifest(await readJson(join(dir, 'manifests', filename)))
       if (manifest.workspace !== workspace || filename !== `${manifest.id}.json`) {
         throw new ShadowRewindError('STATE_CORRUPT', `清单 ${filename} 的持久化身份不一致`)
@@ -138,35 +133,6 @@ export class WorkspaceStore {
   async purgeManifests(workspace: string): Promise<void> {
     const dir = await this.workspaceDir(workspace)
     await rm(join(dir, 'manifests'), { recursive: true, force: true })
-  }
-
-  // ── fork 谱系（ABSORB-RECALL 四）──────────────────────────────────────────
-
-  /** 追加一条 fork 谱系（childId ↔ parentId）到工作区状态目录的
-   * lineage.json。缺失/损坏按空表处理（谱系是展示性增强，不致命）；
-   * 同一 (childId, parentId) 只记一次（fork 幂等）。 */
-  async appendLineage(workspace: string, entry: LineageEntry): Promise<void> {
-    const dir = await this.workspaceDir(workspace)
-    const existing = await this.readLineage(workspace)
-    if (existing.some((item) => item.childId === entry.childId && item.parentId === entry.parentId)) return
-    existing.push(entry)
-    await writeJsonAtomic(join(dir, 'lineage.json'), existing)
-  }
-
-  /** 读取 fork 谱系链；缺失/损坏返回空数组（按无谱系展示）。 */
-  async readLineage(workspace: string): Promise<LineageEntry[]> {
-    const dir = await this.workspaceDir(workspace)
-    try {
-      const raw = await readJson(join(dir, 'lineage.json')) as unknown
-      if (!Array.isArray(raw)) return []
-      return raw.filter((item): item is LineageEntry =>
-        typeof item === 'object' && item !== null
-        && typeof (item as LineageEntry).childId === 'string'
-        && typeof (item as LineageEntry).parentId === 'string'
-        && typeof (item as LineageEntry).time === 'number')
-    } catch {
-      return []
-    }
   }
 
   // ── GC 双闸节流戳（ABSORB-RECALL 六）──────────────────────────────────────

@@ -11,12 +11,11 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol';
-import type { FileReviewRequest, FileReviewResult, RecordedRequest, RecordedResult } from '../file-review/change-types.ts';
+import type { FileReviewRequest, FileReviewResult } from '../file-review/change-types.ts';
 /** 浏览器半边需要的 fileReview 命名空间方法面。 */
 export interface FileReviewRemote {
     status(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>;
     apply(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>;
-    recorded(request: RecordedRequest): Promise<RemoteResult<RecordedResult>>;
 }
 /**
  * 幂等挂载 fileReview 远端贡献。并发调用共享同一任务；失败后允许再次调用
@@ -31,5 +30,3 @@ export declare function disposeFileReviewRemote(): void;
 export declare function resolveFileReviewRemote(ctx: Context, sessionId: string): Promise<FileReviewRemote | undefined>;
 /** fileReview/status|apply 的调用包装（结果 error 分支转译成异常）。 */
 export declare function invokeFileReview(ctx: Context, sessionId: string, method: 'status' | 'apply', request: FileReviewRequest): Promise<FileReviewResult>;
-/** fileReview/recorded 的调用包装（Code Mode 录制读取）。 */
-export declare function invokeFileReviewRecorded(ctx: Context, sessionId: string, request: RecordedRequest): Promise<RecordedResult>;

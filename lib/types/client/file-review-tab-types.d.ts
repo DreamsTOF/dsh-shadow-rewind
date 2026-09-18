@@ -6,9 +6,9 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol';
-import type { FileReviewRequest, FileReviewResult, RecordedRequest, RecordedResult } from '../file-review/change-types.ts';
+import type { FileReviewRequest, FileReviewResult, ProducedFileDiff } from '../file-review/change-types.ts';
 import { type FsAttributionFields, type SessionFileChange } from './session-changes.ts';
-import type { UnifiedDiffStats } from './UnifiedDiff.tsx';
+import { type UnifiedDiffStats } from './UnifiedDiff.tsx';
 /** 页内通知气泡的成功停留时长（自动消失）。 */
 export declare const SUCCESS_NOTICE_DURATION = 3000;
 /** 页内通知气泡的失败停留时长（自动消失）。 */
@@ -33,7 +33,6 @@ export interface FileReviewTabProps {
 export interface FileReviewRemote {
     status(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>;
     apply(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>;
-    recorded(request: RecordedRequest): Promise<RemoteResult<RecordedResult>>;
 }
 /** 页内通知气泡（成功/失败短暂停留后自动消失）。 */
 export interface Notice {
@@ -60,8 +59,7 @@ export interface FlatChange extends FsAttributionFields {
 }
 /** 一个 (轮, 文件) 变更组的状态映射键。 */
 export declare function stateKey(turn: number, path: string): string;
-/** fs 条目的归属徽标文案：旧宿主无归属（owner 缺省）→ 无徽标。
- * 他会话展示会话标题；多主/未知如实标注。 */
+/** fs 条目的归属徽标文案（判定/截断逻辑共用 owner-labels 单一实现）。 */
 export declare function fsOwnerBadge(file: SessionFileChange, sessionTitle: (id: string) => string | undefined): string | null;
 /** 深链的滚动目标：整轮链接滚到轮组，否则滚到文件行。 */
 export interface PendingScroll {
@@ -82,13 +80,22 @@ export interface FileTurnEntry {
         readonly removed: number;
     };
 }
-/** 恢复窗口内一个路径的累计统计与最近改动轮次（恢复对话框 +/− 跳转用）。 */
-export interface PathWindowStats {
-    readonly stats: UnifiedDiffStats;
-    readonly latestTurn: number;
-}
 /** 一组变更只有在 hunks 完整可逆时才判定为可撤销。
  * H1 归一：条件集收敛到 session-changes.reversibleOf（卡片与侧栏共用）。 */
 export declare function isReversible(file: SessionFileChange): boolean;
 /** 统计累加（轮组/总头部把各文件 +/− 汇总用）。 */
 export declare function addStats(left: UnifiedDiffStats, right: UnifiedDiffStats): UnifiedDiffStats;
+/** 可参与统计的条目最小面（服务端净行数优先；缺省按 hunks 汇总）。 */
+export interface StatsEntry {
+    readonly counts?: {
+        readonly added: number;
+        readonly removed: number;
+    } | undefined;
+    readonly added?: number | undefined;
+    readonly removed?: number | undefined;
+    readonly diffs?: readonly ProducedFileDiff[] | undefined;
+}
+/** 单条 +/−：服务端净行数优先，缺省按 hunks 汇总（live/total/turn/window 同口径）。 */
+export declare function statsOf(entry: StatsEntry): UnifiedDiffStats;
+/** 一组条目 +/− 汇总（同口径 reduce，替代各处手写累加）。 */
+export declare function summarizeStats(entries: readonly StatsEntry[]): UnifiedDiffStats;

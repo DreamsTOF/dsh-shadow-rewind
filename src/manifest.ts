@@ -107,7 +107,7 @@ export function parseManifest(value: unknown): Manifest {
   const id = stringField(record, 'id')
   if (!/^rp_[0-9a-z]+_[0-9a-f]{12}$/.test(id)) corrupt(`恢复点 id 无效：${JSON.stringify(id)}`)
   const kind = record.kind
-  if (kind !== 'user' && kind !== 'rescue' && kind !== 'turn' && kind !== 'message') corrupt('恢复点 kind 非法')
+  if (kind !== 'user' && kind !== 'rescue' && kind !== 'turn') corrupt('恢复点 kind 非法')
   const restoreKind = kind
   const workspace = absoluteString(record, 'workspace')
   const storage = record.storage
@@ -145,33 +145,17 @@ export function parseManifest(value: unknown): Manifest {
   const turn = optionalNonNegativeInteger(record, 'turn')
   const turnStartSeq = optionalNonNegativeInteger(record, 'turnStartSeq')
   const turnEndSeq = optionalNonNegativeInteger(record, 'turnEndSeq')
-  const messageSeq = optionalNonNegativeInteger(record, 'messageSeq')
-  const partial = record.partial === undefined ? undefined : record.partial
-  if (partial !== undefined && partial !== true) corrupt('partial 只能为 true')
-  const createdPaths = parseCreatedPaths(record.createdPaths)
   const phase = record.phase
   if (phase !== undefined && phase !== 'start' && phase !== 'end') corrupt(`非法的 phase ${JSON.stringify(phase)}`)
   if (restoreKind === 'turn') {
     if (sessionId === undefined || turn === undefined || turnStartSeq === undefined) {
       corrupt('turn 恢复点必须携带 sessionId、turn 与 turnStartSeq')
     }
-  } else if (restoreKind === 'message') {
-    // 消息检查点（BEFORE 捕获兜底）：锚定消息必带；回合元数据用于谱系核对。
-    if (sessionId === undefined || messageSeq === undefined) {
-      corrupt('message 恢复点必须携带 sessionId 与 messageSeq')
-    }
-    if (turn === undefined || turnStartSeq === undefined) {
-      corrupt('message 恢复点必须携带回合元数据（turn/turnStartSeq）')
-    }
-    if (partial !== true) corrupt('message 恢复点必须是部分树（partial: true）')
   } else {
     if (turn !== undefined || turnStartSeq !== undefined || turnEndSeq !== undefined) {
       corrupt('只有 turn 恢复点可以携带回合元数据')
     }
     if (phase !== undefined) corrupt('只有 turn 恢复点可以携带 phase')
-    if (messageSeq !== undefined) corrupt('只有 message 恢复点可以携带 messageSeq')
-    if (partial !== undefined) corrupt('只有 message 恢复点可以是部分树')
-    if (createdPaths !== undefined) corrupt('只有部分树可以携带 createdPaths')
   }
   if (record.intent !== undefined) {
     if (restoreKind !== 'turn' || phase !== 'end') corrupt('只有 turn 轮末恢复点可以携带 intent')
@@ -193,9 +177,6 @@ export function parseManifest(value: unknown): Manifest {
     ...(phase === undefined ? {} : { phase }),
     ...(intent === undefined ? {} : { intent }),
     ...(turnEndSeq === undefined ? {} : { turnEndSeq }),
-    ...(messageSeq === undefined ? {} : { messageSeq }),
-    ...(partial === undefined ? {} : { partial }),
-    ...(createdPaths === undefined ? {} : { createdPaths }),
     createdAt,
     treeHash,
     fileCount,
@@ -221,14 +202,6 @@ function parseIntent(value: unknown): TurnIntent[] | undefined {
     intent.push({ tool, path, seq })
   }
   return intent
-}
-
-/** 部分树的「捕获时不存在」路径清单（BEFORE=null 的创建）；路径白名单校验。 */
-function parseCreatedPaths(value: unknown): string[] | undefined {
-  if (value === undefined) return undefined
-  if (!Array.isArray(value)) corrupt('createdPaths 必须是数组')
-  for (const path of value) validateRelativePath(path)
-  return value as string[]
 }
 
 function parseSkipped(value: unknown): SkippedPath[] {

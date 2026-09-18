@@ -9,6 +9,8 @@ const CSS_VIRTUAL_SUFFIX = '.mjs'
 const CLIENT_EXTERNALS = [
   'react',
   'react/jsx-runtime',
+  'react-dom',
+  'react-dom/client',
 ] as const
 
 /** Compile CSS Modules into package-owned style elements understood by the Web plugin loader. */
@@ -62,7 +64,7 @@ const config: UserConfig[] = [{
     remote: 'src/file-review/remote.ts',
     // 客户端纯逻辑模块（无 DOM 依赖）单发为 node 可加载产物：单元测试直接
     // 驱动录制 hunk / 清单推导 / diff 工具层的数学，不经浏览器 bundle。
-    'client-recorded-diffs': 'src/client/recorded-diffs.ts',
+    'client-diff-build': 'src/client/diff-build.ts',
     'client-session-changes': 'src/client/session-changes.ts',
     'client-fs-diff-utils': 'src/client/fs-diff-utils.ts',
   },

@@ -1,10 +1,10 @@
 /**
- * DiffPopover —— 轮尾卡片与轮中 live 条**共用**的悬停预览浮层。
+ * DiffPopover —— live 条悬停预览浮层。
  *
- * 锚点是宿主框（卡片或 live 条）自身的 rect：浮层与框同宽、左对齐，于是两
- * 个面天然长得一样，不需要各自维护一套定位逻辑。上下方向按视口余量翻转。
+ * 锚点是宿主框（live 条）自身的 rect：浮层与框同宽、左对齐，不需要额外维护
+ * 一套定位逻辑。上下方向按视口余量翻转。
  */
-import type { ProducedFileReview } from './turn-deliverables.ts';
+import type { ProducedFileReview } from '../file-review/change-types.ts';
 import type { UnifiedDiffStats } from './UnifiedDiff.tsx';
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots';
 import type { NS } from './chat-locales.ts';

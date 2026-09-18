@@ -6,7 +6,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ShadowRewindEngine } from '../lib/index.js'
@@ -170,7 +170,10 @@ test('config 端点：GET 全量 + envLocks；POST patch 热更；reset 兜底',
 // ── 三：manage 端点 ─────────────────────────────────────────────────────────
 
 test('manage 端点：三级树 + 磁盘占用 + 单条删除（undo 引用保护透出）', async () => {
-  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-cfg-ws-'))
+  // realpath 归一：Windows 8.3 短路径（如 ADMINI~1）会让「测试传入的原始
+  // 路径」与「引擎 canonical 化后暴露的路径」不一致，树比对与磁盘占用键
+  // 全落空。
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), 'shadow-rewind-cfg-ws-')))
   const { engine, storageDir } = await makeEngine()
   const handlers = makeHandlers(engine)
   try {
@@ -246,50 +249,12 @@ test('manage 端点：会话级/全部删除逐条走引擎，gc 端点立即回
   }
 })
 
-// ── 四：fork 谱系 ───────────────────────────────────────────────────────────
-
-test('lineage：记录、幂等、版本徽标计算', async () => {
-  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-cfg-lineage-'))
-  const { engine, storageDir } = await makeEngine()
-  // lineage 端点经 sessionQuery 解析 cwd：桩指向本用例的工作区。
-  const handlers = makeHandlers(engine, undefined, undefined, workspace)
-  try {
-    await engine.recordForkLineage({ cwd: workspace, parentSessionId: 'p1', childSessionId: 'c1', restorePointId: 'rp_a_000000000001' })
-    await engine.recordForkLineage({ cwd: workspace, parentSessionId: 'c1', childSessionId: 'c2', restorePointId: 'rp_a_000000000002' })
-    // 幂等：重复 fork 不重复记。
-    await engine.recordForkLineage({ cwd: workspace, parentSessionId: 'p1', childSessionId: 'c1', restorePointId: 'rp_a_000000000001' })
-    const entries = await engine.loadForkLineage(workspace)
-    assert.equal(entries.length, 2)
-    assert.ok(entries.some((entry) => entry.childId === 'c2'), 'c2 链条在列')
-    assert.ok(entries.every((entry) => typeof entry.time === 'number'))
-
-    // lineage 端点按 sessionId 算版本：c1 是 v2，c2 是 v3，p1 无徽标。
-    const c2 = await get(handlers, `/shadow-rewind/lineage?sessionId=c2`)
-    assert.equal(c2.code, 200)
-    assert.equal(c2.body.version, 3)
-    assert.equal(c2.body.restoredFrom, 'rp_a_000000000002')
-    const c1 = await get(handlers, `/shadow-rewind/lineage?sessionId=c1`)
-    assert.equal(c1.body.version, 2)
-    const p1 = await get(handlers, `/shadow-rewind/lineage?sessionId=p1`)
-    assert.equal(p1.body.version, undefined, '原始会话无徽标')
-    assert.equal(p1.body.entries.length, 2)
-
-    // 无 cwd 会话（lineage 409 路径）：sessionQuery 桩返回无 cwd 会话。
-    const noCwdHandlers = makeHandlers(engine, undefined, undefined, null)
-    const none = await get(noCwdHandlers, '/shadow-rewind/lineage?sessionId=ghost')
-    assert.equal(none.code, 409)
-    assert.equal(none.body.code, 'INVALID_ARGUMENTS')
-  } finally {
-    await engine.store.closeAll()
-    await rm(workspace, { recursive: true, force: true })
-    await rm(storageDir, { recursive: true, force: true })
-  }
-})
-
 // ── 六：GC 双闸 ─────────────────────────────────────────────────────────────
 
 test('GC 双闸：turn 检查点创建不推进 GC，首删立即回收，闸内跳过，手动 GC 绕闸', async () => {
-  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-cfg-gc-'))
+  // realpath 归一：readGcStamp 直接读 store 键，而写侧经引擎 canonical
+  // 化——8.3 短路径下两种拼写必须归一才读得到同一 stamp。
+  const workspace = await realpath(await mkdtemp(join(tmpdir(), 'shadow-rewind-cfg-gc-')))
   const { engine, storageDir } = await makeEngine()
   try {
     // turn 检查点的创建不跑 GC（kind==='turn' 跳过）——stamp 保持 0。

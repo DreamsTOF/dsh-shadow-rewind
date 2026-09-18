@@ -8,8 +8,7 @@ import type { NS } from './chat-locales.ts';
 /**
  * Owner share of the input-zone slot（dsh 0.1.2 `InputZone`：会话生命周期
  * 快照 + 输入机状态），外加 session 槽位的标准 props——`useChat` 由 ui-chat
- * 并入 SessionStandardProps，组件用它读取本会话的 Chat 快照（会话变更
- * 推导的数据源；旧 runtime 的 ConversationSnapshot 随包移除）。
+ * 并入 SessionStandardProps，组件用它读取本会话的 Chat 快照（warm 信号源）。
  */
 interface LiveBarOwner {
     readonly session: SessionSnapshot;

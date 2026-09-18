@@ -8,30 +8,31 @@
  * 物理布局（拆分后本文件只持有主组件；子件与形状单向依赖）：
  *  - ./file-review-tab-types.ts  共享类型 + 纯工具（stateKey/addStats…）；
  *  - ./review-widgets.tsx        Stats / 图标 / StateBadge / LazyDiff；
- *  - ./turn-rewind-dialog.tsx    「从快照恢复此轮」对话框（独立状态机）；
+ *  - ./rewind.ts                 统一恢复弹窗 RewindDialog（「从快照恢复此轮」
+ *                                与消息回退按钮共用同一组件、同一份数据）；
  *  - ./review-dialogs.tsx        多会话确认弹窗 + 文件级时间线对话框。
  */
 
 import {
   useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore,
 } from 'react'
-import type { Context } from '@deepseek-ai/cordis'
 import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type { ChatSnapshot } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type {
   FileReviewAction, FileReviewFileState, FileReviewRequest, FileReviewResult,
-  RecordedMutation,
 } from '../file-review/change-types.ts'
 import {
-  basename, deriveSessionChanges, deriveSessionRoots, mergeRecordedTurns,
-  resolveSessionPath, pathKey, type SessionFileChange, type TurnFileChanges,
+  basename, canonicalKey, resolveSessionPath, pathKey, type SessionFileChange, type TurnFileChanges,
 } from './session-changes.ts'
-import { ensureFsFileDiff, fetchAllFsChanges, fsAttributionOf, subscribeFsCache, type FsChangeTurn } from './fs-diff-utils.ts'
+import {
+  cachedFsTurnsForSession, ensureFsFileDiff, forceWarmFsChanges, fsAttributionOf,
+  fsTurnPlaceholders, subscribeFsCache, type FsChangeTurn,
+} from './fs-diff-utils.ts'
 import { dedupeStatus } from './status-dedupe.ts'
-import { invokeFileReview, invokeFileReviewRecorded } from './remote-access.ts'
-import { markRewound, snapshotBarrierOf } from './rewound-changes.ts'
+import { invokeFileReview } from './remote-access.ts'
+import { isFsTurnRewound, rewoundMarksOf, subscribeRewound } from './rewound-changes.ts'
 import { setReviewRows, subscribeReviewRows } from './review-state.ts'
+import { buildApplyRequest } from './apply-core.ts'
 import { summarizeDiffs, UnifiedDiff, type UnifiedDiffStats } from './UnifiedDiff.tsx'
 import { t } from './locales.ts'
 import css from './FileReviewTab.module.css'
@@ -40,15 +41,42 @@ import {
   SUCCESS_NOTICE_DURATION, ERROR_NOTICE_DURATION,
 } from './file-review-tab-types.ts'
 import type {
-  FileReviewTabProps, FileReviewRemote, Notice, FlatChange, PendingScroll,
-  FileTurnEntry, PathWindowStats,
+  FileReviewTabProps, Notice, FlatChange, PendingScroll,
+  FileTurnEntry,
 } from './file-review-tab-types.ts'
 import { Stats, UndoIcon, RedoIcon, Chevron, StateBadge, LazyDiff } from './review-widgets.tsx'
-import { TurnRewindDialog } from './turn-rewind-dialog.tsx'
-import { MultiSessionConfirmDialog, FileTimelineDialog } from './review-dialogs.tsx'
+import { RewindDialog } from './rewind.ts'
+import { ReviewConflictDialog, FileTimelineDialog } from './review-dialogs.tsx'
 
 // Tab 入参类型是本模块公开面的一部分（better-sidebar 装配方引用）。
 export type { FileReviewTabProps }
+
+/** 审查面板同轮文件行合并：同一文件的绝对/相对多拼写只留一行（优先已补齐
+ * 全文的条目），与 live 条共用 canonicalKey，两侧行集一致。 */
+function collapseFiles(files: readonly SessionFileChange[], cwd: string | undefined): SessionFileChange[] {
+  const byKey = new Map<string, SessionFileChange>()
+  for (const file of files) {
+    const key = canonicalKey(file.path, cwd)
+    const existing = byKey.get(key)
+    if (existing === undefined) {
+      byKey.set(key, file)
+      continue
+    }
+    const existingReal = existing.origin !== 'fs' || existing.diffs.length > 0
+    const nextReal = file.origin !== 'fs' || file.diffs.length > 0
+    if (nextReal && !existingReal) byKey.set(key, file)
+  }
+  return [...byKey.values()]
+}
+
+/** 两份 fs 会话清单是否同一（只比轮身份，避免无谓的全量 setState 与全文失效）。 */
+function fsTurnsSame(left: readonly FsChangeTurn[], right: readonly FsChangeTurn[]): boolean {
+  if (left.length !== right.length) return false
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i]?.turnStartSeq !== right[i]?.turnStartSeq) return false
+  }
+  return true
+}
 
 /** 侧边栏 tab 本体：逐轮变更组 + 行内 diff + 撤销。 */
 export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewTabProps) {
@@ -57,47 +85,33 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   const [statusPending, setStatusPending] = useState(false)
   const [busyKey, setBusyKey] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
+  // 树形视图的轮级折叠（缺省全展开；集合内 = 已折叠）与修改处级展开。
+  const [collapsedTurns, setCollapsedTurns] = useState<ReadonlySet<number>>(() => new Set())
+  // 修改处（hunk）展开集：键 = `${stateKey(turn, path)}|${hunk 下标}`。
+  const [openHunks, setOpenHunks] = useState<ReadonlySet<string>>(() => new Set())
   const [notice, setNotice] = useState<Notice | null>(null)
   const [tick, setTick] = useState(0)
   // 双向同步（review-state）：live 条行内撤销/重做的结果回流到这里——
   // tick 触发宿主重巡检，本界面的行状态与 live 条保持同一事实。
   useEffect(() => subscribeReviewRows(() => { setTick(value => value + 1) }), [])
+  // 恢复记录总线（rewound-changes 单一真相）：回退弹窗 / 按轮快照恢复 / 撤销
+  // 任一动作对磁盘的改动都会广播到这里——本面板立即重拉 fs 清单并重巡检，
+  // 消除「弹窗已把文件恢复掉、审计抽屉还照着旧清单」的分叉。
+  useEffect(() => subscribeRewound(() => { setTick(value => value + 1) }), [])
   // 块级选择：stateKey → 选中 hunk 下标集合；缺省（无条目）= 隐式全选。
   const [hunkSelection, setHunkSelection] = useState<ReadonlyMap<string, ReadonlySet<number>>>(() => new Map())
   // 打开「从快照恢复此轮」对话框的回合号；null = 关闭。
   const [rewindTurn, setRewindTurn] = useState<number | null>(null)
   // 打开文件级时间线对话框的路径；null = 关闭。
   const [timelinePath, setTimelinePath] = useState<string | null>(null)
-  // 多会话确认弹窗的待提交批次（批次含 owner === 'multi' 时暂存）；null = 关闭。
-  const [pendingConfirm, setPendingConfirm] = useState<{
+  // 冲突三选项弹窗的待授权清单（apply 非 force 批次返回 conflict 时暂存）；null = 关闭。
+  const [pendingConflict, setPendingConflict] = useState<{
     key: string
     items: readonly FlatChange[]
     action: FileReviewAction
   } | null>(null)
   const noticeSeqRef = useRef(0)
   const noticeTimerRef = useRef<number | null>(null)
-
-  // 本会话的 Live Chat 快照（dsh 0.1.2：会话变更推导的数据源从
-  // runtime 会话快照换成 uiConversation 会话绑定的 `chat` 目标快照）。
-  const uiConversation = (ctx as unknown as {
-    readonly uiConversation?: {
-      binding(source: string): {
-        target(target: 'chat'): { subscribe(listener: () => void): () => void; getSnapshot(): ChatSnapshot | undefined }
-      }
-    }
-  }).uiConversation
-  const chatSource = useMemo(
-    () => uiConversation?.binding(sessionId).target('chat'),
-    [uiConversation, sessionId],
-  )
-  const subscribe = useCallback(
-    (listener: () => void) => chatSource?.subscribe(listener) ?? (() => {}),
-    [chatSource],
-  )
-  const snapshot: ChatSnapshot | null = useSyncExternalStore(
-    subscribe,
-    () => chatSource?.getSnapshot() ?? null,
-  )
 
   // 会话标题查询（归因徽标把「他会话 id」升级成可读标题；缺省回落 id 截断）。
   const sessionList = useSyncExternalStore(
@@ -109,23 +123,9 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     [sessionList],
   )
 
-  // Code Mode（run_code）根调用及其宿主录制的变更：嵌套派发没有可复用的视图,
-  // 所以每个根的变更要异步拉取，再并入下面快照推导出的各轮。拉取在根集合
-  // 变化（新一轮 run_code）或手动刷新时重新触发。
-  const roots = useMemo(
-    () => (snapshot === null ? [] : deriveSessionRoots(snapshot)),
-    [snapshot],
-  )
-  const rootsKey = useMemo(
-    () => roots.map(root => root.rootCallId).join('|'),
-    [roots],
-  )
-  const [recorded, setRecorded] = useState<readonly RecordedMutation[]>(() => [])
-  // 经检查点对比发现的文件系统级变更（PowerShell 等终端写盘）：宿主的
-  // /shadow-rewind/fs-changes 端点把每一轮的轮起检查点与**下一轮**的轮起
-  // 检查点配对（= 轮末树状态），并预算好每文件的增/删行数。全文（整文件
-  // diff）按需懒加载：展开 diff、撤销提交、恢复窗口统计时才拉，且按
-  // (turn, path) 记忆。
+  // 变更事实的唯一来源：宿主 /shadow-rewind/fs-changes 的逐轮检查点 diff
+  // （每一轮 = 轮起检查点 → 轮末检查点，无轮末回退下一轮轮起）。行数由服务端
+  // 预算；全文（整文件 diff）按需懒加载，且按 (turn, path) 记忆。
   const [fsRaw, setFsRaw] = useState<readonly FsChangeTurn[]>([])
   const [ensuredFs, setEnsuredFs] = useState<ReadonlyMap<string, SessionFileChange>>(() => new Map())
   const fsRawRef = useRef(fsRaw)
@@ -133,48 +133,36 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   const ensuredFsRef = useRef(ensuredFs)
   ensuredFsRef.current = ensuredFs
 
+  /** 从共享 fs 缓存同步当前会话的清单（与 live 条同一事实源；轮序升序）。 */
+  const syncFsFromCache = useCallback(() => {
+    const next = cachedFsTurnsForSession(sessionId)
+    const previous = fsRawRef.current
+    if (fsTurnsSame(previous, next)) return
+    // J6：全文记忆随清单换代会话一并失效——避免长期展示过期 diff。
+    setEnsuredFs(new Map())
+    setFsRaw(next)
+  }, [sessionId])
+
+  // fs 数据源统一走 warm 缓存（不再各自直拉 /shadow-rewind/fs-changes，双通道
+  // 分叉消除）：可见、手动刷新或恢复/撤销事件（tick）触发**强制** warm
+  // （绕过 2s 节流），warm 完成广播后从缓存同步。文件被恢复/撤销时，同一份
+  // rev 节流 + 失效广播驱动 live 条与审计面板拿到一致的清单。
   useEffect(() => {
     if (!visible || cwd === undefined || cwd.trim() === '') {
       setFsRaw([])
       setEnsuredFs(new Map())
       return
     }
-
-    let active = true
-
-    fetchAllFsChanges(sessionId).then((payload) => {
-      if (!active) return
-      // J6：全文记忆随清单更新一并失效——底层 lazy 缓存已被 warm 替换作废，
-      // 侧栏若继续命中 ensuredFs 会长期展示过期 diff（与卡片的失效规则相反）。
-      setEnsuredFs(new Map())
-      setFsRaw(payload.turns)
-    }).catch(() => {
-      if (!active) return
-      setFsRaw([])
-    })
-
-    return () => { active = false }
+    forceWarmFsChanges(sessionId)
+    syncFsFromCache()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, tick, sessionId, cwd])
 
-  // J6：接入 warm 缓存广播——live 条推进时审查界面同步重拉，消除
-  // 「双通道获取、两侧新鲜度不同」的展示分叉。
+  // warm 缓存广播（live 条推进 / 强制 warm 完成）：审计面板同步读同一缓存。
   useEffect(() => {
-    if (!visible || cwd === undefined || cwd.trim() === '') return
-    let active = true
-    const unsubscribe = subscribeFsCache(() => {
-      if (!active) return
-      fetchAllFsChanges(sessionId).then((payload) => {
-        if (!active) return
-        setEnsuredFs(new Map())
-        setFsRaw(payload.turns)
-      }).catch(() => { /* warm 广播驱动的重拉失败：保留现有数据 */ })
-    })
-    return () => {
-      active = false
-      unsubscribe()
-    }
-  }, [visible, sessionId, cwd])
+    if (!visible || cwd === undefined || cwd.trim() === '') return undefined
+    return subscribeFsCache(() => { syncFsFromCache() })
+  }, [visible, sessionId, cwd, syncFsFromCache])
 
   /** 按需补齐 fs 条目全文（展开 diff、撤销提交、恢复窗口统计共用）。 */
   const ensureFsTurnFiles = useCallback(async (turn: number, paths?: readonly string[]): Promise<void> => {
@@ -193,95 +181,30 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
       for (const [key, value] of settled) if (value !== null) next.set(key, value)
       return next
     })
-    // 自动勾选：归因非本会话（autoSelect === false）的条目此时才知道 hunk 数，
-    // 初始化为显式空勾选（行按钮默认禁用，须显式勾选才提交）；本会话写入与
-    // 无归因条目保持隐式全选；已有用户选择绝不覆盖。
-    setHunkSelection((current) => {
-      let changed = false
-      const next = new Map(current)
-      for (const [key, value] of settled) {
-        if (value === null || value.autoSelect !== false || next.has(key)) continue
-        next.set(key, new Set<number>())
-        changed = true
-      }
-      return changed ? next : current
-    })
   }, [cwd])
 
   // fs 占位（计数）→ 已补齐条目的合并视图：同 (turn, path) 优先用懒加载全文。
+  // 占位构造统一走 fs-diff-utils 的 fsTurnPlaceholders（带归因徽标）；ensure
+  // 覆盖按 (turn, path) 槽位命中。恢复/撤销（tick 驱动的 marks）时按恢复记录
+  // 过滤已随恢复撤回的 fs 轮写盘——与 live 条同一遮蔽口径，审计抽屉不再照列
+  // 「磁盘上已不存在」的旧写盘。
   const fsTurns = useMemo<TurnFileChanges[]>(() => {
     const result: TurnFileChanges[] = []
+    const marks = rewoundMarksOf(sessionId)
     for (const fsTurn of fsRaw) {
-      const files: SessionFileChange[] = []
-      for (const change of fsTurn.changes) {
-        const ensured = ensuredFs.get(`${String(fsTurn.turn)}|${change.path}`)
-        if (ensured !== undefined) {
-          files.push(ensured)
-          continue
-        }
-        files.push({
-          path: change.path,
-          diffs: [],
-          origin: 'fs',
-          ...(change.dir === true ? { dir: true as const } : {}),
-          ...(change.added !== undefined || change.removed !== undefined
-            ? { counts: { added: change.added ?? 0, removed: change.removed ?? 0 } }
-            : {}),
-          ...(change.kind === 'deleted' ? { deleted: true as const } : {}),
-          ...fsAttributionOf(change),
-        })
-      }
+      const files = fsTurnPlaceholders(fsTurn, { attribution: true })
+        .filter(file => !isFsTurnRewound(marks, fsTurn.turnStartSeq, file.path))
+        .map(file => ensuredFs.get(`${String(fsTurn.turn)}|${file.path}`) ?? file)
       if (files.length > 0) result.push({ turn: fsTurn.turn, live: false, files })
     }
     return result
-  }, [fsRaw, ensuredFs])
-
-  useEffect(() => {
-    if (!visible || roots.length === 0) return
-    let active = true
-    const timer = window.setTimeout(() => {
-      // 弹性解析（remote-access）：命名空间服务丢失时自动重挂一次再取。
-      invokeFileReviewRecorded(ctx, sessionId, { rootCallIds: roots.map(root => root.rootCallId) })
-        .then((value) => {
-          if (!active) return
-          setRecorded(value.mutations)
-        })
-        .catch(() => {
-          // 瞬时拉取失败：保留上一次的记录；下一轮快照 / 手动刷新会重试。
-        })
-    }, 200)
-    return () => {
-      active = false
-      window.clearTimeout(timer)
-    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, rootsKey, tick, sessions, sessionId])
+  }, [fsRaw, ensuredFs, tick, sessionId])
 
+  // 逐轮清单：fs 轮（检查点 diff）按恢复记录遮蔽后即为全部事实。
   const turns = useMemo(
-    () => {
-      const base = mergeRecordedTurns(deriveSessionChanges(snapshot), roots, recorded)
-      // 把文件系统级变更（PowerShell 等）并入轮列表：同轮的组按文件逐个合并，
-      // 保证同一轮绝不被渲染两遍。
-      if (fsTurns.length === 0) return base
-      const byTurn = new Map<number, TurnFileChanges>()
-      for (const turn of base) byTurn.set(turn.turn, turn)
-      for (const fsTurn of fsTurns) {
-        const existing = byTurn.get(fsTurn.turn)
-        if (existing === undefined) {
-          byTurn.set(fsTurn.turn, fsTurn)
-          continue
-        }
-        const files = [...existing.files]
-        for (const fsFile of fsTurn.files) {
-          const index = files.findIndex(f => pathKey(f.path) === pathKey(fsFile.path))
-          if (index === -1) files.push(fsFile)
-          // 同路径的工具视图条目已经带着 hunks，保留它们。
-        }
-        byTurn.set(fsTurn.turn, { turn: existing.turn, live: existing.live, files })
-      }
-      return [...byTurn.values()].sort((a, b) => a.turn - b.turn)
-    },
-    [snapshot, roots, recorded, fsTurns],
+    () => fsTurns.map(turn => ({ ...turn, files: collapseFiles(turn.files, cwd) })),
+    [fsTurns, cwd],
   )
   const flat = useMemo<FlatChange[]>(
     () => turns.flatMap(turn => turn.files.map(file => ({
@@ -471,7 +394,7 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     result: FileReviewResult,
   ) => {
     // 双向同步（review-state）：本界面的开关结果广播给 live 条的行内按钮。
-    setReviewRows(sessionId, result.files)
+    setReviewRows(sessionId, result.files, cwd)
     setStates((current) => {
       const next = new Map(current)
       items.forEach(({ item, full }, index) => {
@@ -486,15 +409,13 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     })
   }, [sessionId, subsetSig])
 
-  /** Toggle one change set (a whole turn, or one file) undo ↔ redo — 提交闸
-   * 单点：轮/文件按钮都传全文，筛选在此统一完成。
-   * ① autoSelect === false 的条目（其它会话/歧义写入）须有显式勾选才纳入；
-   * ② 批次含 owner === 'multi'（真多会话冲突）⇒ 先弹确认窗，确认后走
-   * applyToggle；其余批次直接提交。 */
+  /** Toggle one change set (a whole turn, or one file) undo ↔ redo —— 提交单点：
+   * 轮/文件按钮都传全文，hunk 勾选裁剪在此统一完成（归属只是徽标，不参与筛选）。 */
   const applyToggle = useCallback((
     key: string,
     items: readonly FlatChange[],
     action: FileReviewAction,
+    force = false,
   ) => {
     if (busyKey !== null || items.length === 0) return
     setBusyKey(key)
@@ -528,17 +449,18 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         return subset.length > 0 ? [{ item: { ...item, diffs: subset }, full: false }] : []
       })
       if (submitted.length === 0) return undefined
-      return invoke('apply', {
-        action,
-        files: submitted.map(({ item }) => ({
+      // 装配共用 apply-core：dirKind/请求体唯一实现；force 语义不变。
+      const request = buildApplyRequest(
+        submitted.map(({ item }) => ({
           path: item.path,
           diffs: item.diffs,
-          ...(item.origin !== undefined ? { origin: item.origin } : {}),
-          ...(item.dir === true
-            ? { dirKind: item.deleted === true ? 'deleted' as const : 'added' as const }
-            : {}),
+          ...(item.origin === undefined ? {} : { origin: item.origin }),
+          ...(item.dir === true ? { dir: true, deleted: item.deleted === true } : {}),
         })),
-      })
+        action,
+        force,
+      )
+      return invoke('apply', request)
     })().then((result) => {
       if (result === undefined) return
       mergeResultStates(submitted, result)
@@ -546,9 +468,21 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
       const failures = result.files.filter(file => file.state !== target)
       if (failures.length === 0) {
         showNotice('success', t(action === 'undo' ? 'undoSuccess' : 'redoSuccess'))
-      } else {
-        showNotice('error', t(action === 'undo' ? 'undoPartial' : 'redoPartial'))
+        return
       }
+      // 冲突三选项（EXPECTED-DESIGN 1.2）：非 force 批次里有路径因后续修改
+      // 而漂移（conflict）时弹窗授权——拒绝不动 / force 覆盖 / 只回滚正常
+      // 部分。force 批次里的残余 conflict（锚点定位失败）不进弹窗。
+      if (!force) {
+        const conflictItems = submitted
+          .filter((_, index) => result.files[index]?.state === 'conflict')
+          .map(({ item }) => item)
+        if (conflictItems.length > 0) {
+          setPendingConflict({ key, items: conflictItems, action })
+          return
+        }
+      }
+      showNotice('error', t(action === 'undo' ? 'undoPartial' : 'redoPartial'))
     }).catch((error: unknown) => {
       showNotice('error', `${t('toggleError')}: ${error instanceof Error ? error.message : String(error)}`)
     }).finally(() => { setBusyKey(null) })
@@ -560,26 +494,24 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     action: FileReviewAction,
   ) => {
     if (busyKey !== null || items.length === 0) return
-    // autoSelect === false 且无显式勾选 ⇒ 不纳入提交批次（默认不勾选 ⇒
-    // 提交必经用户显式勾选，纯他会话文件由此无需弹窗确认）。
-    const candidates = items.filter((item) => {
-      if (item.autoSelect !== false) return true
-      const selection = hunkSelection.get(stateKey(item.turn, item.path))
-      return selection !== undefined && selection.size > 0
-    })
-    if (candidates.length === 0) return
-    if (candidates.some(item => item.owner === 'multi')) {
-      setPendingConfirm({ key, items: candidates, action })
-      return
-    }
-    void applyToggle(key, candidates, action)
-  }, [busyKey, hunkSelection, applyToggle])
+    void applyToggle(key, items, action)
+  }, [busyKey, applyToggle])
 
   const toggleExpanded = useCallback((key: string) => {
     setExpanded((current) => {
       const next = new Set(current)
       if (next.has(key)) next.delete(key)
       else next.add(key)
+      return next
+    })
+  }, [])
+
+  /** 树形第三级：展开/折叠一个修改处（键 = 文件键 + hunk 下标）。 */
+  const toggleHunk = useCallback((hunkKey: string) => {
+    setOpenHunks((current) => {
+      const next = new Set(current)
+      if (next.has(hunkKey)) next.delete(hunkKey)
+      else next.add(hunkKey)
       return next
     })
   }, [])
@@ -630,22 +562,6 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
   }, [turns])
   const timelineEntries = timelinePath === null ? [] : timelineForPath.get(timelinePath) ?? []
 
-  // 按轮恢复窗口（第 rewindTurn 轮起）内本会话各路径的累计 +/- 与最近改动轮次。
-  const windowStats = useMemo(() => {
-    const map = new Map<string, PathWindowStats>()
-    if (rewindTurn === null) return map
-    for (const entry of flat) {
-      if (entry.turn < rewindTurn) continue
-      const existing = map.get(entry.path)
-      const stats = entry.counts ?? summarizeDiffs(entry.diffs)
-      map.set(entry.path, {
-        stats: existing === undefined ? stats : addStats(existing.stats, stats),
-        latestTurn: existing === undefined ? entry.turn : Math.max(existing.latestTurn, entry.turn),
-      })
-    }
-    return map
-  }, [flat, rewindTurn])
-
   /** 从时间线/恢复对话框跳到某个（轮, 文件）的差异：关掉浮层、展开该行并滚动
    * 到位（setExpanded 总是产生新 Set，滚动副作用必然重放）。 */
   const jumpToFile = useCallback((turn: number, path: string) => {
@@ -678,6 +594,16 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
     // 轮头部汇总：该轮存在非本会话归属的 fs 写入时提示总数（不逐文件枚举）。
     const otherWrites = turn.files.filter(file => file.origin === 'fs'
       && file.owner !== undefined && file.owner !== 'target').length
+    // 树形第一级：轮（可折叠）。
+    const collapsed = collapsedTurns.has(turn.turn)
+    const toggleCollapse = () => {
+      setCollapsedTurns((current) => {
+        const next = new Set(current)
+        if (next.has(turn.turn)) next.delete(turn.turn)
+        else next.add(turn.turn)
+        return next
+      })
+    }
     return (
       <section
         key={turn.turn}
@@ -687,7 +613,20 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
         }}
         className={css.turnGroup}
       >
-        <header className={css.turnHeader}>
+        <header
+          className={css.turnHeader}
+          role="button"
+          tabIndex={0}
+          aria-expanded={!collapsed}
+          onClick={toggleCollapse}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault()
+              toggleCollapse()
+            }
+          }}
+        >
+          <Chevron open={!collapsed} />
           <span className={css.turnTitle}>{t('turn', { n: turn.turn })}</span>
           {turn.live && <span className={css.liveBadge}>{t('turnLive')}</span>}
           <span className={css.turnCount}>
@@ -702,7 +641,8 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
             className={css.actionButton}
             disabled={statusPending || busyKey !== null || !hasToggleable}
             title={!hasToggleable ? t('toggleUnavailable') : undefined}
-            onClick={() => {
+            onClick={(event) => {
+              event.stopPropagation()
               runToggle(turnKey, toggleable.map(file => ({
                 turn: turn.turn, path: file.path, diffs: file.diffs,
                 ...(file.origin !== undefined ? { origin: file.origin } : {}),
@@ -724,17 +664,18 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
             title={t('snapshotRestoreTitle')}
             onClick={(event) => {
               event.stopPropagation()
-              // 恢复窗口统计需要 fs 条目的 +/-：先按需补齐（幂等，已补的跳过）。
-              void ensureFsTurnFiles(turn.turn)
+              // 打开统一恢复弹窗（轮入口；统计由弹窗自行从 fs 缓存取）。
               setRewindTurn(turn.turn)
             }}
           >
             {t('snapshotRestore')}
           </button>
         </header>
-        <ul className={css.fileList}>
-          {turn.files.map(file => renderFile(turn, file))}
-        </ul>
+        {!collapsed && (
+          <ul className={css.fileList}>
+            {turn.files.map(file => renderFile(turn, file))}
+          </ul>
+        )}
       </section>
     )
   }
@@ -823,12 +764,12 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           <button
             type="button"
             className={css.smallButton}
-            disabled={statusPending || busyKey !== null || !(reversible || fsPending) || ((reversible || file.autoSelect === false) && selectedCount === 0)}
+            disabled={statusPending || busyKey !== null || !(reversible || fsPending) || (reversible && selectedCount === 0)}
             title={deletedNoDiff
               ? t('deletedHint')
               : (!(reversible || fsPending)
                 ? t('toggleUnavailable')
-                : ((reversible || file.autoSelect === false) && selectedCount === 0) ? t('hunkNoneSelected') : undefined)}
+                : (reversible && selectedCount === 0) ? t('hunkNoneSelected') : undefined)}
             onClick={(event) => {
               event.stopPropagation()
               runToggle(key, [{
@@ -855,25 +796,66 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
                   : file.diffs.length === 0
                     ? <p className={css.diffUnavailable}>{t('unavailable')}</p>
                     : (
-                  <UnifiedDiff
-                    diffs={file.diffs}
-                    contextLines={3}
-                    showCopyButton
-                    showFileHeaders={false}
-                    selectable
-                    navigation
-                    selectedHunks={hunkSelection.get(key)}
-                    onSelectedHunksChange={(next) => { changeHunkSelection(key, file.diffs.length, next) }}
-                    labels={{
-                      copy: t('copy'),
-                      copied: t('copied'),
-                      showUnchanged: count => t('showUnchanged', { count }),
-                      hideUnchanged: count => t('hideUnchanged', { count }),
-                      hunkN: n => t('hunkN', { n }),
-                      hunkInclude: t('hunkInclude'),
-                    }}
-                    className={css.reviewDiff}
-                  />
+                  <ul className={css.hunkList}>
+                    {file.diffs.map((diff, index) => {
+                      // 树形第三级：修改处（hunk）。展开才渲染该块 diff；
+                      // 勾选框从原整段 diff 内嵌选择迁移到修改处行上。
+                      const hunkKey = `${key}|${index}`
+                      const hunkOpen = openHunks.has(hunkKey)
+                      const hunkChecked = selection === undefined || selection.has(index)
+                      return (
+                        <li key={hunkKey} className={css.hunkItem}>
+                          <div
+                            className={css.hunkRow}
+                            role="button"
+                            tabIndex={0}
+                            aria-expanded={hunkOpen}
+                            onClick={() => { toggleHunk(hunkKey) }}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault()
+                                toggleHunk(hunkKey)
+                              }
+                            }}
+                          >
+                            <Chevron open={hunkOpen} />
+                            <input
+                              type="checkbox"
+                              checked={hunkChecked}
+                              title={t('hunkInclude')}
+                              onClick={(event) => { event.stopPropagation() }}
+                              onChange={() => {
+                                const next = new Set(selection ?? file.diffs.map((_, i) => i))
+                                if (next.has(index)) next.delete(index)
+                                else next.add(index)
+                                changeHunkSelection(key, file.diffs.length, next)
+                              }}
+                            />
+                            <span className={css.hunkTitle}>{t('hunkN', { n: index + 1 })}</span>
+                            <Stats stats={summarizeDiffs([diff])} />
+                          </div>
+                          {hunkOpen && (
+                            <div className={css.hunkDiff}>
+                              <UnifiedDiff
+                                diffs={[diff]}
+                                contextLines={3}
+                                showFileHeaders={false}
+                                labels={{
+                                  copy: t('copy'),
+                                  copied: t('copied'),
+                                  showUnchanged: count => t('showUnchanged', { count }),
+                                  hideUnchanged: count => t('hideUnchanged', { count }),
+                                  hunkN: n => t('hunkN', { n }),
+                                  hunkInclude: t('hunkInclude'),
+                                }}
+                                className={css.reviewDiff}
+                              />
+                            </div>
+                          )}
+                        </li>
+                      )
+                    })}
+                  </ul>
                 )}
             </LazyDiff>
           </div>
@@ -911,45 +893,36 @@ export function FileReviewTab({ ctx, sessionId, cwd, visible, tab }: FileReviewT
           : [...turns].reverse().map(renderTurn)}
       </div>
       {rewindTurn !== null && (
-        <TurnRewindDialog
+        // 统一恢复弹窗（轮入口）：与消息回退按钮同一组件、同一份共享预览数据。
+        // 恢复成功后的遮蔽标记由弹窗内 commitRestore 完成，本面板经
+        // subscribeRewound 的 tick 自动重拉清单。
+        <RewindDialog
           sessionId={sessionId}
-          turn={rewindTurn}
-          windowStats={windowStats}
-          onJumpToDiff={jumpToFile}
-          sessionTitle={sessionTitle}
+          target={{ turn: rewindTurn }}
           onClose={() => { setRewindTurn(null) }}
-          onRestored={() => {
-            setTick(value => value + 1)
-            // 整树恢复成功：以当前快照最大节点 seq 为屏障打整树遮蔽标记，
-            // live 条的会话累计视图随之扣掉恢复前的全部改动。
-            markRewound(sessionId, null, snapshotBarrierOf(snapshot))
-            showNotice('success', t('snapshotDone'))
+          onJumpToDiff={(path) => {
+            // 弹窗已在本面板内：就地展开该文件最近一轮的 diff 并滚动到位。
+            setRewindTurn(null)
+            const entry = [...flat].reverse().find(item => pathKey(item.path) === pathKey(path))
+            if (entry !== undefined) jumpToFile(entry.turn, entry.path)
           }}
         />
       )}
-      {pendingConfirm !== null && (
-        <MultiSessionConfirmDialog
-          items={pendingConfirm.items}
-          action={pendingConfirm.action}
-          sessionTitle={sessionTitle}
-          onCancel={() => { setPendingConfirm(null) }}
-          onManual={() => {
-            const conflicts = pendingConfirm.items.filter(item => item.owner === 'multi')
-            setPendingConfirm(null)
-            // 展开冲突行并滚到首条；先补齐全文让勾选框即刻可用。
-            for (const item of conflicts) void ensureFsTurnFiles(item.turn, [item.path])
-            setExpanded((current) => {
-              const next = new Set(current)
-              for (const item of conflicts) next.add(stateKey(item.turn, item.path))
-              return next
-            })
-            const first = conflicts[0]
-            if (first !== undefined) pendingScrollRef.current = { rowKey: stateKey(first.turn, first.path), turn: null }
+      {pendingConflict !== null && (
+        <ReviewConflictDialog
+          items={pendingConflict.items}
+          action={pendingConflict.action}
+          busy={busyKey !== null}
+          onAbort={() => { setPendingConflict(null) }}
+          onPartial={() => {
+            const pending = pendingConflict
+            setPendingConflict(null)
+            showNotice('error', t(pending.action === 'undo' ? 'undoPartial' : 'redoPartial'))
           }}
-          onProceed={() => {
-            const pending = pendingConfirm
-            setPendingConfirm(null)
-            void applyToggle(pending.key, pending.items, pending.action)
+          onForce={() => {
+            const pending = pendingConflict
+            setPendingConflict(null)
+            void applyToggle(pending.key, pending.items, pending.action, true)
           }}
         />
       )}

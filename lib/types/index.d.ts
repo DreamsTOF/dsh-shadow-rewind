@@ -11,7 +11,7 @@ export * from './errors.js';
 export * from './rewind-host.js';
 export * from './types.js';
 export { FileReviewService, transformFile } from './file-review/host.ts';
-export type { FileReviewAction, FileReviewChange, FileReviewFileResult, FileReviewRequest, FileReviewResult, ProducedFileDiff, ProducedFileReview, RecordedMutation, RecordedRequest, RecordedResult, } from './file-review/change-types.ts';
+export type { FileReviewAction, FileReviewChange, FileReviewFileResult, FileReviewRequest, FileReviewResult, ProducedFileDiff, ProducedFileReview, } from './file-review/change-types.ts';
 /** 最小 cordis 上下文面（结构类型）：避免依赖具体的 cordis 包版本。 */
 interface PluginContext {
     readonly logger: HostContext['logger'];

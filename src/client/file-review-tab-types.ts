@@ -9,10 +9,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type {
   FileReviewRequest, FileReviewResult,
-  RecordedRequest, RecordedResult,
+  ProducedFileDiff,
 } from '../file-review/change-types.ts'
 import { reversibleOf, type FsAttributionFields, type SessionFileChange } from './session-changes.ts'
-import type { UnifiedDiffStats } from './UnifiedDiff.tsx'
+import { summarizeDiffs, type UnifiedDiffStats } from './UnifiedDiff.tsx'
+import { ownerBadgeOf } from './owner-labels.ts'
 import { t } from './locales.ts'
 
 /** 页内通知气泡的成功停留时长（自动消失）。 */
@@ -39,7 +40,6 @@ export interface FileReviewTabProps {
 export interface FileReviewRemote {
   status(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>
   apply(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>
-  recorded(request: RecordedRequest): Promise<RemoteResult<RecordedResult>>
 }
 
 /** 页内通知气泡（成功/失败短暂停留后自动消失）。 */
@@ -69,19 +69,13 @@ export function stateKey(turn: number, path: string): string {
   return `${turn}|${path}`
 }
 
-/** fs 条目的归属徽标文案：旧宿主无归属（owner 缺省）→ 无徽标。
- * 他会话展示会话标题；多主/未知如实标注。 */
+/** fs 条目的归属徽标文案（判定/截断逻辑共用 owner-labels 单一实现）。 */
 export function fsOwnerBadge(file: SessionFileChange, sessionTitle: (id: string) => string | undefined): string | null {
-  if (file.owner === undefined) return null
-  if (file.owner === 'multi') return t('ownerMulti')
-  if (file.owner === 'unknown') return t('ownerUnknown')
-  if (file.owner !== 'target') {
-    const title = sessionTitle(file.owner)
-    return title ?? t('ownerSession', {
-      id: file.owner.length > 12 ? `${file.owner.slice(0, 12)}…` : file.owner,
-    })
-  }
-  return null
+  return ownerBadgeOf(file.owner, {
+    multi: t('ownerMulti'),
+    unknown: t('ownerUnknown'),
+    other: (id) => t('ownerSession', { id: id.length > 12 ? `${id.slice(0, 12)}…` : id }),
+  }, sessionTitle)
 }
 
 /** 深链的滚动目标：整轮链接滚到轮组，否则滚到文件行。 */
@@ -102,12 +96,6 @@ export interface FileTurnEntry {
   readonly counts?: { readonly added: number; readonly removed: number }
 }
 
-/** 恢复窗口内一个路径的累计统计与最近改动轮次（恢复对话框 +/− 跳转用）。 */
-export interface PathWindowStats {
-  readonly stats: UnifiedDiffStats
-  readonly latestTurn: number
-}
-
 /** 一组变更只有在 hunks 完整可逆时才判定为可撤销。
  * H1 归一：条件集收敛到 session-changes.reversibleOf（卡片与侧栏共用）。 */
 export function isReversible(file: SessionFileChange): boolean {
@@ -117,4 +105,33 @@ export function isReversible(file: SessionFileChange): boolean {
 /** 统计累加（轮组/总头部把各文件 +/− 汇总用）。 */
 export function addStats(left: UnifiedDiffStats, right: UnifiedDiffStats): UnifiedDiffStats {
   return { added: left.added + right.added, removed: left.removed + right.removed }
+}
+
+/** 可参与统计的条目最小面（服务端净行数优先；缺省按 hunks 汇总）。 */
+export interface StatsEntry {
+  readonly counts?: { readonly added: number; readonly removed: number } | undefined
+  readonly added?: number | undefined
+  readonly removed?: number | undefined
+  readonly diffs?: readonly ProducedFileDiff[] | undefined
+}
+
+/** 单条 +/−：服务端净行数优先，缺省按 hunks 汇总（live/total/turn/window 同口径）。 */
+export function statsOf(entry: StatsEntry): UnifiedDiffStats {
+  if (entry.counts !== undefined) return entry.counts
+  if (entry.added !== undefined || entry.removed !== undefined) {
+    return { added: entry.added ?? 0, removed: entry.removed ?? 0 }
+  }
+  return summarizeDiffs(entry.diffs ?? [])
+}
+
+/** 一组条目 +/− 汇总（同口径 reduce，替代各处手写累加）。 */
+export function summarizeStats(entries: readonly StatsEntry[]): UnifiedDiffStats {
+  let added = 0
+  let removed = 0
+  for (const entry of entries) {
+    const stats = statsOf(entry)
+    added += stats.added
+    removed += stats.removed
+  }
+  return { added, removed }
 }

@@ -174,10 +174,8 @@ test('混沌：双会话交错写盘——归属分离、空目录流转、整�
     assert.ok(aTurn1, 'A 轮 1 必须有配对条目')
     const aByPath = Object.fromEntries(aTurn1.changes.map((change) => [change.path, change]))
     assert.equal(aByPath['a.txt'].owner, 'target', 'A 自己的修改必须归属本会话')
-    assert.equal(aByPath['a.txt'].autoSelect, true)
     assert.equal(aByPath['emptyA'].dir, true, '空目录条目必须带 dir 标记')
     assert.equal(aByPath['b-new.txt'].owner, 'sB', 'B 窗口写入必须归属 sB')
-    assert.equal(aByPath['b-new.txt'].autoSelect, false, 'B 的写入不得默认勾选')
     assert.equal(aByPath['sub/b.txt'].owner, 'sB', 'B 造成的删除归属 sB')
     assert.equal(aByPath['sub'].owner, 'sB', 'sub 变空发生在 B 的窗口，归属 sB')
 
@@ -189,7 +187,6 @@ test('混沌：双会话交错写盘——归属分离、空目录流转、整�
     assert.equal(bByPath['sub/b.txt'].owner, 'target', 'B 自己的删除归属本会话（发生在 B-t1 之后）')
     assert.ok(!('sub' in bByPath), 'sub 变空成形于 B 开轮捕获，不在 B 的配对 diff 里')
     assert.equal(bByPath['sub/c.txt'].owner, 'sA', 'A 窗口的写入归属 sA')
-    assert.equal(bByPath['sub/c.txt'].autoSelect, false)
     assert.equal(bByPath['emptyA'].owner, 'sA', 'A 删除 emptyA 属于 A 的窗口，归属 sA')
 
     // 整树恢复收敛：回到 A 轮 1 轮起——B 的一切与 A 轮 1 的写入全部消失。

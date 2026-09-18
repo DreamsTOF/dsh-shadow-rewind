@@ -20,15 +20,16 @@ import type { PathAttribution } from '../attribution.js'
 import { collectTurnIntent, traceBaselinePaths, traceNodes, traceRangeDiff, traceSpans, turnBoundaries } from '../trace-replay.js'
 import type { ShadowRewindEngine } from '../engine.js'
 import type { RestorePointSummary } from '../types.js'
-import { turnCheckpointForRequest, checkpointForRequest, applyGuarded, createConversationRestart, resolveMessageRewindTarget, resolveTurnRewindTarget, readSession, sharedWorkspaceSessions } from './session-resolve.js'
-import { computeTurnFsChanges, decodeUtf8, countLines, lineCounts, probeUnreadableCheckpoints, readChangeSide, readLiveFile, DIFF_COUNT_BUDGET } from './fs-changes.js'
+import { turnCheckpointForRequest, checkpointForRequest, applyGuarded, resolveMessageRewindTarget, resolveTurnRewindTarget, readSession } from './session-resolve.js'
+import { computeTurnFsChanges, computeCumulativeFsChanges, countChangeLines, decodeUtf8, countLines, lineCounts, probeUnreadableCheckpoints, readChangeSide, readLiveFile, DIFF_COUNT_BUDGET } from './fs-changes.js'
 import type { TurnFsChange } from './fs-changes.js'
 import { bumpWorkspaceRevision, workspaceRevision } from './revision.js'
 import { INITIAL_CHANGE_PREVIEW_LIMIT, MAX_CHANGE_PAGE_SIZE, isLoopback, json, nonNegativeInteger, optionalText, pageSize, readJsonBody, requiredText } from './http-utils.js'
 import type { Request, Response } from './http-utils.js'
 import type { RewindHttpDeps } from './types.js'
 import type { TurnCheckpointCoordinator } from './coordinator.js'
-import { CONFIG_HTTP_PATH, LINEAGE_HTTP_PATH, MANAGE_HTTP_PATH, handleConfigHttp, handleLineageHttp, handleManageHttp } from './manage-endpoints.js'
+import { handleInPlaceHttp } from './inplace-http.js'
+import { CONFIG_HTTP_PATH, MANAGE_HTTP_PATH, handleConfigHttp, handleManageHttp } from './manage-endpoints.js'
 import type { SettingsBridge } from './settings-bridge.js'
 
 /** 同源端点根路径（客户端侧 fetch 的事实标准）。 */
@@ -47,9 +48,11 @@ export function installShadowRewindHttp(ctx: RewindHttpDeps & {
   const routes: readonly { path: string; handler: (request: Request, response: Response) => Promise<void> }[] = [
     { path: REWIND_HTTP_PATH, handler: (request, response) => handleRewindHttp(ctx, engine, coordinator, request, response) },
     // 获取检查点中的文件内容（用于为文件系统变更生成 diff）。
-    { path: `${REWIND_HTTP_PATH}/file`, handler: (request, response) => handleFileContentHttp(ctx, engine, request, response) },
+    { path: `${REWIND_HTTP_PATH}/file`, handler: (request, response) => handleFileContentHttp(engine, request, response) },
     // 批量返回会话所有轮次的文件系统变更（侧边栏按轮合并展示用）。
     { path: `${REWIND_HTTP_PATH}/fs-changes`, handler: (request, response) => handleFsChangesHttp(ctx, engine, request, response) },
+    // 就地遮蔽回退（命令面已移除；弹窗的 inplace 模式经此执行）。
+    { path: `${REWIND_HTTP_PATH}/inplace`, handler: (request, response) => handleInPlaceHttp(ctx, request, response) },
     // 轨迹时间线 + 区间 diff（轨迹重放 / 快照对比二选一）。
     { path: `${REWIND_HTTP_PATH}/trace`, handler: (request, response) => handleTraceHttp(ctx, engine, request, response) },
     // 撤销最近一次恢复（B1，进程内单次 undo）。
@@ -60,8 +63,6 @@ export function installShadowRewindHttp(ctx: RewindHttpDeps & {
     { path: CONFIG_HTTP_PATH, handler: (request, response) => handleConfigHttp(engine, resolveBridge(), request, response) },
     // 检查点管理树、磁盘占用、删除与立即 GC（管理面板）。
     { path: MANAGE_HTTP_PATH, handler: (request, response) => handleManageHttp(engine, request, response) },
-    // fork 谱系链（时间线「恢复自」徽标）。
-    { path: LINEAGE_HTTP_PATH, handler: (request, response) => handleLineageHttp(ctx, engine, request, response) },
   ]
   for (const route of routes) {
     const dispose = ctx.webServer?.register({ kind: 'exact', path: route.path, handler: route.handler })
@@ -146,22 +147,6 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
         throw new ShadowRewindError('INVALID_ARGUMENTS', 'messageSeq 与 turn 必须提供其一（且只能其一）')
       }
       const detailsOnly = url.searchParams.get('details') === '1'
-      // 对称模式的子集计划：paths 为 JSON 字符串数组（勾选路径）。
-      const pathsParam = url.searchParams.get('paths')
-      let requestedPaths: readonly string[] | undefined
-      if (pathsParam !== null) {
-        let parsed: unknown
-        try {
-          parsed = JSON.parse(pathsParam)
-        } catch {
-          throw new ShadowRewindError('INVALID_ARGUMENTS', 'paths 必须是 JSON 字符串数组')
-        }
-        if (!Array.isArray(parsed) || parsed.length === 0
-          || !parsed.every((item): item is string => typeof item === 'string')) {
-          throw new ShadowRewindError('INVALID_ARGUMENTS', 'paths 必须是非空的 JSON 字符串数组')
-        }
-        requestedPaths = parsed
-      }
       const offset = nonNegativeInteger(url.searchParams.get('offset') ?? '0', 'offset')
       const limit = pageSize(url.searchParams.get('limit'), detailsOnly ? MAX_CHANGE_PAGE_SIZE : INITIAL_CHANGE_PREVIEW_LIMIT)
       const resolved = turnParam !== null
@@ -173,12 +158,10 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
       }
       const { checkpoint, messageSeq } = resolved
       const inspection = await engine.inspect({ cwd: checkpoint.cwd, restorePointId: checkpoint.id })
-      const running = await sharedWorkspaceSessions(deps, checkpoint.cwd)
-      // 路径归因：按检查点窗口给每条变更标归属（目标会话 / 其它会话 / 双方 /
-      // 未知）。归属只是勾选清单的建议标签（纯快照网格推导）；带 paths 的
-      // 子集计划请求不再渲染标签，直接跳过。
+      // 路径归因：按检查点窗口给每条变更标归属（本会话 / 其它会话 / 双方 /
+      // 未知）。归属只是**信息徽标**——恢复一律整树，标签不影响任何默认行为。
       let ownership: Map<string, PathAttribution> | undefined
-      if (requestedPaths === undefined && inspection.changes.length > 0) {
+      if (inspection.changes.length > 0) {
         const attributed = await engine.listSnapshotsAfter({
           cwd: checkpoint.cwd,
           restorePointId: checkpoint.id,
@@ -191,55 +174,20 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
         })
       }
       const changes = inspection.changes.slice(offset, offset + limit)
-
-      // 文件系统差异（捕获 PowerShell 等终端命令的文件变更）：
-      // 第 N 轮的变更 = diff(第 N 轮轮起检查点, 第 N+1 轮轮起检查点)——
-      // 第 N+1 轮第一步之前的捕获天然等于第 N 轮的轮末树状态，零新增捕获。
-      // 无下一轮检查点时（最后一轮/被跳过）不返回该字段，预览的 changes
-      // （轮起检查点 vs 当前磁盘）已覆盖这一轮。
-      let nextCheckpointId: string | undefined
-      let fileSystemChanges: readonly { path: string; kind: 'added' | 'modified' | 'deleted' }[] | undefined
-      if (checkpoint.turn !== undefined) {
-        // 从引擎读取当前检查点的完整 manifest 以获取 sessionId
-        const manifests = await engine.list({ cwd: checkpoint.cwd, includeTurnCheckpoints: true })
-        const currentManifest = manifests.find((m) => m.id === checkpoint.id)
-        const sessionIdForLookup = currentManifest?.sessionId
-
-        if (sessionIdForLookup && currentManifest !== undefined) {
-          const allCheckpoints = await engine.listTurnCheckpoints({
-            cwd: checkpoint.cwd,
-            sessionId: sessionIdForLookup,
-          })
-          // 优先同轮轮末检查点（精确轮末树），回退下一轮轮起（旧语义）。
-          const startCheckpoints = allCheckpoints.filter((cp) => cp.phase !== 'end')
-          const endCheckpoint = allCheckpoints.find((cp) => cp.phase === 'end' && cp.turn === checkpoint.turn)
-          const currentIndex = startCheckpoints.findIndex((cp) => cp.id === checkpoint.id)
-          const nextCheckpoint = currentIndex >= 0 ? startCheckpoints[currentIndex + 1] : undefined
-          const pairEnd = endCheckpoint ?? nextCheckpoint
-          if (pairEnd !== undefined) {
-            nextCheckpointId = pairEnd.id
-            // 配对 diff 与归属走共享助手（与 fs-changes 端点同源）；预览只
-            // 消费 path/kind，行数预算置 0 不读内容。对比失败助手返回
-            // undefined（已记警告），nextCheckpointId 不受影响。
-            const computed = await computeTurnFsChanges(engine, deps, {
-              cwd: checkpoint.cwd,
-              current: {
-                id: checkpoint.id,
-                sessionId: sessionIdForLookup,
-                createdAt: currentManifest.createdAt,
-                turn: checkpoint.turn,
-                turnStartSeq: checkpoint.turnStartSeq,
-              },
-              pairEnd,
-              countBudget: { remaining: 0 },
-            })
-            // 保留 added/modified/deleted/mode-changed（后者映射为 modified，
-            // 内容两侧相同）；type-changed 仍过滤。
-            fileSystemChanges = computed?.changes.map((change) => ({ path: change.path, kind: change.kind }))
-          }
-        }
+      // 逐文件行数：与 fs-changes 同一套服务端预算（内容缺失/超限/非 UTF-8
+      // 时该行只给形态），预览的 +/− 与恢复后的清单同口径。
+      const countBudget = { remaining: DIFF_COUNT_BUDGET }
+      const counts = new Map<string, { added: number; removed: number }>()
+      for (const change of changes) {
+        if (countBudget.remaining <= 0) break
+        countBudget.remaining -= 1
+        const stats = await countChangeLines(engine, checkpoint.cwd, change.path, checkpoint.id, 'live')
+        if (stats !== undefined) counts.set(change.path, stats)
       }
 
+      // 预览清单 = inspect(该检查点 vs 当前磁盘)：恢复会把这之后的一切写盘
+      // 全部丢弃（整树语义），所以这份清单就是「将被改动的文件」的完整事实，
+      // 不再与任何逐轮窗口清单叠加。
       const common = {
           status: 'ready',
           sessionId,
@@ -247,24 +195,19 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
           turn: checkpoint.turn,
           checkpointId: checkpoint.id,
           turnStartSeq: checkpoint.turnStartSeq,
-          ...(nextCheckpointId === undefined ? {} : { nextCheckpointId }),
-          ...(fileSystemChanges === undefined ? {} : { fileSystemChanges }),
           totalChanges: inspection.changes.length,
           changes: changes.map((change) => {
             const attributed = ownership?.get(change.path)
+            const stats = counts.get(change.path)
             return {
               path: change.path,
               kind: change.kind,
-              ...(attributed === undefined
-                ? {}
-                : { owner: serializeOwner(attributed.owner), autoSelect: attributed.autoSelect }),
+              ...(stats === undefined ? {} : { added: stats.added, removed: stats.removed }),
+              ...(attributed === undefined ? {} : { owner: serializeOwner(attributed.owner) }),
             }
           }),
           offset,
           truncated: offset + changes.length < inspection.changes.length,
-          activeSessionIds: running,
-          // 恢复语义模式：恒为对称（勾选式子集）。字段保留以兼容旧客户端。
-          mode: 'symmetric',
           // 跳过项逐条透传 {path, reason}——用户必须能看到具体哪些文件
           // 不在快照内、为什么，而不是只给一个数字。
           skippedPaths: inspection.skippedPaths.map((skip) => ({ path: skip.path, reason: skip.reason })),
@@ -281,71 +224,31 @@ async function handleRewindHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine
         restorePointId: checkpoint.id,
         sessionId,
         expectedCurrentTreeHash: inspection.currentTreeHash,
-        ...(requestedPaths === undefined ? {} : { paths: requestedPaths }),
       })
       json(response, 200, { ...common, planId: plan.id })
       return
     }
     if (request.method === 'POST') {
+      // 唯一恢复语义：整树恢复到该检查点（丢弃其后一切写盘）。对话侧的就地
+      // 遮蔽由 /shadow-rewind/inplace 端点单独执行，本端点绝不触碰会话。
       const body = await readJsonBody(request)
-      const mode = (body as { mode?: unknown }).mode
-      if (mode !== 'code' && mode !== 'both') {
-        throw new ShadowRewindError('INVALID_ARGUMENTS', 'mode 必须是 "code" 或 "both"')
-      }
       const record = body as Record<string, unknown>
       const sessionId = requiredText(record.sessionId, 'sessionId')
       const checkpointId = requiredText(record.checkpointId, 'checkpointId')
       const planId = optionalText(record.planId, 'planId')
-      // 确认串已废除（EXPECTED-DESIGN 1.4 #2）：「确认」由 GUI 弹窗承担，
-      // 兼容字段被静默忽略（strict schema 只约束 Typert 协议，此处是 HTTP）。
       if (record.turn !== undefined) {
-        // 按轮快照恢复（侧边栏文件审查 tab）：只恢复文件，绝不触碰对话。
-        if (mode !== 'code') {
-          throw new ShadowRewindError('INVALID_ARGUMENTS', '按回合快照恢复只支持 mode: "code"')
-        }
+        // 按轮寻址（审查面板「从快照恢复此轮」）。
         const turn = nonNegativeInteger(record.turn, 'turn')
         const checkpoint = await turnCheckpointForRequest(deps, engine, sessionId, turn, checkpointId)
-        // 按轮恢复前先核对该计划确实对应该检查点（防 checkpointId 与 plan
-        // 错配——两种寻址各自为政时会静默恢复到错误时点）。
+        // 恢复前核对该计划确实对应该检查点（防 checkpointId 与 plan 错配）。
         const restoreResult = await applyGuarded(deps, engine, sessionId, checkpoint, planId)
-        json(response, 200, { status: 'completed', mode, ...restoreResult })
+        json(response, 200, { status: 'completed', ...restoreResult })
         return
       }
       const messageSeq = nonNegativeInteger(record.messageSeq, 'messageSeq')
       const checkpoint = await checkpointForRequest(deps, engine, sessionId, messageSeq, checkpointId)
       const restoreResult = await applyGuarded(deps, engine, sessionId, checkpoint, planId)
-      if (mode === 'code') {
-        json(response, 200, { status: 'completed', mode, ...restoreResult })
-        return
-      }
-      try {
-        const fork = await createConversationRestart(deps, sessionId, checkpoint)
-        // 谱系记录（ABSORB-RECALL 四）：时间线据此显示「v2 · 恢复自」徽标；
-        // 方法自身全容错，失败只是丢徽标。
-        await engine.recordForkLineage({
-          cwd: checkpoint.cwd,
-          parentSessionId: sessionId,
-          childSessionId: fork.sessionId,
-          restorePointId: checkpoint.id,
-        })
-        json(response, 200, { status: 'completed', mode, sessionId: fork.sessionId, ...restoreResult })
-      } catch (forkError) {
-        // 文件已恢复但建会话失败：把文件滚回操作前，绝不留半完成状态。
-        // 补偿本身也会产生一个 rescue 点——堆叠由引擎的 rescue 修剪上限控制。
-        try {
-          const inspection = await engine.inspect({ cwd: checkpoint.cwd, restorePointId: restoreResult.rescuePointId })
-          const plan = await engine.planRestore({
-            cwd: checkpoint.cwd,
-            restorePointId: restoreResult.rescuePointId,
-            sessionId,
-            expectedCurrentTreeHash: inspection.currentTreeHash,
-          })
-          await engine.applyRestore({ planId: plan.id, sessionId, skipUndoRecord: true })
-        } catch (rollbackError) {
-          throw new ShadowRewindError('RECOVERY_REQUIRED', `新会话创建失败且回滚也失败，可从备份点 ${restoreResult.rescuePointId} 手工恢复。${errorMessage(rollbackError)}`)
-        }
-        throw new ShadowRewindError('CONVERSATION_REWIND_FAILED', `文件已自动还原；新会话创建失败：${errorMessage(forkError)}`, { cause: forkError })
-      }
+      json(response, 200, { status: 'completed', ...restoreResult })
       return
     }
     json(response, 405, { error: 'method not allowed', code: 'METHOD_NOT_ALLOWED' })
@@ -396,7 +299,7 @@ async function handleStatusHttp(engine: ShadowRewindEngine, coordinator: TurnChe
 }
 
 /** GET /shadow-rewind/file：从指定检查点读取文件内容（base64 编码）。 */
-async function handleFileContentHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, request: Request, response: Response): Promise<void> {
+async function handleFileContentHttp(engine: ShadowRewindEngine, request: Request, response: Response): Promise<void> {
   try {
     if (!isLoopback(request.socket.remoteAddress)) {
       json(response, 403, { error: 'forbidden', code: 'FORBIDDEN' })
@@ -660,7 +563,7 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
     if (last !== undefined && last.turn !== undefined && last.turnStartSeq !== undefined
       && !endByTurn.has(last.turn)) {
       // live 条目的 after 内容就是「当前磁盘」，窗口归属走同一助手
-      // （网格 owner/autoSelect 随条目透出，作为勾选清单的建议标签）。
+      // （网格 owner 随条目透出，作为信息徽标）。
       const computed = await computeTurnFsChanges(engine, deps, {
         cwd,
         current: {
@@ -689,7 +592,14 @@ async function handleFsChangesHttp(deps: RewindHttpDeps, engine: ShadowRewindEng
       const degraded = unreadable.has(turn.checkpointId) || unreadable.has(turn.nextCheckpointId)
       return degraded ? { ...turn, degraded: true as const } : turn
     })
-    json(response, 200, { sessionId, rev, turns: marked })
+    // 会话累计视图（live 条的唯一数据源）：同一路径跨轮的净变化按检查点算出，
+    // 客户端不再做「工具优先 / fs 跳过」的跨轮合流。
+    const cumulative = await computeCumulativeFsChanges(engine, {
+      cwd,
+      turns: marked,
+      countBudget: { remaining: DIFF_COUNT_BUDGET },
+    })
+    json(response, 200, { sessionId, rev, turns: marked, cumulative })
   } catch (error) {
     json(response, 409, {
       error: errorMessage(error),

@@ -50,5 +50,5 @@ export declare const wireSchemas: {
         force: z.ZodOptional<z.ZodBoolean>;
     }, z.core.$strict>;
 };
-/** 本包对外登记的调用集合：状态巡检、开关、录制读取。 */
+/** 本包对外登记的调用集合：状态巡检、开关。 */
 export declare const FILE_REVIEW_INVOCATIONS: readonly InvocationDescriptor[];

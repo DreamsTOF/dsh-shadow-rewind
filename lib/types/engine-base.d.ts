@@ -13,7 +13,6 @@
  *     fail-closed（计划限时 + 确认串回显在子类实现）。
  */
 import { WorkspaceStore } from './store.js';
-import { BeforeJournal } from './before-journal.js';
 import type { Manifest, ResolvedShadowRewindConfig, RestorePointSummary, ShadowRewindConfig, SkippedPath, SnapshotEntry, WorkspaceChange } from './types.js';
 /** 一次当前树捕获的完整产物。 */
 export interface CapturedTree {
@@ -41,8 +40,6 @@ export declare class ShadowRewindEngineBase {
     readonly downgradeReason?: string;
     private excludes;
     private readonly shadowRepos;
-    /** BEFORE 捕获日志（主路捕获的存储半边；消息检查点的物化数据源）。 */
-    protected readonly beforeJournal: BeforeJournal;
     constructor(config?: ShadowRewindConfig);
     /**
      * 运行时热更新配置（设置卡片 watch 链路，ABSORB-RECALL 1.2）：重新走

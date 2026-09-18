@@ -2,8 +2,8 @@
  * 宿主半边的产出文本 diff 撤销 / 重做服务（工作区围栏内）。
  *
  * 三条并行的执行路径，共用同一套 applied / undone / conflict 状态模型：
- *  - **hunk 文本回放**：工具结果视图与 Code Mode 录制的常规改动，逐 hunk
- *    逆序回放 + 行锚点匹配 + 提交前字节级 CAS 复核；
+ *  - **hunk 文本回放**：检查点 diff 派生的常规改动（含 Code Mode 嵌套写盘），
+ *    逐 hunk 逆序回放 + 行锚点匹配 + 提交前 CAS 复核；
  *  - **fs 整文件形状**：检查点对比派生的终端写盘（新增 / 删除 / 纯权限位），
  *    天然互逆，无需回放；
  *  - **目录条目**：mkdir / rmdir 互逆，删除侧带「必须为空」闸门。
@@ -13,7 +13,7 @@
  * 会话 cwd 内）与符号链接拒绝共同约束。
  */
 
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -22,7 +22,7 @@ import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type {
   FileReviewAction, FileReviewChange, FileReviewFileResult, FileReviewRequest, FileReviewResult,
-  ProducedFileDiff, RecordedMutation, RecordedRequest, RecordedResult,
+  ProducedFileDiff,
 } from './change-types.ts'
 
 type InspectState = Exclude<FileReviewFileResult['state'], 'error'>
@@ -668,56 +668,9 @@ function sessionCwd(agent: Agent): string {
   return cwd
 }
 
-/** 每 agent 的 Code Mode 录制条数上限（超出淘汰最旧的）。 */
-const RECORDED_PER_AGENT_CAP = 4000
-
-/** 持久化记录文件的 JSON 字节上限；超出时丢弃最旧条目（保底保留最后一条）。 */
-const RECORDED_BYTES_CAP = 64 * 1024 * 1024
-
-/** 录制记录落盘的防抖窗口（毫秒）；run_code 修改通常成簇到达。 */
-const RECORDS_FLUSH_MS = 400
-
-/** 持久化记录格式版本；读取方拒绝其它版本（视为损坏，从空开始）。 */
-const RECORDS_VERSION = 1
-
-interface PersistedRecords {
-  readonly version: typeof RECORDS_VERSION
-  readonly mutations: readonly RecordedMutation[]
-}
-
-/** 逐字段收紧的录制条目校验——损坏记录自愈的第一道闸。 */
-function isRecordedMutation(value: unknown): value is RecordedMutation {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
-  const candidate = value as Record<string, unknown>
-  return typeof candidate.rootCallId === 'string'
-    && typeof candidate.name === 'string'
-    && typeof candidate.path === 'string'
-    && (candidate.before === null || typeof candidate.before === 'string')
-    && typeof candidate.after === 'string'
-}
-
-/** 按条数上限裁剪（保留最新的）。 */
-function capRecords(list: RecordedMutation[]): RecordedMutation[] {
-  return list.length > RECORDED_PER_AGENT_CAP
-    ? list.slice(list.length - RECORDED_PER_AGENT_CAP)
-    : list
-}
-
-/** 记录文件名：可读前缀 + agentKey 的 16 位哈希，避免非法路径字符与碰撞。 */
-function recordsFilename(agentKey: string): string {
-  const hash = createHash('sha256').update(agentKey).digest('hex').slice(0, 16)
-  const stem = agentKey.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40)
-  return `${stem === '' ? 'agent' : stem}-${hash}.json`
-}
-
-/** 录制键：agent id 的字符串形态（同时用作落盘文件名的输入）。 */
-function agentKey(agent: Agent): string {
-  return String(agent.id)
-}
-
-/** 录制持久化选项。 */
+/** 文件审查服务选项。 */
 export interface FileReviewServiceOptions {
-  /** 记录目录根（shadow-rewind 存储根）；缺省/空串时保持纯内存（不落盘）。 */
+  /** 存储根（shadow-rewind 存储根）：删除类 fs 撤销的安全网副本落在其下。 */
   readonly storageDir?: string
 }
 
@@ -729,170 +682,15 @@ export interface FileReviewServiceOptions {
  * 回合，也绝不在请求内部并行（避免同一文件被两个动作交错）。
  */
 export class FileReviewService extends TypertRemoteService {
-  /** 每 agent 的 Code Mode（`run_code`）文件变更记录，按派发顺序。 */
-  private readonly recordLog = new Map<string, RecordedMutation[]>()
-  /** 已完成懒加载的 agent（此后变更直写 recordLog 并调度落盘）。 */
-  private readonly loadedAgents = new Set<string>()
-  /** 进行中的懒加载任务（recordMutation 与 recorded 共用，保证合并顺序）。 */
-  private readonly loadingAgents = new Map<string, Promise<void>>()
-  /** 懒加载完成前到达的变更缓冲；加载完成后按「磁盘在前、缓冲在后」合并。 */
-  private readonly preLoad = new Map<string, RecordedMutation[]>()
-  /** 每 agent 的落盘防抖定时器。 */
-  private readonly flushTimers = new Map<string, ReturnType<typeof setTimeout>>()
-  /** 每 agent 的串行化落盘链（防抖触发可能晚于前一次写入）。 */
-  private readonly flushChains = new Map<string, Promise<void>>()
-  /** 录制记录落盘目录；undefined = 纯内存模式（不落盘）。 */
-  private readonly recordsDir: string | undefined
   /** 删除类 fs 撤销的安全网目录：<storageDir>/file-review/rescue/。 */
   private readonly rescueDir: string | undefined
 
   constructor(ctx: Context, options: FileReviewServiceOptions = {}) {
     super(ctx, 'fileReview')
-    this.recordsDir = options.storageDir !== undefined && options.storageDir.trim() !== ''
-      ? join(options.storageDir, 'file-review', 'recorded')
-      : undefined
     this.rescueDir = options.storageDir !== undefined && options.storageDir.trim() !== ''
       ? join(options.storageDir, 'file-review', 'rescue')
       : undefined
   }
-
-  /** 为接收方 agent 追加一条嵌套（Code Mode）文件变更。 */
-  recordMutation(agent: Agent, mutation: RecordedMutation): void {
-    const key = agentKey(agent)
-    if (!this.loadedAgents.has(key)) {
-      // 懒加载尚未完成：先缓冲，完成后按「磁盘在前、缓冲在后」合并，保证全局
-      // dispatch 顺序（磁盘条目全部属于上一个宿主生命周期）。
-      const buffered = this.preLoad.get(key) ?? []
-      buffered.push(mutation)
-      this.preLoad.set(key, buffered)
-      void this.ensureLoaded(key)
-      return
-    }
-    const list = this.recordLog.get(key)
-    if (list === undefined) {
-      this.recordLog.set(key, [mutation])
-    } else {
-      list.push(mutation)
-      if (list.length > RECORDED_PER_AGENT_CAP) {
-        list.splice(0, list.length - RECORDED_PER_AGENT_CAP)
-      }
-    }
-    this.scheduleFlush(key)
-  }
-
-  /** 返回被请求的那些 `run_code` 根调用所录制的变更（按派发顺序）。 */
-  async recorded(agent: Agent, request: RecordedRequest): Promise<RecordedResult> {
-    const key = agentKey(agent)
-    await this.ensureLoaded(key)
-    const list = this.recordLog.get(key)
-    if (list === undefined || request.rootCallIds.length === 0) return { mutations: [] }
-    const wanted = new Set(request.rootCallIds)
-    return { mutations: list.filter(mutation => wanted.has(mutation.rootCallId)) }
-  }
-
-  // ── 录制记录持久化（懒加载 + 防抖原子写；任何失败都退化为纯内存） ─────────
-
-  /** 确保该 agent 的磁盘记录已合并进内存；并发调用共享同一个加载任务。 */
-  private ensureLoaded(key: string): Promise<void> {
-    if (this.loadedAgents.has(key)) return Promise.resolve()
-    const existing = this.loadingAgents.get(key)
-    if (existing !== undefined) return existing
-    const task = this.loadFromDisk(key).finally(() => { this.loadingAgents.delete(key) })
-    this.loadingAgents.set(key, task)
-    return task
-  }
-
-  /** 从磁盘读入并与加载期间缓冲的变更合并（磁盘在前、缓冲在后）。 */
-  private async loadFromDisk(key: string): Promise<void> {
-    try {
-      if (this.recordsDir === undefined) return
-      let raw: string
-      try {
-        raw = await readFile(join(this.recordsDir, recordsFilename(key)), 'utf8')
-      } catch {
-        return // 不存在或不可读：从空开始（首次使用是常态）。
-      }
-      const parsed: unknown = JSON.parse(raw)
-      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return
-      const record = parsed as { version?: unknown; mutations?: unknown }
-      if (record.version !== RECORDS_VERSION || !Array.isArray(record.mutations)) return
-      const disk: RecordedMutation[] = []
-      for (const entry of record.mutations) if (isRecordedMutation(entry)) disk.push(entry)
-      const buffered = this.preLoad.get(key) ?? []
-      this.preLoad.delete(key)
-      const merged = capRecords([...disk, ...buffered])
-      if (merged.length > 0) this.recordLog.set(key, merged)
-      if (buffered.length > 0) this.scheduleFlush(key)
-    } catch {
-      // 损坏的记录文件：静默从空开始，下一次 flush 会用内存态重写。
-    } finally {
-      // 标志必须在加载完成后才置位：加载期间的变更走 preLoad 缓冲，
-      // 这里统一兜底合并（磁盘在前、缓冲在后 = 全局 dispatch 顺序）。
-      this.loadedAgents.add(key)
-      const remaining = this.preLoad.get(key)
-      if (remaining !== undefined) {
-        this.preLoad.delete(key)
-        const list = this.recordLog.get(key) ?? []
-        list.push(...remaining)
-        this.recordLog.set(key, capRecords(list))
-        this.scheduleFlush(key)
-      }
-    }
-  }
-
-  /** 调度一次防抖落盘；窗口内重复调用只保留一个定时器。 */
-  private scheduleFlush(key: string): void {
-    if (this.recordsDir === undefined) return
-    if (this.flushTimers.has(key)) return
-    const timer = setTimeout(() => {
-      this.flushTimers.delete(key)
-      void this.flushNow(key)
-    }, RECORDS_FLUSH_MS)
-    timer.unref?.()
-    this.flushTimers.set(key, timer)
-  }
-
-  /** 接在前一次落盘之后串行执行，避免两次写入交错。 */
-  private flushNow(key: string): Promise<void> {
-    const previous = this.flushChains.get(key) ?? Promise.resolve()
-    const next = previous.then(() => this.writeRecords(key))
-    this.flushChains.set(key, next)
-    return next
-  }
-
-  /** 原子写入该 agent 的录制记录；超限时淘汰最旧条目并把内存态裁剪一致。 */
-  private async writeRecords(key: string): Promise<void> {
-    const list = this.recordLog.get(key)
-    if (list === undefined || this.recordsDir === undefined) return
-    let payload: PersistedRecords = { version: RECORDS_VERSION, mutations: [...list] }
-    let text: string
-    try {
-      text = JSON.stringify(payload)
-    } catch {
-      return
-    }
-    if (Buffer.byteLength(text, 'utf8') > RECORDED_BYTES_CAP && list.length > 1) {
-      // 超出字节上限：丢弃最旧条目直到放得下，并把内存态裁剪到一致。
-      const trimmed = [...list]
-      do {
-        trimmed.shift()
-        payload = { version: RECORDS_VERSION, mutations: [...trimmed] }
-        try {
-          text = JSON.stringify(payload)
-        } catch {
-          continue
-        }
-      } while (trimmed.length > 1 && Buffer.byteLength(text, 'utf8') > RECORDED_BYTES_CAP)
-      this.recordLog.set(key, [...trimmed])
-    }
-    try {
-      await mkdir(this.recordsDir, { recursive: true })
-      await writeFileAtomic(join(this.recordsDir, recordsFilename(key)), text, { mode: 0o600 })
-    } catch {
-      // 落盘失败不影响内存态；下一次 recordMutation 会再次尝试。
-    }
-  }
-
 
   /** 只巡检当前磁盘状态，不动任何文件（可并发）。 */
   async status(agent: Agent, request: FileReviewRequest): Promise<FileReviewResult> {

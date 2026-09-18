@@ -24,7 +24,6 @@ export declare const CONFIG_DEFAULTS: {
     readonly maxFiles: 20000;
     readonly maxFileBytes: number;
     readonly maxSnapshotBytes: number;
-    readonly planTtlMs: number;
     readonly turnCheckpointMode: "jj";
     readonly turnCheckpointTimeoutMs: 5000;
     readonly turnCheckpointMaxNewBytes: number;

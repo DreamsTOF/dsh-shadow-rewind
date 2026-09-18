@@ -77,35 +77,6 @@ const resultCodec = {
   schema: resultSchema,
 }
 
-/** 一条录制的 Code Mode 变更：根 call-id + 工具名 + 路径 + 前后全文。 */
-const recordedMutationSchema = z.object({
-  rootCallId: z.string(),
-  name: z.string(),
-  path: z.string(),
-  before: z.string().nullable(),
-  after: z.string(),
-})
-
-const recordedRequestSchema = z.object({
-  rootCallIds: z.array(z.string()),
-})
-
-const recordedResultSchema = z.object({
-  mutations: z.array(recordedMutationSchema),
-})
-
-const recordedRequestCodec = {
-  mode: 'strict' as const,
-  typeSymbol: `${PACKAGE_NAME}#RecordedRequest`,
-  schema: recordedRequestSchema,
-}
-
-const recordedResultCodec = {
-  mode: 'strict' as const,
-  typeSymbol: `${PACKAGE_NAME}#RecordedResult`,
-  schema: recordedResultSchema,
-}
-
 /** 组装 status / apply 描述符：两者签名同形，仅方法名不同。 */
 function descriptor(method: 'status' | 'apply'): InvocationDescriptor {
   return {
@@ -124,27 +95,8 @@ function descriptor(method: 'status' | 'apply'): InvocationDescriptor {
   }
 }
 
-/** 组装 `recorded` 描述符：与开关调用同作用域，但请求/结果是录制载荷。 */
-function recordedDescriptor(): InvocationDescriptor {
-  return {
-    id: `${PACKAGE_NAME}#fileReview/recorded`,
-    service: 'fileReview',
-    namespace: 'fileReview',
-    method: 'recorded',
-    invocation: { kind: 'direct' },
-    scope: { context: 'agent', wire: 'agentId' },
-    parameters: [{
-      name: 'agent', wire: 'agentId', source: 'lookup', lookup: 'agent', codec: agentCodec,
-    }, {
-      name: 'request', wire: 'request', source: 'json', codec: recordedRequestCodec,
-    }],
-    result: recordedResultCodec,
-  }
-}
-
-/** 本包对外登记的调用集合：状态巡检、开关、录制读取。 */
+/** 本包对外登记的调用集合：状态巡检、开关。 */
 export const FILE_REVIEW_INVOCATIONS: readonly InvocationDescriptor[] = [
   descriptor('status'),
   descriptor('apply'),
-  recordedDescriptor(),
 ]

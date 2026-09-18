@@ -14,6 +14,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
+// Type-only: pulls the runtime client Context merges（ctx.slots）。
+import type {} from '@deepseek-ai/dsh-client-runtime/client'
+import { REWIND_BASE } from './client-http.ts'
 
 /**
  * 宿主 ui-settings 包声明 `settings.plugin.item` keyed slot（按 settings
@@ -120,7 +123,7 @@ const NUMBER_LABELS: readonly [string, string, string][] = [
   ['maxSnapshotBytes', '单次快照总字节上限', ''],
   ['turnCheckpointTimeoutMs', '自动检查点超时 (ms)', '超时按可预期跳过'],
   ['turnCheckpointMaxNewBytes', '单轮新增字节上限', '超出跳过本轮快照'],
-  ['planTtlMs', '恢复计划有效期 (ms)', '过期仅软警告'],
+  
 ]
 
 /** 常用排除模式一键芯片（ABSORB-RECALL 1.5）。 */
@@ -135,7 +138,7 @@ function ConfigForm(): ReactNode {
 
   const load = useCallback(async () => {
     try {
-      const body = await fetchJson('/shadow-rewind/config') as ConfigResponse
+      const body = await fetchJson(`${REWIND_BASE}/config`) as ConfigResponse
       setData(body)
       setDraft(Object.fromEntries(Object.entries(body.values).map(([key, value]) => [key, Array.isArray(value) ? [...value] : String(value)])))
       setExcludeText((Array.isArray(body.values.excludePatterns) ? body.values.excludePatterns as string[] : []).join('\n'))
@@ -172,7 +175,7 @@ function ConfigForm(): ReactNode {
     }
     if (Object.keys(patch).length === 0) { setStatus('没有修改'); return }
     try {
-      await fetchJson('/shadow-rewind/config', { method: 'POST', body: JSON.stringify({ patch }) })
+      await fetchJson(`${REWIND_BASE}/config`, { method: 'POST', body: JSON.stringify({ patch }) })
       setStatus('已保存并热更新生效')
       await load()
     } catch (error) {
@@ -182,7 +185,7 @@ function ConfigForm(): ReactNode {
 
   const reset = useCallback(async () => {
     try {
-      await fetchJson('/shadow-rewind/config', { method: 'POST', body: JSON.stringify({ op: 'reset' }) })
+      await fetchJson(`${REWIND_BASE}/config`, { method: 'POST', body: JSON.stringify({ op: 'reset' }) })
       setStatus('已恢复默认')
       await load()
     } catch (error) {
@@ -192,7 +195,7 @@ function ConfigForm(): ReactNode {
 
   const saveExcludes = useCallback(async (patterns: string[]) => {
     try {
-      await fetchJson('/shadow-rewind/config', { method: 'POST', body: JSON.stringify({ patch: { excludePatterns: patterns } }) })
+      await fetchJson(`${REWIND_BASE}/config`, { method: 'POST', body: JSON.stringify({ patch: { excludePatterns: patterns } }) })
       setStatus('排除清单已更新')
       await load()
     } catch (error) {
@@ -305,9 +308,9 @@ function ManagePanel(): ReactNode {
   const load = useCallback(async () => {
     try {
       const [list, disk, status] = await Promise.all([
-        fetchJson('/shadow-rewind/manage?op=list'),
-        fetchJson('/shadow-rewind/manage?op=diskUsage'),
-        fetchJson('/shadow-rewind/status'),
+        fetchJson(`${REWIND_BASE}/manage?op=list`),
+        fetchJson(`${REWIND_BASE}/manage?op=diskUsage`),
+        fetchJson(`${REWIND_BASE}/status`),
       ]) as [ManageList, { totalBytes: number; perWorkspace: Record<string, number> }, { errors?: ErrorRow[] }]
       setTree(list)
       setUsage(disk)
@@ -321,7 +324,7 @@ function ManagePanel(): ReactNode {
   const act = useCallback(async (body: Record<string, unknown>, confirmKey: string | null = null) => {
     setBusy(true)
     try {
-      await fetchJson('/shadow-rewind/manage', { method: 'POST', body: JSON.stringify(body) })
+      await fetchJson(`${REWIND_BASE}/manage`, { method: 'POST', body: JSON.stringify(body) })
       setMessage(null)
       setConfirming(confirmKey === null ? confirming : null)
       await load()
@@ -335,7 +338,7 @@ function ManagePanel(): ReactNode {
 
   const clearErrors = useCallback(async () => {
     try {
-      await fetchJson('/shadow-rewind/status', { method: 'POST', body: JSON.stringify({ op: 'clear' }) })
+      await fetchJson(`${REWIND_BASE}/status`, { method: 'POST', body: JSON.stringify({ op: 'clear' }) })
       setErrors([])
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error))

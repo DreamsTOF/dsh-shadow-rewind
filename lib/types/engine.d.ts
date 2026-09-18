@@ -1,4 +1,3 @@
-import type { LineageEntry } from './store.js';
 import type { WorkspaceChange } from './types.js';
 import { type RestorePlan, type RestorePointKind, type RestorePointSummary, type RestoreResult, type RestoreUndoProbe, type RestoreUndoResult, type ShadowRewindConfig, type SkippedPath, type TurnIntent, type RestorePlanId } from './types.js';
 import { ShadowRewindEngineBase } from './engine-base.js';
@@ -8,10 +7,12 @@ export { isCheckpointSkipCode } from './engine-helpers.js';
 export declare class ShadowRewindEngine extends ShadowRewindEngineBase {
     private readonly plans;
     private readonly applying;
-    /** 恢复后单次撤销（B1）：workspace → 最近一次恢复的逐路径 before/after。
-     * 进程内记录，重启即失效；每次 applyRestore 替换上一次（无 redo）。
-     * 部分撤销时按成功路径收缩，全部撤销完才销毁。 */
+    /** 恢复后撤销（B1 升级为小栈多槽）：workspace → 最近若干次恢复的逐路径
+     * before/after（栈顶 = 最近一次；默认保留 {@link MAX_UNDO_STACK} 条）。
+     * 进程内记录，重启即失效。部分撤销时按成功路径收缩当前栈顶，清空才弹栈。 */
     private readonly undoRecords;
+    /** undo 记录身份自增。 */
+    private undoSeq;
     constructor(config?: ShadowRewindConfig);
     /** 创建一个持久化恢复点（user / rescue）。 */
     create(options: {
@@ -58,8 +59,6 @@ export declare class ShadowRewindEngine extends ShadowRewindEngineBase {
         readonly restorePointId: string;
         readonly sessionId?: string;
         readonly expectedCurrentTreeHash?: string;
-        /** 对称模式的勾选式子集：计划只覆盖这些路径（必须都是变更清单成员）。 */
-        readonly paths?: readonly string[];
         readonly signal?: AbortSignal;
     }): Promise<RestorePlan>;
     /** 查询内存中的恢复计划（不存在返回 undefined；TTL 过期不拒绝——
@@ -120,64 +119,6 @@ export declare class ShadowRewindEngine extends ShadowRewindEngineBase {
         restorePointId: string;
         deletedBlobs?: number;
     }>;
-    /**
-     * 记录一条写盘前捕获（宿主 tools/execute 瀑布调用）。
-     * 内容内联进 BEFORE 日志；超限文件（maxFileBytes）直接放弃——
-     * 兜底覆盖不到的字节仍有影子整树快照兜着。
-     */
-    recordBeforeEntry(options: {
-        readonly workspace: string;
-        readonly sessionId: string;
-        readonly anchorSeq: number;
-        readonly callId: string;
-        /** 工作区相对路径（'/' 分隔）。 */
-        readonly rel: string;
-        readonly existed: boolean;
-        readonly content: string | null;
-        readonly mode: number;
-    }): Promise<void>;
-    /**
-     * user/message 边界重查（抄 dsh-rewind reconcileTracked）：把本会话全部
-     * 被跟踪路径与最近已知内容比对，变化者（含外部编辑/删除）补一条以本消息
-     * 锚定的 BEFORE 记录。返回补录条数（仅诊断用）。
-     */
-    reconcileTrackedBefore(options: {
-        readonly workspace: string;
-        readonly sessionId: string;
-        readonly anchorSeq: number;
-    }): Promise<number>;
-    /**
-     * 物化「消息 S 之前」的部分树检查点（BEFORE 日志 → kind 'message' 恢复点）。
-     *
-     * 这是检查点缺席（关闭/失败/被修剪）时的兜底：每路径取 anchorSeq >= S 的
-     * 最早 BEFORE（含边界），existed=true 的进 entries（内容入库 sqlite，
-     * id 稳定、重复物化为增量合并）；existed=false（工具创建）进 createdPaths，
-     * 计划按「恢复删除」处理。部分树绝不携带 createdPaths 之外的 added 语义
-     * ——未捕获路径留在磁盘上不动。
-     */
-    ensureMessageRestorePoint(options: {
-        readonly cwd: string;
-        readonly sessionId: string;
-        readonly messageSeq: number;
-        readonly turn: number;
-        readonly turnStartSeq: number;
-    }): Promise<RestorePointSummary | undefined>;
-    /** 删除被 prune 掉的 anchor 对应的消息检查点（内容 GC 随后回收独占 blob）。 */
-    pruneMessageRestorePoints(workspace: string, sessionId: string, anchorSeqs: readonly number[]): Promise<number>;
-    /**
-     * 记录 fork 谱系：「恢复并从新会话继续」成功后由宿主端点调用，把
-     * childId ↔ parentId 写进工作区状态的 lineage.json，时间线据此显示
-     * 「v2 · 恢复自 <检查点>」徽标。谱系是展示性增强：工作区无法定位或
-     * 落盘失败都静默吞掉（丢徽标，不丢功能），绝不影响恢复主流程。
-     */
-    recordForkLineage(options: {
-        readonly cwd: string;
-        readonly parentSessionId: string;
-        readonly childSessionId: string;
-        readonly restorePointId: string;
-    }): Promise<void>;
-    /** 读取该工作区的 fork 谱系链（时间线/管理面板用）；工作区无效时为空链。 */
-    loadForkLineage(cwd: string): Promise<readonly LineageEntry[]>;
     private isReferencedByUndo;
     private expirePlans;
 }

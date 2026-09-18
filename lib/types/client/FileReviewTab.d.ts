@@ -8,7 +8,8 @@
  * 物理布局（拆分后本文件只持有主组件；子件与形状单向依赖）：
  *  - ./file-review-tab-types.ts  共享类型 + 纯工具（stateKey/addStats…）；
  *  - ./review-widgets.tsx        Stats / 图标 / StateBadge / LazyDiff；
- *  - ./turn-rewind-dialog.tsx    「从快照恢复此轮」对话框（独立状态机）；
+ *  - ./rewind.ts                 统一恢复弹窗 RewindDialog（「从快照恢复此轮」
+ *                                与消息回退按钮共用同一组件、同一份数据）；
  *  - ./review-dialogs.tsx        多会话确认弹窗 + 文件级时间线对话框。
  */
 import type { FileReviewTabProps } from './file-review-tab-types.ts';

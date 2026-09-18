@@ -4,8 +4,7 @@
  *  - `/shadow-rewind/config`  GET 全量配置（resolved + 用户覆盖 + env 锁）
  *                             + POST {patch} / {op:'reset'} 写 settings 用户层；
  *  - `/shadow-rewind/manage`  GET 工作区→会话→检查点三级树 + 磁盘占用，
- *                             POST 删除（单条/会话/全部）、立即 GC；
- *  - `/shadow-rewind/lineage` GET fork 谱系链（时间线「恢复自」徽标数据源）。
+ *                             POST 删除（单条/会话/全部）、立即 GC。
  *
  * 全部只服务本机回环（与其余 /shadow-rewind 端点同一安全边界）。
  * 管理树不分页：每会话检查点有硬配额（30×2 相位），自用规模树全量返回。
@@ -17,17 +16,16 @@ import { ShadowRewindError, errorMessage } from '../errors.js'
 import { readJson, safeDirectoryNames } from '../path-utils.js'
 import { CONFIG_DEFAULTS, configEnvLocks, DEFAULT_EXCLUDES } from '../engine-config.js'
 import { cleanConfigPatch } from './plugin-config.js'
-import { readSession } from './session-resolve.js'
+
 import type { ShadowRewindEngine } from '../engine.js'
 import type { RestorePointSummary } from '../types.js'
 import type { SettingsBridge } from './settings-bridge.js'
 import { json, readJsonBody, isLoopback, requiredText } from './http-utils.js'
 import type { Request, Response } from './http-utils.js'
-import type { RewindHttpDeps } from './types.js'
 
 export const MANAGE_HTTP_PATH = '/shadow-rewind/manage'
 export const CONFIG_HTTP_PATH = '/shadow-rewind/config'
-export const LINEAGE_HTTP_PATH = '/shadow-rewind/lineage'
+
 
 /** settings 不可用时的兜底重置补丁（config-reset 的降级路径）。 */
 const RESET_DEFAULTS: Record<string, unknown> = {
@@ -250,63 +248,6 @@ async function deleteMany(engine: ShadowRewindEngine, cwd: string, filter: (poin
   return { deleted, failed }
 }
 
-// ── lineage 端点 ────────────────────────────────────────────────────────────
 
-/** GET /shadow-rewind/lineage?cwd=|sessionId=：fork 谱系链（ABSORB-RECALL 四）。
- * 带 sessionId 时附带 version/restoredFrom——该会话沿链回溯的深度即「第几代
- * fork」（v2/v3…），restoredFrom 是触发分叉的恢复点（时间线徽标数据源）。 */
-export async function handleLineageHttp(deps: RewindHttpDeps, engine: ShadowRewindEngine, request: Request, response: Response): Promise<void> {
-  try {
-    if (!isLoopback(request.socket.remoteAddress)) {
-      json(response, 403, { error: 'forbidden', code: 'FORBIDDEN' })
-      return
-    }
-    if (request.method !== 'GET') {
-      json(response, 405, { error: 'method not allowed', code: 'METHOD_NOT_ALLOWED' })
-      return
-    }
-    const url = new URL(request.url ?? LINEAGE_HTTP_PATH, 'http://dsh.local')
-    const cwdParam = url.searchParams.get('cwd')
-    const sessionIdParam = url.searchParams.get('sessionId')
-    if ((cwdParam !== null) === (sessionIdParam !== null)) {
-      throw new ShadowRewindError('INVALID_ARGUMENTS', 'cwd 与 sessionId 必须提供其一（且只能其一）')
-    }
-    let cwd: string
-    let badgeSessionId: string | undefined
-    if (cwdParam !== null) {
-      cwd = requiredText(cwdParam, 'cwd')
-    } else {
-      badgeSessionId = requiredText(sessionIdParam, 'sessionId')
-      const session = await readSession(deps, badgeSessionId)
-      cwd = session.header.cwd ?? ''
-      if (cwd === '') throw new ShadowRewindError('INVALID_ARGUMENTS', '会话没有工作区，无法读取谱系')
-    }
-    const entries = await engine.loadForkLineage(cwd)
-    const badge = badgeSessionId === undefined ? undefined : lineageVersion(entries, badgeSessionId)
-    json(response, 200, {
-      entries,
-      ...(badge !== undefined ? { version: badge.version, ...(badge.restoredFrom !== undefined ? { restoredFrom: badge.restoredFrom } : {}) } : {}),
-    })
-  } catch (error) {
-    json(response, 409, {
-      error: errorMessage(error),
-      code: error instanceof ShadowRewindError ? error.code : 'LINEAGE_FAILED',
-    })
-  }
-}
 
-/** 沿 lineage 链回溯会话的 fork 深度：无链 = undefined；一次 fork = v2。
- * restoredFrom 取本会话直连父链的那条（第一次命中），不被更深的祖先覆盖。 */
-function lineageVersion(entries: readonly { childId: string; parentId: string; restorePointId?: string }[], sessionId: string): { version: number; restoredFrom?: string } | undefined {
-  let current = sessionId
-  let depth = 0
-  let restoredFrom: string | undefined
-  while (depth < 64) {
-    const entry = entries.find((item) => item.childId === current)
-    if (entry === undefined) break
-    if (restoredFrom === undefined) restoredFrom = entry.restorePointId
-    current = entry.parentId
-    depth += 1
-  }
-  return depth === 0 ? undefined : { version: depth + 1, ...(restoredFrom !== undefined ? { restoredFrom } : {}) }
-}
+

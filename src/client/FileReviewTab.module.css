@@ -276,6 +276,52 @@
   font-size: 12px;
 }
 
+/* 树形第三级：修改处（hunk）节点——行头可展开该块 diff，勾选框参与子集撤销。 */
+.hunkList {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.hunkItem + .hunkItem {
+  border-top: 1px solid var(--dsw-alias-border-l2);
+}
+
+.hunkRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 8px 0 22px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.hunkRow:hover {
+  background: color-mix(in srgb, var(--dsw-alias-border-l1) 55%, transparent);
+}
+
+.hunkRow input[type='checkbox'] {
+  flex: none;
+  cursor: pointer;
+}
+
+.hunkTitle {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.hunkRow .stats {
+  margin-left: auto;
+}
+
+.hunkDiff {
+  border-top: 1px solid var(--dsw-alias-border-l2);
+  overflow-x: auto;
+}
+
 .reviewDiff {
   border: 0;
   border-radius: 0;

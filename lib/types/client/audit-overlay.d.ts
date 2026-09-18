@@ -1,12 +1,13 @@
 /**
- * AuditOverlay —— 文件审查的全屏对话框界面（侧边栏 tab 移除后的新家）。
+ * AuditOverlay —— 文件审查的全屏界面（原侧边栏 tab 移除后的新家）。
  *
- * 复用 FileReviewTab 的全部能力（逐轮 diff、hunk 级撤销/重做、每轮快照恢复），
- * 只是外壳从 better-sidebar tab 换成独立的模态对话框：入口在 live 条头部
- * 按钮（或点行深链到该文件的展开态）。回退遮罩点击关闭。
+ * 参照 dsh-prompt-customizer 的 PanelShell 形态：**覆盖会话主区的右侧抽屉**，
+ * 不再是居中弹窗——侧栏保持可点、可随时切会话；portal 到 document.body，
+ * 避免宿主 React 树重建连带回收与 transform 祖先使 position:fixed 失效。
  *
- * 状态同步：FileReviewTab 的开关结果经 review-state 广播，live 条行内按钮
- * 随之翻转；反向（live 条行内撤销）也经同一存储回到本界面（订阅 → 重巡检）。
+ * 复用 FileReviewTab 的全部能力（逐轮 diff、hunk 级撤销/重做、每轮快照恢复、
+ * 文件级时间线），入口在 live 条头部「审查」按钮（或点行深链到该文件）。
+ * Esc / ✕ 关闭。
  */
 import * as React from 'react';
 import type { Context } from '@deepseek-ai/cordis';
@@ -18,9 +19,4 @@ export interface AuditOverlayProps {
     readonly seedPaths?: readonly string[];
     readonly onClose: () => void;
 }
-export declare function AuditOverlay({ ctx, sessionId, cwd, seedPaths, onClose }: AuditOverlayProps): React.DetailedReactHTMLElement<{
-    className: string;
-    role: "dialog";
-    'aria-modal': "true";
-    onClick: (event: React.MouseEvent) => void;
-}, HTMLElement>;
+export declare function AuditOverlay({ ctx, sessionId, cwd, seedPaths, onClose }: AuditOverlayProps): React.ReactPortal;

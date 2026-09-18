@@ -143,16 +143,12 @@ test('fs-changes：跨会话窗口写入保留并附归属标签（建议，不�
     const turn1 = body.turns.find((turn) => turn.turn === 1 && turn.live !== true)
     assert.ok(turn1, 's1 轮 1 必须有配对条目')
     const byPath = Object.fromEntries(turn1.changes.map((change) => [change.path, change]))
-    // 本会话写入：归属本会话、默认勾选。
-    assert.deepEqual(
-      { owner: byPath['s1-wrote.txt'].owner, autoSelect: byPath['s1-wrote.txt'].autoSelect },
-      { owner: 'target', autoSelect: true },
-    )
-    // 其它会话窗口的写入：保留（建议标签不裁决可见性），附会话归属、不默认勾选。
+    // 本会话写入：归属本会话（信息徽标）。
+    assert.equal(byPath['s1-wrote.txt'].owner, 'target')
+    // 其它会话窗口的写入：保留（归属只是信息徽标，不裁决可见性），附会话归属。
     const s2file = byPath['s2-wrote.txt']
-    assert.ok(s2file, '其它会话窗口的写入必须保留（归属只是建议标签）')
+    assert.ok(s2file, '其它会话窗口的写入必须保留（归属只是信息徽标）')
     assert.equal(s2file.owner, 's2')
-    assert.equal(s2file.autoSelect, false)
   } finally {
     await rm(workspace, { recursive: true, force: true })
     await engine.store.closeAll()
@@ -188,12 +184,11 @@ test('fs-changes：live-tail 行数 + 其它会话写入照常返回（附归属
     const s1made = live1.changes.find((change) => change.path === 's1-made.txt')
     assert.ok(s1made, 's1 自己的写入必须在 live-tail 里')
     assert.deepEqual(
-      { kind: s1made.kind, added: s1made.added, removed: s1made.removed, owner: s1made.owner, autoSelect: s1made.autoSelect },
-      { kind: 'added', added: 1, removed: 0, owner: 'target', autoSelect: true },
+      { kind: s1made.kind, added: s1made.added, removed: s1made.removed, owner: s1made.owner },
+      { kind: 'added', added: 1, removed: 0, owner: 'target' },
     )
     const s2made = live1.changes.find((change) => change.path === 's2-made.txt')
     assert.ok(s2made, 's2 的写入必须保留在 s1 的 live-tail 里（不静默丢弃）')
-    assert.equal(s2made.autoSelect, false, '非本会话独有归属不得默认勾选')
 
     // s2 的 live-tail：s2 自己的文件照常返回（s1 的写入落在 s2 检查点基线之前）。
     const s2 = await callFsChanges(handlers, 's2')
@@ -280,7 +275,6 @@ test('fs-changes：旧清单无 mtimeNs 时代条目照常配对（网格归属�
     const legacy = turn1.changes.find((change) => change.path === 'legacy.txt')
     assert.ok(legacy, '变更必须保留')
     assert.equal(legacy.owner, 'target')
-    assert.equal(legacy.autoSelect, true)
   } finally {
     await rm(workspace, { recursive: true, force: true })
     await engine.store.closeAll()

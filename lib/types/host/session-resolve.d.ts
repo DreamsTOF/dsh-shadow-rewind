@@ -81,20 +81,4 @@ export declare function applyGuarded(deps: RewindHttpDeps, engine: ShadowRewindE
     readonly id: string;
     readonly cwd: string;
 }, planId: string | undefined): Promise<RestoreResult>;
-/**
- * 「恢复并继续」：文件恢复后按消息边界重建会话——
- *  - 回合前无更早轮终点：直接 create 新会话（首个用户回合）；
- *  - 有 previousTurnEndSeq：在源会话上 fork 到该边界。
- */
-export declare function createConversationRestart(deps: RewindHttpDeps, sourceId: string, checkpoint: {
-    cwd: string;
-    messageSeq: number;
-    turn: number;
-    turnStartSeq: number;
-    previousTurnEndSeq?: number;
-}): Promise<{
-    sessionId: string;
-}>;
-/** 列出与目标目录共享同一工作区的活跃会话（canonical realpath 比对）。 */
-export declare function sharedWorkspaceSessions(deps: RewindHttpDeps, cwd: string): Promise<readonly string[]>;
 export {};

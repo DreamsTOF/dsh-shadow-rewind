@@ -59,86 +59,6 @@ test('transformFile：空 diffs 不可还原', () => {
   assert.equal(transformFile('anything\n', { path: 'x', diffs: [] }, 'undo'), null)
 })
 
-test('录制持久化：跨实例往返（懒加载 + 防抖落盘）', async () => {
-  const storageDir = await mkdtemp(join(tmpdir(), 'shadow-rewind-fr-'))
-  try {
-    const ctx = new Context()
-    const first = new FileReviewService(ctx, { storageDir })
-    first.recordMutation(fakeAgent('agent-roundtrip'), {
-      rootCallId: 'root-1',
-      name: 'edit',
-      path: 'a.txt',
-      before: 'old\n',
-      after: 'new\n',
-    })
-    first.recordMutation(fakeAgent('agent-roundtrip'), {
-      rootCallId: 'root-2',
-      name: 'write',
-      path: 'b.txt',
-      before: null,
-      after: 'created\n',
-    })
-    // 等待防抖窗口（400ms）+ 写入完成。
-    await new Promise((resolve) => { setTimeout(resolve, 800) })
-    // 记录文件存在（文件名 = agentKey 哈希）。
-    const roundtripHash = createHash('sha256').update('agent-roundtrip').digest('hex').slice(0, 16)
-    const roundtripRecord = join(storageDir, 'file-review', 'recorded', `agent-roundtrip-${roundtripHash}.json`)
-    await readFile(roundtripRecord, 'utf8')
-
-    // 新实例（模拟宿主重启）：recorded() 触发懒加载，磁盘记录可见。
-    const second = new FileReviewService(new Context(), { storageDir })
-    const result = await second.recorded(fakeAgent('agent-roundtrip'), { rootCallIds: ['root-1', 'root-2'] })
-    assert.deepEqual(result.mutations.map(m => m.rootCallId), ['root-1', 'root-2'], '磁盘记录按 dispatch 顺序返回')
-    assert.equal(result.mutations[0].path, 'a.txt')
-    assert.equal(result.mutations[1].before, null)
-
-    // 加载后再录制：直接追加并再次落盘；重启后仍可见（合并顺序：磁盘在前）。
-    second.recordMutation(fakeAgent('agent-roundtrip'), {
-      rootCallId: 'root-3',
-      name: 'edit',
-      path: 'c.txt',
-      before: 'x\n',
-      after: 'y\n',
-    })
-    await new Promise((resolve) => { setTimeout(resolve, 800) })
-    const third = new FileReviewService(new Context(), { storageDir })
-    const all = await third.recorded(fakeAgent('agent-roundtrip'), { rootCallIds: ['root-1', 'root-2', 'root-3'] })
-    assert.deepEqual(all.mutations.map(m => m.rootCallId), ['root-1', 'root-2', 'root-3'])
-
-    // rootCallIds 过滤仍然生效。
-    const filtered = await third.recorded(fakeAgent('agent-roundtrip'), { rootCallIds: ['root-2'] })
-    assert.deepEqual(filtered.mutations.map(m => m.rootCallId), ['root-2'])
-  } finally {
-    await rm(storageDir, { recursive: true, force: true })
-  }
-})
-
-test('录制持久化：损坏记录文件静默从空开始并被重写', async () => {
-  const storageDir = await mkdtemp(join(tmpdir(), 'shadow-rewind-fr-'))
-  try {
-    // 与 recordsFilename 同规则：agentKey 的 sha256 前 16 位。
-    const hash = createHash('sha256').update('agent-broken').digest('hex').slice(0, 16)
-    const recordPath = join(storageDir, 'file-review', 'recorded', `agent-broken-${hash}.json`)
-    await mkdir(dirname(recordPath), { recursive: true })
-    await writeFile(recordPath, 'NOT JSON{{', 'utf8')
-    const ctx = new Context()
-    const service = new FileReviewService(ctx, { storageDir })
-    const before = await service.recorded(fakeAgent('agent-broken'), { rootCallIds: ['r1'] })
-    assert.deepEqual(before.mutations, [], '损坏文件读取为空')
-    // 新录制照常工作并覆盖损坏文件。
-    service.recordMutation(fakeAgent('agent-broken'), {
-      rootCallId: 'r1', name: 'edit', path: 'x.txt', before: null, after: 'hi\n',
-    })
-    await new Promise((resolve) => { setTimeout(resolve, 800) })
-    const written = await readFile(recordPath, 'utf8')
-    const parsed = JSON.parse(written)
-    assert.equal(parsed.version, 1)
-    assert.equal(parsed.mutations.length, 1)
-  } finally {
-    await rm(storageDir, { recursive: true, force: true })
-  }
-})
-
 // ── 文件系统级变更（检查点对比产生的新增/删除形状）撤销语义 ──────────────
 
 function fsAgent(cwd) {
@@ -626,10 +546,10 @@ test('wire schema：request 层 strict——未知字段显式报错而非静默
   )
 })
 
-// ── H4/E2：录制产线的 LF 归一、空文件保留与白名单 ──────────────────────────
+// ── H4：检查点 hunk 的 LF 归一（宿主锚点匹配的基线）────────────────────────
 
-test('H4：CRLF 文件的 run_code 录制 hunk 与宿主 LF 基线对齐', async () => {
-  const { diffsFromBeforeAfter } = await import('../lib/client-recorded-diffs.js')
+test('H4：CRLF 内容的 hunk 与宿主 LF 基线对齐', async () => {
+  const { diffsFromBeforeAfter } = await import('../lib/client-diff-build.js')
   const hunks = diffsFromBeforeAfter('a.txt', 'hello\r\nworld\r\n', 'hello\r\nbrave\r\nworld\r\n')
   assert.equal(hunks.length, 1)
   assert.ok(!hunks[0].newText.includes('\r'), 'hunk 行尾不得携带 CR（宿主在 LF 文本上锚点匹配）')
@@ -640,8 +560,8 @@ test('H4：CRLF 文件的 run_code 录制 hunk 与宿主 LF 基线对齐', async
   assert.equal(restored, 'hello\nworld\n')
 })
 
-test('H4/J7：run_code 创建空文件不再被静默丢弃（added 语义与 write 同形）', async () => {
-  const { diffsFromBeforeAfter } = await import('../lib/client-recorded-diffs.js')
+test('H4/J7：创建空文件是真实变更（added 语义与 write 同形）', async () => {
+  const { diffsFromBeforeAfter } = await import('../lib/client-diff-build.js')
   const hunks = diffsFromBeforeAfter('empty.txt', null, '')
   assert.deepEqual(hunks, [{ path: 'empty.txt', oldText: null, newText: '' }])
 })

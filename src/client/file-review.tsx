@@ -14,6 +14,8 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+// Type-only: pulls the runtime client Context merges（ctx.slots / sessions）。
+import type {} from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
@@ -154,12 +156,11 @@ export function applyFileReview(ctx: Context): void {
     const tChat = ctx.locale.bind(CHAT_NS)
     const mentions: ChatFileMentions = {
       forClosing(owner) {
-        // 与轮尾链条目跑同一个认领判定：没有产出文件就没有提及词汇——
-        // 两个面在构造上就保持一致。
-        const reviews = selectProducedFiles(owner)
-        if (reviews === null) return undefined
+        // 没有产出文件就没有提及词汇——两个面在构造上保持一致。
+        const paths = selectProducedFiles(owner)
+        if (paths === null) return undefined
         return producedFileMentions(
-          reviews.map(review => review.path),
+          paths,
           owner.openFile,
           path => tChat('produced.open', { name: path }),
         )

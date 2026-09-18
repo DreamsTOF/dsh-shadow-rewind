@@ -13,8 +13,7 @@
  * 内存状态（pending/skipped/failed/missing）。
  */
 
-import { ShadowRewindError, errorMessage } from '../errors.js'
-import { canonicalDirectory } from '../path-utils.js'
+import { ShadowRewindError } from '../errors.js'
 import type { ShadowRewindEngine } from '../engine.js'
 import type { RestoreResult } from '../types.js'
 import type { TurnCheckpointCoordinator } from './coordinator.js'
@@ -78,34 +77,13 @@ export async function readSession(
   }
 }
 
-/** 消息 → 检查点解析总入口：先查（含 fork 继承的）回合检查点；缺席时用
- * BEFORE 日志物化的部分树消息检查点兜底——「消除没料可回」。 */
+/** 消息 → 检查点解析：直查（含 fork 继承的）回合检查点；缺席即如实报告
+ * 「没有快照」——绝不用部分树兜底制造「同一动作恢复集合不同」的第二语义。 */
 async function resolveMessageCheckpoint(deps: RewindHttpDeps, engine: ShadowRewindEngine, sessionId: string, messageSeq: number): Promise<{
   target: MessageTarget
   checkpoint?: { id: string; cwd: string; messageSeq: number; turn: number; turnStartSeq: number; previousTurnEndSeq?: number }
 }> {
-  const viaCheckpoints = await resolveMessageCheckpointViaCheckpoints(deps, engine, sessionId, messageSeq)
-  if (viaCheckpoints.checkpoint !== undefined) return viaCheckpoints
-  const { target } = viaCheckpoints
-  const messagePoint = await engine.ensureMessageRestorePoint({
-    cwd: target.cwd,
-    sessionId,
-    messageSeq,
-    turn: target.turn,
-    turnStartSeq: target.turnStartSeq,
-  }).catch(() => undefined)
-  if (messagePoint === undefined) return { target }
-  return {
-    target,
-    checkpoint: {
-      id: messagePoint.id,
-      cwd: target.cwd,
-      messageSeq,
-      turn: target.turn,
-      turnStartSeq: target.turnStartSeq,
-      ...(target.previousTurnEndSeq === undefined ? {} : { previousTurnEndSeq: target.previousTurnEndSeq }),
-    },
-  }
+  return resolveMessageCheckpointViaCheckpoints(deps, engine, sessionId, messageSeq)
 }
 
 /** 消息 → 回合检查点：直查本会话，未命中则沿 fork 父链在 seed 范围内继承。 */
@@ -160,7 +138,7 @@ async function resolveMessageCheckpointViaCheckpoints(deps: RewindHttpDeps, engi
 
 /** 消息恢复的执行入口：解析 + 与请求带来的 checkpointId 核对（防错配）。 */
 export async function checkpointForRequest(deps: RewindHttpDeps, engine: ShadowRewindEngine, sessionId: string, messageSeq: number, requestedId: string): Promise<{ id: string; cwd: string; messageSeq: number; turn: number; turnStartSeq: number; previousTurnEndSeq?: number }> {
-  const { target, checkpoint } = await resolveMessageCheckpoint(deps, engine, sessionId, messageSeq)
+  const { checkpoint } = await resolveMessageCheckpoint(deps, engine, sessionId, messageSeq)
   if (checkpoint === undefined) {
     throw new ShadowRewindError('RESTORE_POINT_NOT_FOUND', `消息 ${String(messageSeq)} 没有可用的回退检查点`)
   }
@@ -234,29 +212,14 @@ export async function resolveTurnRewindTarget(deps: RewindHttpDeps, engine: Shad
  * 回合 → 检查点解析：优先本会话自身的检查点；fork 产物在本会话没有该回合
  * 检查点时沿父链继承——只有回合起点落在 seed 范围内（fork 之前发生的回合）
  * 才允许继承，且继承检查点的 turnStartSeq 必须与本会话的回合起点一致。
+ * 检查点缺席即如实报告，绝不用部分树兜底。
  */
 async function resolveTurnCheckpoint(deps: RewindHttpDeps, engine: ShadowRewindEngine, sessionId: string, turn: number): Promise<{
   cwd: string
   turnStartSeq: number
   checkpoint?: { id: string }
 }> {
-  const viaCheckpoints = await resolveTurnCheckpointViaCheckpoints(deps, engine, sessionId, turn)
-  if (viaCheckpoints.checkpoint !== undefined) return viaCheckpoints
-  // BEFORE 日志兜底：回合检查点缺席时，取该回合的开场用户消息并物化消息检查点。
-  const session = await readSession(deps, sessionId).catch(() => undefined)
-  const opening = session?.events.find((event) => event.type === 'user/message'
-    && event.seq > viaCheckpoints.turnStartSeq
-    && isDirectUserMessage(event))
-  if (session === undefined || opening === undefined) return viaCheckpoints
-  const messagePoint = await engine.ensureMessageRestorePoint({
-    cwd: viaCheckpoints.cwd,
-    sessionId,
-    messageSeq: opening.seq,
-    turn,
-    turnStartSeq: viaCheckpoints.turnStartSeq,
-  }).catch(() => undefined)
-  if (messagePoint === undefined) return viaCheckpoints
-  return { cwd: viaCheckpoints.cwd, turnStartSeq: viaCheckpoints.turnStartSeq, checkpoint: { id: messagePoint.id } }
+  return resolveTurnCheckpointViaCheckpoints(deps, engine, sessionId, turn)
 }
 
 async function resolveTurnCheckpointViaCheckpoints(deps: RewindHttpDeps, engine: ShadowRewindEngine, sessionId: string, turn: number): Promise<{
@@ -341,31 +304,6 @@ export async function applyGuarded(deps: RewindHttpDeps, engine: ShadowRewindEng
   return result
 }
 
-/**
- * 「恢复并继续」：文件恢复后按消息边界重建会话——
- *  - 回合前无更早轮终点：直接 create 新会话（首个用户回合）；
- *  - 有 previousTurnEndSeq：在源会话上 fork 到该边界。
- */
-export async function createConversationRestart(deps: RewindHttpDeps, sourceId: string, checkpoint: { cwd: string; messageSeq: number; turn: number; turnStartSeq: number; previousTurnEndSeq?: number }): Promise<{ sessionId: string }> {
-  const source = await readSession(deps, sourceId)
-  const current = messageTarget(source, checkpoint.messageSeq)
-  if (current.turn !== checkpoint.turn
-    || current.turnStartSeq !== checkpoint.turnStartSeq
-    || current.previousTurnEndSeq !== checkpoint.previousTurnEndSeq) {
-    throw new ShadowRewindError('PLAN_STALE', '会话中已找不到所选消息的回合边界')
-  }
-  try {
-    // dsh 0.1.2 起 apiProxy 移除：会话网关收敛为 `ctx.sessionController`
-    // （方法直连、错误以 throw 表达），不再包 RPC 信封。
-    const sessionId = checkpoint.previousTurnEndSeq === undefined
-      ? (await deps.sessionController.create({ cwd: checkpoint.cwd })).sessionId
-      : (await deps.sessionController.fork({ sessionId: sourceId, atSeq: checkpoint.previousTurnEndSeq })).sessionId
-    return { sessionId }
-  } catch (error) {
-    throw new ShadowRewindError('CONVERSATION_REWIND_FAILED', errorMessage(error), { cause: error })
-  }
-}
-
 /** 消息 → 会话事实（含一系列 fail-closed 校验，见各 throw）。 */
 function messageTarget(session: { id: string; header: { cwd?: string }; events: readonly SessionEvent[] }, messageSeq: number): MessageTarget {
   const cwd = session.header.cwd
@@ -410,19 +348,4 @@ function isDirectUserMessage(event: SessionEvent): boolean {
     && (source as { kind?: unknown }).kind === 'user'
 }
 
-/** 列出与目标目录共享同一工作区的活跃会话（canonical realpath 比对）。 */
-export async function sharedWorkspaceSessions(deps: RewindHttpDeps, cwd: string): Promise<readonly string[]> {
-  const listed = deps.agents.list()
-  if (listed.length === 0) return []
-  const root = await canonicalDirectory(cwd).catch(() => undefined)
-  if (root === undefined) return []
-  const shared: string[] = []
-  for (const agent of listed) {
-    if (agent.status !== 'running') continue
-    const agentCwd = agent.session.header.cwd
-    if (agentCwd === undefined) continue
-    const agentRoot = await canonicalDirectory(agentCwd).catch(() => undefined)
-    if (agentRoot === root) shared.push(agent.session.id)
-  }
-  return shared.sort()
-}
+

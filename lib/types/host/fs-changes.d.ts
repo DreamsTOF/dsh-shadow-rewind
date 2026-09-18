@@ -34,7 +34,7 @@ export declare function readChangeSide(engine: ShadowRewindEngine, cwd: string, 
 /** 端点变更条目：path/kind + 服务端预算行数 + 检查点权限位 + 目录标记。
  * oldMode/newMode 供客户端透传给宿主撤销（写回时恢复权限位）；
  * dir 条目的撤销语义是 mkdir/rmdir，不产生行数。
- * owner/autoSelect 为检查点窗口网格归属（勾选清单的建议标签）。 */
+ * owner 为检查点窗口网格归属（信息徽标，不影响任何默认行为）。 */
 export interface FsChangeItem {
     path: string;
     kind: 'added' | 'modified' | 'deleted';
@@ -43,11 +43,16 @@ export interface FsChangeItem {
     oldMode?: number;
     newMode?: number;
     dir?: true;
-    /** serializeOwner 形态：'target' | 'multi' | 'unknown' | <sessionId>。 */
+    /** serializeOwner 形态：'target' | 'multi' | 'unknown' | <sessionId>（信息徽标）。 */
     owner?: string;
-    /** 回滚勾选清单默认值：仅归属本会话为 true。 */
-    autoSelect?: boolean;
 }
+/** 一条变更两侧内容的行数差；内容缺失/超限/非 UTF-8/读取失败都返回 undefined
+ * （调用方按「行数不可得」呈现，绝不猜）。两侧都在但内容相同 = 纯权限位变更，
+ * 返回 {0,0}。 */
+export declare function countChangeLines(engine: ShadowRewindEngine, cwd: string, path: string, prevId: string, nextId: string): Promise<{
+    added: number;
+    removed: number;
+} | undefined>;
 /** 一轮的文件系统变更条目（配对轮与 live-tail 同形）。 */
 export interface TurnFsChange {
     readonly turn: number;
@@ -66,8 +71,8 @@ export interface TurnFsChange {
  * （diffCheckpoints）与 live-tail（inspect = 最后检查点 vs 当前磁盘）共用，
  * 两端点（/shadow-rewind 预览与 /shadow-rewind/fs-changes）不再各持一份拷贝。
  *
- * 归属行为：窗口内快照做网格归属（attributePaths），owner/autoSelect 随
- * 条目透出，作为勾选清单的建议标签。归属失败保守保留全部路径。
+ * 归属行为：窗口内快照做网格归属（attributePaths），owner 随条目透出，
+ * 作为信息徽标。归属失败保守保留全部路径。
  *
  * 返回 undefined = 结构性跳过（无 sessionId / 无配对终点）或对比失败
  * （已记警告）；空 changes 数组原样返回，由调用方决定是否透出。
@@ -94,5 +99,32 @@ export declare function computeTurnFsChanges(engine: ShadowRewindEngine, deps: P
         remaining: number;
     };
 }): Promise<TurnFsChange | undefined>;
+/**
+ * 一条「会话累计」变更：同一路径在会话多轮里的净变化 = diff(最早触碰该路径的
+ * 轮起检查点, 最后一次触碰的轮末/下一轮起点)。live 条的会话累计视图消费这一份
+ * ——行数/权限位/增删形态全部由服务端按检查点算出，客户端不再跨轮拼接近似。
+ *
+ * 单轮路径直接复用该轮的预算结果（零额外读取）；跨轮路径按最早/最后两侧重算
+ * 一次净行数。`turnStartSeq` 是最早触碰轮的 turn/start seq（回滚遮蔽基准）。
+ */
+export interface CumulativeFsChange extends FsChangeItem {
+    /** 最早触碰该路径的轮起检查点（diff 的 prev 侧）。 */
+    readonly checkpointId: string;
+    /** 最后一次触碰的轮末检查点（或 'live' = 当前磁盘）。 */
+    readonly nextCheckpointId: string;
+    /** 最早触碰轮的 turn/start seq（回滚遮蔽的判别基准）。 */
+    readonly turnStartSeq: number;
+    /** 触碰过该路径的轮号（升序）。 */
+    readonly turns: readonly number[];
+}
+/** 把逐轮变更合并成「每路径一行」的会话累计净变化（live 条的唯一数据源）。 */
+export declare function computeCumulativeFsChanges(engine: ShadowRewindEngine, options: {
+    readonly cwd: string;
+    /** 逐轮变更（按轮升序；live 轮排最后）。 */
+    readonly turns: readonly TurnFsChange[];
+    readonly countBudget: {
+        remaining: number;
+    };
+}): Promise<readonly CumulativeFsChange[]>;
 /** 并行只读探测检查点内容可读性；返回「不可读」的 id 集合（探测失败也算不可读）。 */
 export declare function probeUnreadableCheckpoints(engine: ShadowRewindEngine, cwd: string, ids: ReadonlySet<string>): Promise<Set<string>>;

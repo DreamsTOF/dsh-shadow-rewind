@@ -1,11 +1,11 @@
 /**
- * 对称模式测试：检查点窗口归因（纯函数）与勾选式子集恢复（引擎集成）。
+ * 归因测试：检查点窗口归因（纯函数，信息徽标）。
  * 窗口语义：检查点在回合开始时捕获，窗口 [S_j, S_{j+1}) 的写者就是
- * S_j 的会话；最后一个窗口延伸到当前树。
+ * S_j 的会话；最后一个窗口延伸到当前树。归因只做展示，不影响任何默认行为。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { attributePaths, serializeOwner } from '../lib/attribution.js'
@@ -19,7 +19,7 @@ function modified(path, before, after) {
   return { path, kind: 'modified', before, after }
 }
 
-test('窗口归因：变更落在目标窗口 → target + 默认勾选', () => {
+test('窗口归因：变更落在目标窗口 → target', () => {
   // A 的回合写了 p（x），其后 B 的回合开始检查点 S1 捕获到 x。
   const attribution = attributePaths({
     targetSessionId: 'A',
@@ -27,10 +27,9 @@ test('窗口归因：变更落在目标窗口 → target + 默认勾选', () => 
     snapshots: [{ sessionId: 'B', entries: { p: fileEntry('x') } }],
   })
   assert.deepEqual(attribution.get('p')?.owner, { kind: 'target' })
-  assert.equal(attribution.get('p')?.autoSelect, true)
 })
 
-test('窗口归因：变更落在其它会话窗口 → session 标签，不默认勾选', () => {
+test('窗口归因：变更落在其它会话窗口 → session 标签', () => {
   // B 的回合开始（S1，p 仍为 o）后写了 x；A 的回合开始检查点 S2 捕获到 x。
   const attribution = attributePaths({
     targetSessionId: 'A',
@@ -41,10 +40,9 @@ test('窗口归因：变更落在其它会话窗口 → session 标签，不默�
     ],
   })
   assert.deepEqual(attribution.get('p')?.owner, { kind: 'session', sessionId: 'B' })
-  assert.equal(attribution.get('p')?.autoSelect, false)
 })
 
-test('窗口归因：双方先后都改过 → multi（保守排除自动勾选）', () => {
+test('窗口归因：双方先后都改过 → multi', () => {
   const attribution = attributePaths({
     targetSessionId: 'A',
     changes: [modified('p', fileEntry('o'), fileEntry('x'))],
@@ -54,7 +52,6 @@ test('窗口归因：双方先后都改过 → multi（保守排除自动勾选�
     ],
   })
   assert.deepEqual(attribution.get('p')?.owner, { kind: 'multi' })
-  assert.equal(attribution.get('p')?.autoSelect, false)
 })
 
 test('窗口归因：新增文件（before=null）属于目标窗口', () => {
@@ -64,7 +61,6 @@ test('窗口归因：新增文件（before=null）属于目标窗口', () => {
     snapshots: [],
   })
   assert.deepEqual(attribution.get('new.txt')?.owner, { kind: 'target' })
-  assert.equal(attribution.get('new.txt')?.autoSelect, true)
 })
 
 test('窗口归因：快照缺少会话 id → unknown；序列化按约定映射', () => {
@@ -80,7 +76,7 @@ test('窗口归因：快照缺少会话 id → unknown；序列化按约定映�
   assert.equal(serializeOwner({ kind: 'session', sessionId: 'sess_x' }), 'sess_x')
 })
 
-test('引擎集成：双会话窗口归因 + 勾选式子集恢复只还原勾选路径', async () => {
+test('引擎集成：双会话窗口归因（标签只作展示）', async () => {
   const storageDir = await mkdtemp(join(tmpdir(), 'shadow-rewind-attr-'))
   const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-ws-'))
   const engine = new ShadowRewindEngine({ storageDir, turnCheckpointMode: 'sqlite' })
@@ -120,26 +116,6 @@ test('引擎集成：双会话窗口归因 + 勾选式子集恢复只还原勾�
     assert.deepEqual(attribution.get('a.txt')?.owner, { kind: 'multi' }, 'a 被 B 和 A 先后改过')
     assert.deepEqual(attribution.get('b.txt')?.owner, { kind: 'session', sessionId: 'B' })
     assert.deepEqual(attribution.get('c.txt')?.owner, { kind: 'target' })
-
-    // 勾选式子集恢复：只还原 b.txt（B 的改动），a/c 原样保留。
-    const plan = await engine.planRestore({
-      cwd: workspace,
-      restorePointId: first.id,
-      sessionId: 'A',
-      expectedCurrentTreeHash: inspection.currentTreeHash,
-      paths: ['b.txt'],
-    })
-    assert.deepEqual(plan.changes.map(change => change.path), ['b.txt'])
-    await engine.applyRestore({ planId: plan.id, sessionId: 'A' })
-    assert.equal(await readFile(join(workspace, 'b.txt'), 'utf8'), 'B0\n', 'b.txt 回到目标检查点状态')
-    assert.equal(await readFile(join(workspace, 'a.txt'), 'utf8'), 'A2\n', '未勾选的 a.txt 不受影响')
-    assert.equal(await readFile(join(workspace, 'c.txt'), 'utf8'), 'C0\n', '未勾选的 c.txt 不受影响')
-
-    // 未知路径拒绝：防止拿错版本的清单拼出半个计划。
-    await assert.rejects(
-      () => engine.planRestore({ cwd: workspace, restorePointId: first.id, paths: ['missing.txt'] }),
-      (error) => error.code === 'INVALID_ARGUMENTS',
-    )
   } finally {
     await engine.store.closeAll()
     await rm(storageDir, { recursive: true, force: true })

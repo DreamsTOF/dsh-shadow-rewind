@@ -11,16 +11,13 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type {
-  FileReviewRequest, FileReviewResult, RecordedRequest, RecordedResult,
-} from '../file-review/change-types.ts'
+import type { FileReviewRequest, FileReviewResult } from '../file-review/change-types.ts'
 import { TYPERT_REMOTE } from '../file-review/remote.ts'
 
 /** 浏览器半边需要的 fileReview 命名空间方法面。 */
 export interface FileReviewRemote {
   status(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>
   apply(request: FileReviewRequest): Promise<RemoteResult<FileReviewResult>>
-  recorded(request: RecordedRequest): Promise<RemoteResult<RecordedResult>>
 }
 
 interface MountableRemote {
@@ -106,17 +103,4 @@ export async function invokeFileReview(
   return result.value
 }
 
-/** fileReview/recorded 的调用包装（Code Mode 录制读取）。 */
-export async function invokeFileReviewRecorded(
-  ctx: Context,
-  sessionId: string,
-  request: RecordedRequest,
-): Promise<RecordedResult> {
-  const remote = await resolveFileReviewRemote(ctx, sessionId)
-  if (remote === undefined) {
-    throw new Error('文件审查远端服务不可用（fileReview 命名空间未挂载，详情见控制台 remote mount error）')
-  }
-  const result = await remote.recorded(request)
-  if (!result.ok) throw new Error(result.error.message)
-  return result.value
-}
+

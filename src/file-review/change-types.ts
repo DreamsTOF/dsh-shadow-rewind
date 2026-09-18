@@ -90,35 +90,5 @@ export interface FileReviewResult {
   readonly files: readonly FileReviewFileResult[]
 }
 
-/**
- * Code Mode（`run_code`）程序向文件编辑工具派发的一次变更，在宿主侧连同
- * **完整 before / after 内容**一起录制下来。
- *
- * 为什么必须录全文：线上视图（diff 卡片）只挂在模型直发的 tool/call 帧上，
- * 嵌套派发既不带视图也没有 hunk——想审查程序化改动，只能从这两份快照反
- * 推出 diff。
- */
-export interface RecordedMutation {
-  /** 拥有这次派发的 `run_code` 调用（其 `callId`）。 */
-  readonly rootCallId: string
-  /** 被派发的工具名（`edit` / `write` 等）。 */
-  readonly name: string
-  /** 工具上报的展示路径；按会话 cwd 解析。 */
-  readonly path: string
-  /** 变更前的完整文件内容；文件是新建时为 `null`。 */
-  readonly before: string | null
-  /** 变更后的完整文件内容。 */
-  readonly after: string
-}
 
-/** 宿主侧请求：取某个会话录制到的 Code Mode 变更。 */
-export interface RecordedRequest {
-  /** 想要其录制变更的根（`run_code`）call-id 列表。 */
-  readonly rootCallIds: readonly string[]
-}
-
-/** 宿主侧响应：每个被请求根调用的变更，按派发顺序排列。 */
-export interface RecordedResult {
-  readonly mutations: readonly RecordedMutation[]
-}
 

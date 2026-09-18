@@ -1,8 +1,9 @@
 /**
- * B1 恢复撤销 + A4 headless 命令面测试：
+ * B1 恢复撤销测试：
  * undoLastRestore 的 CAS 语义（撤销/部分跳过/全跳过 409/新建文件删除/无记录）、
- * restore-undo 端点、shadow-diff / shadow-undo 命令（真实引擎 + sqlite 后端，
- * 端点与命令直接驱动免网络）。
+ * restore-undo 端点（真实引擎 + sqlite 后端，直接驱动免网络）。
+ * 命令面（/shadow-diff、/shadow-inplace）已整体移除——就地回退改走
+ * /shadow-rewind/inplace 端点（见 inplace-command.test.mjs）。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -10,7 +11,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ShadowRewindEngine } from '../lib/index.js'
-import { TurnCheckpointCoordinator, installShadowRewindCommands, installShadowRewindHttp } from '../lib/rewind-host.js'
+import { TurnCheckpointCoordinator, installShadowRewindHttp } from '../lib/rewind-host.js'
 
 async function makeEngine() {
   const storageDir = await mkdtemp(join(tmpdir(), 'shadow-rewind-undo-store-'))
@@ -236,7 +237,7 @@ test('undo paths：未知路径拒绝（防拼出半个撤销）', async () => {
   }
 })
 
-test('applyRestore：会话绑定不匹配降级为软警告（EXPECTED-DESIGN 1.4 #3）', async () => {
+test('applyRestore：其它会话执行同工作区恢复照常生效（归属不影响执行）', async () => {
   const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-undo-ws-'))
   const { engine, storageDir } = await makeEngine()
   try {
@@ -244,122 +245,10 @@ test('applyRestore：会话绑定不匹配降级为软警告（EXPECTED-DESIGN 1
     const baseline = await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 's1', turn: 1, turnStartSeq: 10 })
     await writeFile(join(workspace, 'a.txt'), 'v2\n', 'utf8')
     const plan = await engine.planRestore({ cwd: workspace, restorePointId: baseline.id, sessionId: 's1' })
-    // 其它会话执行：不拒绝，只带软警告。
+    // 其它会话执行：不拒绝（归属只是信息徽标）。
     const result = await engine.applyRestore({ planId: plan.id, sessionId: 'other' })
     assert.deepEqual([...result.restoredPaths], ['a.txt'])
-    assert.ok(result.warnings?.some(warning => warning.includes('s1')), '软警告点名计划归属会话')
     assert.equal(await readFile(join(workspace, 'a.txt'), 'utf8'), 'v1\n', '恢复照常生效')
-  } finally {
-    await engine.store.closeAll()
-    await rm(workspace, { recursive: true, force: true })
-    await rm(storageDir, { recursive: true, force: true })
-  }
-})
-
-// ── A4 命令面 ────────────────────────────────────────────────────────────
-
-function makeCommandHost() {
-  const definitions = []
-  return {
-    definitions,
-    commands: {
-      register(definition) { definitions.push(definition); return () => {} },
-    },
-  }
-}
-
-function fakeAgent(cwd, events = []) {
-  return {
-    session: {
-      id: 's1',
-      header: { cwd },
-      snapshotEvents: () => events,
-    },
-  }
-}
-
-test('命令：/shadow-diff 的用法错误、混用拒绝与轨迹区间输出', async () => {
-  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-cmd-ws-'))
-  const { engine, storageDir } = await makeEngine()
-  try {
-    const host = makeCommandHost()
-    installShadowRewindCommands(host, engine)
-    assert.equal(host.definitions.length, 2, '注册 shadow-diff 与 shadow-undo')
-    const diff = host.definitions.find((definition) => definition.name === 'shadow-diff')
-    const undo = host.definitions.find((definition) => definition.name === 'shadow-undo')
-
-    // 空参数 → 用法。
-    const usage = await diff.handler({ agent: fakeAgent(workspace), rawInput: '' })
-    assert.equal(usage.kind, 'error')
-    assert.ok(usage.text.includes('用法'))
-
-    // 混用 → 拒绝。
-    const mixed = await diff.handler({ agent: fakeAgent(workspace), rawInput: `trace:1 ${'rp_1_000000000000'}` })
-    assert.equal(mixed.kind, 'error')
-
-    // 轨迹区间：事件流里 write + edit。
-    const events = [
-      { type: 'tool/call', seq: 10, data: { turn: 1, step: 1, callId: 'c10', name: 'write', arguments: JSON.stringify({ file_path: join(workspace, 'a.ts'), content: 'one\ntwo\n' }) } },
-      { type: 'tool/result', seq: 11, data: { callId: 'c10', message: { content: [] } } },
-      { type: 'tool/call', seq: 12, data: { turn: 1, step: 2, callId: 'c12', name: 'edit', arguments: JSON.stringify({ file_path: join(workspace, 'a.ts'), old_string: 'two', new_string: 'TWO' }) } },
-      { type: 'tool/result', seq: 13, data: { callId: 'c12', message: { content: [] } } },
-    ]
-    const range = await diff.handler({ agent: fakeAgent(workspace, events), rawInput: 'trace:11 trace:13' })
-    assert.equal(range.kind, 'success')
-    assert.ok(range.text.includes('轨迹区间 #11 → #13'))
-    assert.ok(range.text.includes('a.ts'))
-    assert.ok(range.text.includes('+1 −1'))
-
-    // shadow-undo 无记录 → 明确错误文案。
-    const undoResult = await undo.handler({ agent: fakeAgent(workspace), rawInput: '' })
-    assert.equal(undoResult.kind, 'error')
-    assert.ok(undoResult.text.includes('没有可撤销'))
-  } finally {
-    await engine.store.closeAll()
-    await rm(workspace, { recursive: true, force: true })
-    await rm(storageDir, { recursive: true, force: true })
-  }
-})
-
-test('命令：/shadow-diff 单轮与 /shadow-undo 撤销输出', async () => {
-  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-cmd-ws-'))
-  const { engine, storageDir } = await makeEngine()
-  try {
-    await writeFile(join(workspace, 'a.txt'), 'v1\n', 'utf8')
-    await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 's1', turn: 1, turnStartSeq: 10 })
-    await writeFile(join(workspace, 'a.txt'), 'v2\nmore\n', 'utf8')
-    await writeFile(join(workspace, 'b.txt'), 'b\n', 'utf8')
-    await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 's1', turn: 2, turnStartSeq: 20 })
-
-    const host = makeCommandHost()
-    installShadowRewindCommands(host, engine)
-    const diff = host.definitions.find((definition) => definition.name === 'shadow-diff')
-
-    // 单轮模式：轮 1 → 轮 2（回退配对）。
-    const turn1 = await diff.handler({ agent: fakeAgent(workspace), rawInput: '1' })
-    assert.equal(turn1.kind, 'success', turn1.text)
-    assert.ok(turn1.text.includes('a.txt'))
-    assert.ok(turn1.text.includes('b.txt'))
-
-    // 双轮号模式。
-    const span = await diff.handler({ agent: fakeAgent(workspace), rawInput: '1 2' })
-    assert.equal(span.kind, 'success', span.text)
-
-    // shadow-undo：先造一次恢复再撤销（基线 v1 → 改 v2 → 恢复回 v1）。
-    const baseline = await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 's1', turn: 10, turnStartSeq: 100 })
-    await writeFile(join(workspace, 'a.txt'), 'v2\n', 'utf8')
-    const current = await engine.inspect({ cwd: workspace, restorePointId: baseline.id })
-    const plan = await engine.planRestore({
-      cwd: workspace,
-      restorePointId: baseline.id,
-      sessionId: 's1',
-      expectedCurrentTreeHash: current.currentTreeHash,
-    })
-    await engine.applyRestore({ planId: plan.id, sessionId: 's1' })
-    const undo = host.definitions.find((definition) => definition.name === 'shadow-undo')
-    const undoResult = await undo.handler({ agent: fakeAgent(workspace), rawInput: '' })
-    assert.equal(undoResult.kind, 'success', undoResult.text)
-    assert.ok(undoResult.text.includes('a.txt'))
   } finally {
     await engine.store.closeAll()
     await rm(workspace, { recursive: true, force: true })
@@ -495,14 +384,13 @@ function sessionWithTurns(workspace, turns) {
   }
 }
 
-test('G1：带 paths 的预览请求必须铸出子集计划（fetchSubsetPlan 通路）', async () => {
-  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-subset-ws-'))
+test('G1：预览铸出整树计划（含逐文件净行数），执行后全部路径回基线', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'shadow-rewind-preview-ws-'))
   const { engine, storageDir } = await makeEngine()
   try {
     await writeFile(join(workspace, 'a.txt'), 'v1\n', 'utf8')
     await writeFile(join(workspace, 'b.txt'), 'v1\n', 'utf8')
-    const baseline = await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 's1', turn: 1, turnStartSeq: 10 })
-    void baseline
+    await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 's1', turn: 1, turnStartSeq: 10 })
     await writeFile(join(workspace, 'a.txt'), 'v2\n', 'utf8')
     await writeFile(join(workspace, 'b.txt'), 'v2\n', 'utf8')
     await engine.createTurnCheckpoint({ cwd: workspace, sessionId: 's1', turn: 2, turnStartSeq: 20 })
@@ -510,21 +398,20 @@ test('G1：带 paths 的预览请求必须铸出子集计划（fetchSubsetPlan �
     const liveSessions = new Map([['s1', sessionWithTurns(workspace, [1, 2])]])
     const handlers = makeHandlers(liveSessions, engine)
 
-    // 与 fetchSubsetPlan 完全相同的请求形状：turn 定位 + paths（不带 details）。
-    const subset = await callPreview(handlers,
-      `sessionId=s1&turn=1&paths=${encodeURIComponent(JSON.stringify(['a.txt']))}`)
-    assert.equal(subset.code, 200)
-    assert.equal(typeof subset.body.planId, 'string', '带 paths 的请求必须铸出计划（details=1 死路径已移除）')
-    assert.equal('confirmation' in subset.body, false, '确认串已废除（EXPECTED-DESIGN 1.4 #2）')
+    const preview = await callPreview(handlers, 'sessionId=s1&turn=1')
+    assert.equal(preview.code, 200)
+    assert.equal(typeof preview.body.planId, 'string', '预览必须铸出整树计划')
+    assert.equal('confirmation' in preview.body, false, '确认串已废除')
+    assert.deepEqual(
+      preview.body.changes.map((change) => [change.path, change.added, change.removed]).sort(),
+      [['a.txt', 1, 1], ['b.txt', 1, 1]],
+      '预览逐文件带服务端净行数',
+    )
 
-    // 计划只覆盖勾选路径：执行后 a 回基线、b 保持 v2。
-    const applied = await engine.applyRestore({
-      planId: subset.body.planId,
-      sessionId: 's1',
-    })
-    assert.deepEqual([...applied.restoredPaths].sort(), ['a.txt'])
-    assert.equal(await readFile(join(workspace, 'a.txt'), 'utf8'), 'v1\n', '勾选路径已回基线')
-    assert.equal(await readFile(join(workspace, 'b.txt'), 'utf8'), 'v2\n', '未勾选路径不被触碰')
+    const applied = await engine.applyRestore({ planId: preview.body.planId, sessionId: 's1' })
+    assert.deepEqual([...applied.restoredPaths].sort(), ['a.txt', 'b.txt'], '整树恢复覆盖全部变更路径')
+    assert.equal(await readFile(join(workspace, 'a.txt'), 'utf8'), 'v1\n')
+    assert.equal(await readFile(join(workspace, 'b.txt'), 'utf8'), 'v1\n')
   } finally {
     await engine.store.closeAll()
     await rm(workspace, { recursive: true, force: true })

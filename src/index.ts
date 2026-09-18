@@ -3,10 +3,9 @@
  * `ctx.shadowRewind`，供其它插件消费。
  */
 import { ShadowRewindEngine } from './engine.js'
-import { installBeforeCapture } from './host/before-capture.ts'
 import { installFileReviewHost } from './file-review/host.ts'
 import { installSettingsNamespace, type SettingsBridge } from './rewind-host.js'
-import { installShadowRewindCommands, installShadowRewindHttp, TurnCheckpointCoordinator } from './rewind-host.js'
+import { installShadowRewindHttp, TurnCheckpointCoordinator } from './rewind-host.js'
 import type { AgentFace, HostContext } from './rewind-host.js'
 import type { RestorePointSummary, ShadowRewindConfig } from './types.js'
 
@@ -20,8 +19,7 @@ export * from './types.js'
 export { FileReviewService, transformFile } from './file-review/host.ts'
 export type {
   FileReviewAction, FileReviewChange, FileReviewFileResult, FileReviewRequest,
-  FileReviewResult, ProducedFileDiff, ProducedFileReview, RecordedMutation,
-  RecordedRequest, RecordedResult,
+  FileReviewResult, ProducedFileDiff, ProducedFileReview,
 } from './file-review/change-types.ts'
 
 /** 最小 cordis 上下文面（结构类型）：避免依赖具体的 cordis 包版本。 */
@@ -60,13 +58,8 @@ export class ShadowRewindService {
     this.engine = new ShadowRewindEngine(config)
     this.coordinator = new TurnCheckpointCoordinator(this.engine)
 
-    // BEFORE 捕获管道（主路捕获，Claude Code 式）：tools/execute 写盘前抓
-    // 目标文件全文，锚定 user message seq；user/message 边界重查外部编辑。
-    // 影子整树快照保留为兜底——检查点在位时恢复仍走全树检查点。
-    installBeforeCapture(ctx, this.engine)
-
     // 文件审查半边（dsh-file-review-tab 融合）：Typert `fileReview` 服务 +
-    // 最终回复文件引用引导 + Code Mode 录制器；录制记录持久化到本插件存储。
+    // 最终回复文件引用引导；变更事实的唯一来源是检查点 diff。
     installFileReviewHost(
       ctx as unknown as Parameters<typeof installFileReviewHost>[0],
       { storageDir: this.engine.config.storageDir },
@@ -89,11 +82,8 @@ export class ShadowRewindService {
       // bridge 传解析函数：settings 桥异步装配，端点 handler 每请求时读取。
       installShadowRewindHttp(s, this.engine, this.coordinator, () => this.settingsBridge)
     })
-    // headless 命令面（/shadow-diff、/shadow-undo）：commands 服务缺失的宿主
-    // 上该 inject 挂起即可，不影响其余装配（与 webServer 同一降级模型）。
-    ctx.inject(['commands'], (scope) => {
-      installShadowRewindCommands(scope as unknown as Parameters<typeof installShadowRewindCommands>[0], this.engine)
-    })
+    // 命令面已整体移除：回退入口只保留 live 条 / 消息旁回退按钮 / 审计面板
+    // 三处，就地回退经 /shadow-rewind/inplace 端点执行（host/inplace-http.ts）。
 
     void this.engine.ready.then(() => {
       ctx.logger.info(`[shadow-rewind] 就绪；存储=${this.engine.config.storageDir} 后端=${this.engine.effectiveBackend}`)

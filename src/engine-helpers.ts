@@ -10,20 +10,12 @@ import { diffTrees } from './manifest.js'
 import type { Manifest, WorkspaceChange } from './types.js'
 import type { RestorePlan, RestorePointSummary, SnapshotEntry } from './types.js'
 
-/**
- * 恢复点 vs 当前树的路径级差异（partial 感知）。
- * 部分树（kind 'message' 的 BEFORE 兜底恢复点）只覆盖捕获到的路径：磁盘上
- * 其余路径一律「不在恢复范围」——`added` 方向的变更仅对 createdPaths
- * （捕获时不存在、此后被工具创建的路径）成立，绝不能把整个工作区当新增删掉。
- */
+/** 恢复点 vs 当前树的路径级差异（检查点恒为整树，无部分树语义）。 */
 export function diffAgainstManifest(
   manifest: Manifest,
   currentEntries: Readonly<Record<string, SnapshotEntry>>,
 ): readonly WorkspaceChange[] {
-  const changes = diffTrees(manifest.entries, currentEntries)
-  if (manifest.partial !== true) return changes
-  const created = new Set(manifest.createdPaths ?? [])
-  return changes.filter((change) => change.kind !== 'added' || created.has(change.path))
+  return diffTrees(manifest.entries, currentEntries)
 }
 
 /** Manifest → 对外摘要（RestorePointSummary）：条目明细不外泄，只留计数。 */

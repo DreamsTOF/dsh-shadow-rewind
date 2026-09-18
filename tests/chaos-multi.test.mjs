@@ -369,22 +369,19 @@ async function runMultiScenario(bias, seed) {
           const touched = contributors.get(change.path) ?? new Set()
           const others = [...touched].filter((id) => id !== session.id)
           if (others.length === 0) {
-            assert.deepEqual(
-              { owner: change.owner, autoSelect: change.autoSelect },
-              { owner: 'target', autoSelect: true },
-              `${session.id} 轮 ${turn} ${change.path}：独占变更必须归属本会话并默认勾选`,
+            assert.equal(
+              change.owner, 'target',
+              `${session.id} 轮 ${turn} ${change.path}：独占变更必须归属本会话`,
             )
           } else if (touched.size === 1) {
-            assert.deepEqual(
-              { owner: change.owner, autoSelect: change.autoSelect },
-              { owner: others[0], autoSelect: false },
-              `${session.id} 轮 ${turn} ${change.path}：单它主变更必须归属该会话且不默认勾选`,
+            assert.equal(
+              change.owner, others[0],
+              `${session.id} 轮 ${turn} ${change.path}：单它主变更必须归属该会话`,
             )
           } else {
-            assert.deepEqual(
-              { owner: change.owner, autoSelect: change.autoSelect },
-              { owner: 'multi', autoSelect: false },
-              `${session.id} 轮 ${turn} ${change.path}：多主变更必须归属 multi 且不默认勾选`,
+            assert.equal(
+              change.owner, 'multi',
+              `${session.id} 轮 ${turn} ${change.path}：多主变更必须归属 multi`,
             )
           }
         }

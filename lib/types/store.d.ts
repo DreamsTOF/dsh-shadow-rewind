@@ -1,13 +1,5 @@
 import { parseManifest } from './manifest.js';
 import type { ResolvedShadowRewindConfig } from './types.js';
-/** fork 谱系条目（ABSORB-RECALL 四）：childId 是 fork 出的新会话。 */
-export interface LineageEntry {
-    readonly childId: string;
-    readonly parentId: string;
-    /** 触发 fork的恢复点（「恢复并从新会话继续」的时点）。 */
-    readonly restorePointId?: string;
-    readonly time: number;
-}
 /** 每个工作区的全部持久化状态。 */
 export declare class WorkspaceStore {
     private readonly config;
@@ -28,12 +20,6 @@ export declare class WorkspaceStore {
      * 跳过记录不在此列：它只是提示。
      */
     purgeManifests(workspace: string): Promise<void>;
-    /** 追加一条 fork 谱系（childId ↔ parentId）到工作区状态目录的
-     * lineage.json。缺失/损坏按空表处理（谱系是展示性增强，不致命）；
-     * 同一 (childId, parentId) 只记一次（fork 幂等）。 */
-    appendLineage(workspace: string, entry: LineageEntry): Promise<void>;
-    /** 读取 fork 谱系链；缺失/损坏返回空数组（按无谱系展示）。 */
-    readLineage(workspace: string): Promise<LineageEntry[]>;
     /** 读上次 GC 时刻（gc.stamp，跨重启续存）；缺失/损坏返回 0（视为很久前）。 */
     readGcStamp(workspace: string): Promise<number>;
     /** 记录本次 GC 时刻。失败上抛由调用方静默（节流退化为每次都跑，不损正确性）。 */
